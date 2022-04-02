@@ -7,6 +7,8 @@ from torch.nn import init
 from torchvision.models import vgg16
 from torch import autograd
 
+from .encoder import SpatialEncoder, ImageEncoder
+
 
 class Encoder(nn.Module):
     def __init__(self, input_nc=3, z_dim=64, bottom=False):
@@ -103,6 +105,84 @@ class Decoder(nn.Module):
         self.b_before = nn.Sequential(*before_skip)
         self.b_after = nn.Sequential(*after_skip)
 
+        self.enc_type = "spatial"
+        if self.enc_type == "spatial":
+            self.encoder = SpatialEncoder()
+        elif self.enc_type == "global":
+            self.encoder = ImageEncoder()
+        else:
+            raise NotImplementedError("Unsupported encoder type")
+
+        #TODO: if use_global_encoder, input_dim should be changed.
+        self.use_global_encoder = False
+        self.global_encoder = None
+
+        # Note: this is world -> camera, and bottom row is omitted
+        self.register_buffer("poses", torch.empty(1, 3, 4), persistent=False)
+        self.register_buffer("image_shape", torch.empty(2), persistent=False)
+        self.register_buffer("focal", torch.empty(1, 2), persistent=False)
+        # Principal point
+        self.register_buffer("c", torch.empty(1, 2), persistent=False)
+
+        self.num_objs = 0
+        self.num_views_per_obj = 1
+
+    def encode(self, images, poses, focal, c=None):
+        """
+        :param images (NS, 3, H, W)
+        NS is number of input (aka source or reference) views
+        :param poses (NS, 4, 4)
+        :param focal focal length () or (2) or (NS) or (NS, 2) [fx, fy]
+        :param c principal point None or () or (2) or (NS) or (NS, 2) [cx, cy],
+        default is center of image
+        """
+        self.num_objs = images.size(0)
+        if len(images.shape) == 5:
+            assert len(poses.shape) == 4
+            assert poses.size(1) == images.size(
+                1
+            )  # Be consistent with NS = num input views
+            self.num_views_per_obj = images.size(1)
+            images = images.reshape(-1, *images.shape[2:])
+            poses = poses.reshape(-1, 4, 4)
+        else:
+            self.num_views_per_obj = 1
+
+        self.encoder(images)
+        rot = poses[:, :3, :3].transpose(1, 2)  # (B, 3, 3)
+        trans = -torch.bmm(rot, poses[:, :3, 3:])  # (B, 3, 1)
+        self.poses = torch.cat((rot, trans), dim=-1)  # (B, 3, 4)
+
+        self.image_shape[0] = images.shape[-1]
+        self.image_shape[1] = images.shape[-2]
+
+        # Handle various focal length/principal point formats
+        if len(focal.shape) == 0:
+            # Scalar: fx = fy = value for all views
+            focal = focal[None, None].repeat((1, 2))
+        elif len(focal.shape) == 1:
+            # Vector f: fx = fy = f_i *for view i*
+            # Length should match NS (or 1 for broadcast)
+            focal = focal.unsqueeze(-1).repeat((1, 2))
+        else:
+            focal = focal.clone()
+        self.focal = focal.float()
+        self.focal[..., 1] *= -1.0
+
+        if c is None:
+            # Default principal point is center of image
+            c = (self.image_shape * 0.5).unsqueeze(0)
+        elif len(c.shape) == 0:
+            # Scalar: cx = cy = value for all views
+            c = c[None, None].repeat((1, 2))
+        elif len(c.shape) == 1:
+            # Vector c: cx = cy = c_i *for view i*
+            c = c.unsqueeze(-1).repeat((1, 2))
+        self.c = c
+
+        if self.use_global_encoder:
+            self.global_encoder(images)
+
     def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform):
         """
         1. pos emb by Fourier
@@ -113,6 +193,7 @@ class Decoder(nn.Module):
             z_slots: KxC, K: #slots, C: #feat_dim
             fg_transform: If self.fixed_locality, it is 1x4x4 matrix nss2cam0, otherwise it is 1x3x3 azimuth rotation of nss2cam0
         """
+        #TODO: need to figure out diff between sampling_coor_fg and xyz in pixelnerf / poses and fg_transform
         K, C = z_slots.shape
         P = sampling_coor_bg.shape[0]
 
