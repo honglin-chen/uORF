@@ -6,6 +6,7 @@ from torch import nn
 import torch.nn.functional as F
 import torchvision
 import util
+from .networks import get_norm_layer
 # from model.custom_encoder import ConvEncoder # This module has been added to current file.
 import torch.autograd.profiler as profiler
 
@@ -17,7 +18,7 @@ class ConvEncoder(nn.Module):
     def __init__(
         self,
         dim_in=3,
-        norm_layer=util.get_norm_layer("group"),
+        norm_layer=get_norm_layer("group"),
         padding_type="reflect",
         use_leaky_relu=True,
         use_skip_conn=True,

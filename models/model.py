@@ -9,6 +9,25 @@ from torch import autograd
 
 from .encoder import SpatialEncoder, ImageEncoder
 
+def repeat_interleave(input, repeats, dim=0):
+    """
+    Repeat interleave along axis 0
+    torch.repeat_interleave is currently very slow
+    https://github.com/pytorch/pytorch/issues/31980
+    """
+    output = input.unsqueeze(1).expand(-1, repeats, *input.shape[1:])
+    return output.reshape(-1, *input.shape[1:])
+
+def distance_between_rotations(P, Q):
+    # P, Q = (3, 3) rotation matrices
+    #http://www.boris-belousov.net/2016/12/01/quat-dist/#:~:text=The%20distance%20between%20rotations%20represented%20by%20rotation%20matrices%20P%20and,matrix%20R%20%3D%20P%20Q%20%E2%88%97%20.
+    R = np.matmul(P, Q.transpose(-1, -2))
+    return (np.trace(R)-1)/2 # = cos(theta), theta = rotation angle between P and Q
+
+def cos_softmax(cosines, temperature=1.):
+    # cosines = (N, )
+    numerator = np.exp(cosines/temperature)
+    return numerator/np.sum(numerator, dim=0, keepdims=True)
 
 class Encoder(nn.Module):
     def __init__(self, input_nc=3, z_dim=64, bottom=False):
@@ -64,7 +83,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False):
+    def __init__(self, n_freq=5, input_dim=33+64+, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -80,6 +99,32 @@ class Decoder(nn.Module):
         self.locality_ratio = locality_ratio
         self.fixed_locality = fixed_locality
         self.out_ch = 4
+
+        self.enc_type = "spatial"
+        if self.enc_type == "spatial":
+            self.encoder = SpatialEncoder()
+        elif self.enc_type == "global":
+            self.encoder = ImageEncoder()
+        else:
+            raise NotImplementedError("Unsupported encoder type")
+
+        self.use_global_encoder = False
+        self.global_encoder = None
+
+        self.latent_size = self.encoder.latent_size
+        input_dim += self.latent_size
+
+        # Note: this is world -> camera, and bottom row is omitted
+        self.register_buffer("poses", torch.empty(1, 3, 4), persistent=False)
+        self.register_buffer("image_shape", torch.empty(2), persistent=False)
+        self.register_buffer("focal", torch.empty(1, 2), persistent=False)
+        # Principal point
+        self.register_buffer("c", torch.empty(1, 2), persistent=False)
+
+        self.num_objs = 0
+        self.num_views_per_obj = 1
+
+        # Define NN
         before_skip = [nn.Linear(input_dim, z_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(z_dim+input_dim, z_dim), nn.ReLU(True)]
         for i in range(n_layers-1):
@@ -105,27 +150,7 @@ class Decoder(nn.Module):
         self.b_before = nn.Sequential(*before_skip)
         self.b_after = nn.Sequential(*after_skip)
 
-        self.enc_type = "spatial"
-        if self.enc_type == "spatial":
-            self.encoder = SpatialEncoder()
-        elif self.enc_type == "global":
-            self.encoder = ImageEncoder()
-        else:
-            raise NotImplementedError("Unsupported encoder type")
 
-        #TODO: if use_global_encoder, input_dim should be changed.
-        self.use_global_encoder = False
-        self.global_encoder = None
-
-        # Note: this is world -> camera, and bottom row is omitted
-        self.register_buffer("poses", torch.empty(1, 3, 4), persistent=False)
-        self.register_buffer("image_shape", torch.empty(2), persistent=False)
-        self.register_buffer("focal", torch.empty(1, 2), persistent=False)
-        # Principal point
-        self.register_buffer("c", torch.empty(1, 2), persistent=False)
-
-        self.num_objs = 0
-        self.num_views_per_obj = 1
 
     def encode(self, images, poses, focal, c=None):
         """
@@ -185,6 +210,7 @@ class Decoder(nn.Module):
 
     def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform):
         """
+        0. latent vectors from CNN encoder
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
         input:
@@ -193,7 +219,39 @@ class Decoder(nn.Module):
             z_slots: KxC, K: #slots, C: #feat_dim
             fg_transform: If self.fixed_locality, it is 1x4x4 matrix nss2cam0, otherwise it is 1x3x3 azimuth rotation of nss2cam0
         """
-        #TODO: need to figure out diff between sampling_coor_fg and xyz in pixelnerf / poses and fg_transform
+        #self.poses = world2cam coord change
+        NS = self.num_views_per_obj
+        xyz_fg = repeat_interleave(sampling_coor_fg, NS) # (NS*(K-1), P, 3)
+        xyz_bg = repeat_interleave(sampling_coor_bg.unsqueeze(0), NS) # (NS, P, 3)
+
+        #self.poses = (NS, 4, 4)
+        xyz_fg_rot = torch.matmul(self.poses[:, None, :3, :3], xyz_fg.unsqueeze(-1))[..., 0] # (NS, 1, 3, 3) * (NS*(K-1), P, 3, 1)
+        xyz_bg_rot = torch.matmul(self.poses[:, None, :3, :3], xyx_bg.unsqueeze(-1))[..., 0]
+        # matmul: (j, 1, n, m), (k, m, p) -> (j, k, n, p)
+
+        xyz_fg = xyz_fg_rot + self.poses[:, None, :3, 3] # (NS*(K-1), P, 3, 1)
+        xyz_bg = xyz_bg_rot + self.poses[:, None, :3, 3] # (NS, P, 3, 1)
+
+        uv_fg = -xyz_fg[:, :, :2] / xyz_fg[:, :, 2:] # (NS*(K-1), P, 2)
+        uv_fg *= repeat_interleave(self.focal.unsqueeze(1), NS if self.focal.shape[0] > 1 else 1)
+        uv_fg += repeat_interleave(self.c.unsqueeze(1), NS if self.c.shape[0]>1 else 1)
+        latent_fg = self.encoder.index(uv_fg, None, self.image_shape) # (NS*(K-1), latent, B)
+        if False: # stop_encoder_grad
+            latent_fg = latent_fg.detach()
+        latent_fg = latent_fg.transpose(1, 2).reshape(-1, latent_fg.shape[1]) # (NS*(K-1)*B, latent)
+
+        uv_bg = -xyz_bg[:, :, :2] / xyz_bg[:, :, 2:]  # (NS*(K-1), P, 2)
+        uv_bg *= repeat_interleave(self.focal.unsqueeze(1), NS if self.focal.shape[0] > 1 else 1)
+        uv_bg += repeat_interleave(self.c.unsqueeze(1), NS if self.c.shape[0] > 1 else 1)
+        latent_bg = self.encoder.index(uv_bg, None, self.image_shape)  # (NS*(K-1), latent, B)
+        if False:  # stop_encoder_grad
+            latent_bg = latent_bg.detach()
+        latent_bg = latent_bg.transpose(1, 2).reshape(-1, latent_bg.shape[1])  # (NS*(K-1)*B, latent)
+
+        # TODO: convert xyz coordinates to the image plane.
+        # TODO: get an image feature for xyz coordinates
+        # TODO: weighted sum using the camera rotation matrix
+
         K, C = z_slots.shape
         P = sampling_coor_bg.shape[0]
 
@@ -212,10 +270,14 @@ class Decoder(nn.Module):
         query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
         input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
 
+        input_bg = torch.cat([input_bg, latent_bg], dim=1)
+
         sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
         query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
         z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
         input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
+
+        input_fg = torch.cat([input_fg, latent_fg], dim=1)
 
         tmp = self.b_before(input_bg)
         bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
