@@ -65,7 +65,7 @@ if __name__ == '__main__':
 
             iter_data_time = time.time()
 
-        print('End of epoch %d / %d \t Time Taken: %d sec' % (epoch, opt.niter + opt.niter_decay, time.time() - epoch_start_time))
+        print('End of epoch %d / %d \t Time Taken: %.4f sec' % (epoch, opt.niter + opt.niter_decay, time.time() - epoch_start_time))
         if not opt.custom_lr:
             model.update_learning_rate()  # update learning rates at the end of every epoch.
 

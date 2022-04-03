@@ -29,6 +29,7 @@ class MultiscenesDataset(BaseDataset):
         BaseDataset.__init__(self, opt)
         self.n_scenes = opt.n_scenes
         self.n_img_each_scene = opt.n_img_each_scene
+        self.min_num_masks = 4
         image_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*.png')))  # root/00000_sc000_az00_el00.png
         mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask.png')))
         fg_mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask_for_moving.png')))
@@ -109,7 +110,7 @@ class MultiscenesDataset(BaseDataset):
                 onehot_labels = mask_flat[:, None] == greyscale_dict  # HWx8, one-hot
                 onehot_labels = onehot_labels.type(torch.uint8)
                 mask_idx = onehot_labels.argmax(dim=1)  # HW
-                bg_color = greyscale_dict[1]
+                bg_color = greyscale_dict[0] if 'tdw' in mask_path else greyscale_dict[1]
                 fg_idx = mask_flat != bg_color  # HW
                 ret['mask_idx'] = mask_idx
                 ret['fg_idx'] = fg_idx
@@ -119,6 +120,23 @@ class MultiscenesDataset(BaseDataset):
                     obj_idxs.append(obj_idx)
                 obj_idxs = torch.stack(obj_idxs)  # Kx1xHxW
                 ret['obj_idxs'] = obj_idxs  # KxHxW
+
+                # additional attributes: GT background mask and object masks
+                ret['bg_mask'] = mask_l == bg_color
+                obj_masks = []
+                for i in range(len(greyscale_dict)):
+                    if greyscale_dict[i] == bg_color:
+                        continue
+                    obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
+                    obj_masks.append(obj_mask)
+                obj_masks = torch.stack(obj_masks)  # Kx1xHxW
+
+                # if the number of masks is too small, pad with empty masks
+                if obj_masks.shape[0] < self.min_num_masks:
+                    obj_masks = torch.cat([obj_masks, torch.zeros_like(obj_masks[0:(self.min_num_masks-obj_masks.shape[0])])], dim=0)
+
+                ret['obj_masks'] = obj_masks  # KxHxW
+
             rets.append(ret)
         return rets
 
@@ -154,4 +172,9 @@ def collate_fn(batch):
         ret['fg_idx'] = fg_idx
         obj_idxs = flat_batch[0]['obj_idxs']  # Kx1xHxW
         ret['obj_idxs'] = obj_idxs
+        bg_mask = torch.stack([x['bg_mask'] for x in flat_batch])
+        ret['bg_mask'] = bg_mask
+        obj_masks = torch.stack([x['obj_masks'].squeeze(1) for x in flat_batch])
+        ret['obj_masks'] = obj_masks # [BxKxHXW]
+
     return ret

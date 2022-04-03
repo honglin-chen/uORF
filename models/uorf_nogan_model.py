@@ -10,7 +10,8 @@ import time
 from .projection import Projection
 from torchvision.transforms import Normalize
 from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs
-
+import pdb
+from util import util
 
 class uorfNoGanModel(BaseModel):
 
@@ -48,7 +49,8 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--near_plane', type=float, default=6)
         parser.add_argument('--far_plane', type=float, default=20)
         parser.add_argument('--fixed_locality', action='store_true', help='enforce locality in world space instead of transformed view space')
-
+        parser.add_argument('--gt_seg', action='store_true', help='replace slot attention with GT segmentation')
+        parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
 
@@ -79,17 +81,18 @@ class uorfNoGanModel(BaseModel):
         self.vgg_norm = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         render_size = (opt.render_size, opt.render_size)
         frustum_size = [self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp]
-        self.projection = Projection(device=self.device, nss_scale=opt.nss_scale,
+        self.projection = Projection(focal_ratio=opt.focal_ratio, device=self.device, nss_scale=opt.nss_scale,
                                      frustum_size=frustum_size, near=opt.near_plane, far=opt.far_plane, render_size=render_size)
         frustum_size_fine = [self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp]
-        self.projection_fine = Projection(device=self.device, nss_scale=opt.nss_scale,
-                                          frustum_size=frustum_size_fine, near=opt.near_plane, far=opt.far_plane, render_size=render_size)
+
+        self.projection_fine = Projection(focal_ratio=opt.focal_ratio, device=self.device, nss_scale=opt.nss_scale,
+                                     frustum_size=frustum_size_fine, near=opt.near_plane, far=opt.far_plane, render_size=render_size)
         z_dim = opt.z_dim
         self.num_slots = opt.num_slots
         self.netEncoder = networks.init_net(Encoder(3, z_dim=z_dim, bottom=opt.bottom),
                                             gpu_ids=self.gpu_ids, init_type='normal')
         self.netSlotAttention = networks.init_net(
-            SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter), gpu_ids=self.gpu_ids, init_type='normal')
+            SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter, gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
         self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
                                                     locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
 
@@ -124,6 +127,14 @@ class uorfNoGanModel(BaseModel):
         if not self.opt.fixed_locality:
             self.cam2world_azi = input['azi_rot'].to(self.device)
 
+        if 'masks' in input.keys():
+            bg_masks = input['bg_mask'][0:1].to(self.device)
+            obj_masks = input['obj_masks'][0:1].to(self.device)
+
+            masks = torch.cat([bg_masks, obj_masks], dim=1)
+            masks = F.interpolate(masks.float(), size=[64, 64], mode='nearest')
+            self.masks = masks.flatten(2, 3)
+
     def forward(self, epoch=0):
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
         self.weight_percept = self.opt.weight_percept if epoch >= self.opt.percept_in else 0
@@ -137,7 +148,7 @@ class uorfNoGanModel(BaseModel):
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention
-        z_slots, attn = self.netSlotAttention(feat)  # 1xKxC, 1xKxN
+        z_slots, attn = self.netSlotAttention(feat, masks=self.masks)  # 1xKxC, 1xKxN
         z_slots, attn = z_slots.squeeze(0), attn.squeeze(0)  # KxC, KxN
         K = attn.shape[0]
 

@@ -4,9 +4,12 @@ import torch.nn.functional as F
 
 
 class Projection(object):
-    def __init__(self, focal_ratio=(350. / 320., 350. / 240.),
+    def __init__(self,focal_ratio=(350. / 320., 350. / 240.),
                  near=5, far=16, frustum_size=[128, 128, 128], device='cpu',
                  nss_scale=7, render_size=(64, 64)):
+
+        focal_ratio = [float(i) for i in focal_ratio]
+        print('Focal ratio in projection: ', focal_ratio)
         self.render_size = render_size
         self.device = device
         self.focal_ratio = focal_ratio

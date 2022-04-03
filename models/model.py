@@ -161,12 +161,13 @@ class Decoder(nn.Module):
 
 
 class SlotAttention(nn.Module):
-    def __init__(self, num_slots, in_dim=64, slot_dim=64, iters=3, eps=1e-8, hidden_dim=128):
+    def __init__(self, num_slots, in_dim=64, slot_dim=64, iters=3, eps=1e-8, hidden_dim=128, gt_seg=False):
         super().__init__()
         self.num_slots = num_slots
         self.iters = iters
         self.eps = eps
         self.scale = slot_dim ** -0.5
+        self.gt_seg = gt_seg
 
         self.slots_mu = nn.Parameter(torch.randn(1, 1, slot_dim))
         self.slots_logsigma = nn.Parameter(torch.zeros(1, 1, slot_dim))
@@ -201,7 +202,7 @@ class SlotAttention(nn.Module):
         self.norm_feat = nn.LayerNorm(in_dim)
         self.slot_dim = slot_dim
 
-    def forward(self, feat, num_slots=None):
+    def forward(self, feat, num_slots=None, masks=None):
         """
         input:
             feat: visual feature with position information, BxNxC
@@ -231,10 +232,18 @@ class SlotAttention(nn.Module):
             dots_fg = torch.einsum('bid,bjd->bij', q_fg, k) * self.scale
             dots_bg = torch.einsum('bid,bjd->bij', q_bg, k) * self.scale
             dots = torch.cat([dots_bg, dots_fg], dim=1)  # BxKxN
-            attn = dots.softmax(dim=1) + self.eps  # BxKxN
-            attn_bg, attn_fg = attn[:, 0:1, :], attn[:, 1:, :]  # Bx1xN, Bx(K-1)xN
-            attn_weights_bg = attn_bg / attn_bg.sum(dim=-1, keepdim=True)  # Bx1xN
-            attn_weights_fg = attn_fg / attn_fg.sum(dim=-1, keepdim=True)  # Bx(K-1)xN
+
+            if self.gt_seg:
+                # Replace slot attention with GT segmentations
+                attn_bg, attn_fg = masks[:, 0:1], masks[:, 1:]
+                attn = torch.cat([attn_bg, attn_fg], dim=1)
+            else:
+                attn = dots.softmax(dim=1) + self.eps  # BxKxN
+                attn_bg, attn_fg = attn[:, 0:1, :], attn[:, 1:, :]  # Bx1xN, Bx(K-1)xN
+
+            # Add small epsilon to prevent division by zero
+            attn_weights_bg = attn_bg / (attn_bg.sum(dim=-1, keepdim=True) + 1e-12)  # Bx1xN
+            attn_weights_fg = attn_fg / (attn_fg.sum(dim=-1, keepdim=True) + 1e-12)  # Bx(K-1)xN
 
             updates_bg = torch.einsum('bjd,bij->bid', v, attn_weights_bg)
             updates_fg = torch.einsum('bjd,bij->bid', v, attn_weights_fg)
