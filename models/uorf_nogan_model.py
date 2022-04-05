@@ -122,8 +122,9 @@ class uorfNoGanModel(BaseModel):
         Parameters:
             input: a dictionary that contains the data itself and its metadata information.
         """
-        self.x = input['img_data'].to(self.device)
-        self.cam2world = input['cam2world'].to(self.device)
+        self.x = input['img_data'].to(self.device) # (NS=4, 3, 128, 128)
+        self.cam2world = input['cam2world'].to(self.device) # (NS=4, 4, 4)
+        # print(input.keys()) -> (['img_data', 'paths', 'cam2world', 'azi_rot', 'depths', 'masks', 'mask_idx', 'fg_idx', 'obj_idxs', 'bg_mask', 'obj_masks'])
         if not self.opt.fixed_locality:
             self.cam2world_azi = input['azi_rot'].to(self.device)
 
@@ -145,6 +146,8 @@ class uorfNoGanModel(BaseModel):
 
         # Encoding images
         feature_map = self.netEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
+        focal_length = torch.tensor([496.0]).to(self.device)  # TODO: make this configurable
+        self.netDecoder.encode(self.x[0:1], self.cam2world[0:1], focal_length)
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention

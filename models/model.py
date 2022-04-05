@@ -7,6 +7,27 @@ from torch.nn import init
 from torchvision.models import vgg16
 from torch import autograd
 
+from .encoder import SpatialEncoder, ImageEncoder
+
+def repeat_interleave(input, repeats, dim=0):
+    """
+    Repeat interleave along axis 0
+    torch.repeat_interleave is currently very slow
+    https://github.com/pytorch/pytorch/issues/31980
+    """
+    output = input.unsqueeze(1).expand(-1, repeats, *input.shape[1:])
+    return output.reshape(-1, *input.shape[1:])
+
+def distance_between_rotations(P, Q):
+    # P, Q = (3, 3) rotation matrices
+    #http://www.boris-belousov.net/2016/12/01/quat-dist/#:~:text=The%20distance%20between%20rotations%20represented%20by%20rotation%20matrices%20P%20and,matrix%20R%20%3D%20P%20Q%20%E2%88%97%20.
+    R = np.matmul(P, Q.transpose(-1, -2))
+    return (np.trace(R)-1)/2 # = cos(theta), theta = rotation angle between P and Q
+
+def cos_softmax(cosines, temperature=1.):
+    # cosines = (N, )
+    numerator = np.exp(cosines/temperature)
+    return numerator/np.sum(numerator, dim=0, keepdims=True)
 
 class Encoder(nn.Module):
     def __init__(self, input_nc=3, z_dim=64, bottom=False):
@@ -78,6 +99,34 @@ class Decoder(nn.Module):
         self.locality_ratio = locality_ratio
         self.fixed_locality = fixed_locality
         self.out_ch = 4
+
+        # Pixelnerf extension
+        self.enc_type = "spatial"
+        if self.enc_type == "spatial":
+            # self.encoder = SpatialEncoder(backbone='custom')
+            self.encoder = SpatialEncoder(num_layers=3)
+        elif self.enc_type == "global":
+            self.encoder = ImageEncoder()
+        else:
+            raise NotImplementedError("Unsupported encoder type")
+
+        self.use_global_encoder = False
+        self.global_encoder = None
+
+        self.latent_size = self.encoder.latent_size
+        input_dim += self.latent_size
+
+        # Note: this is world -> camera, and bottom row is omitted
+        self.register_buffer("poses", torch.empty(1, 3, 4), persistent=False)
+        self.register_buffer("image_shape", torch.empty(2), persistent=False)
+        self.register_buffer("focal", torch.empty(1, 2), persistent=False)
+        # Principal point
+        self.register_buffer("c", torch.empty(1, 2), persistent=False)
+
+        self.num_objs = 0
+        self.num_views_per_obj = 1
+
+        # Define NN
         before_skip = [nn.Linear(input_dim, z_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(z_dim+input_dim, z_dim), nn.ReLU(True)]
         for i in range(n_layers-1):
@@ -103,8 +152,68 @@ class Decoder(nn.Module):
         self.b_before = nn.Sequential(*before_skip)
         self.b_after = nn.Sequential(*after_skip)
 
+    def encode(self, images, poses, focal, c=None):
+        """
+        :param images (NS, 3, H, W)
+        NS is number of input (aka source or reference) views
+        :param poses (NS, 4, 4)
+        :param focal focal length () or (2) or (NS) or (NS, 2) [fx, fy]
+        :param c principal point None or () or (2) or (NS) or (NS, 2) [cx, cy],
+        default is center of image
+        """
+        self.num_objs = images.size(0)
+        if len(images.shape) == 5:
+            assert len(poses.shape) == 4
+            assert poses.size(1) == images.size(
+                1
+            )  # Be consistent with NS = num input views
+            self.num_views_per_obj = images.size(1)
+            images = images.reshape(-1, *images.shape[2:])
+            poses = poses.reshape(-1, 4, 4)
+        else:
+            self.num_views_per_obj = 1
+
+        self.num_objs = 1
+        self.num_views_per_obj = images.size(0)
+
+        self.encoder(images)
+        rot = poses[:, :3, :3].transpose(1, 2)  # (B, 3, 3)
+        trans = -torch.bmm(rot, poses[:, :3, 3:])  # (B, 3, 1)
+        self.poses = torch.cat((rot, trans), dim=-1)  # (B, 3, 4)
+
+        self.image_shape[0] = images.shape[-1]
+        self.image_shape[1] = images.shape[-2]
+
+        # Handle various focal length/principal point formats
+        if len(focal.shape) == 0:
+            # Scalar: fx = fy = value for all views
+            focal = focal[None, None].repeat((1, 2))
+        elif len(focal.shape) == 1:
+            # Vector f: fx = fy = f_i *for view i*
+            # Length should match NS (or 1 for broadcast)
+            focal = focal.unsqueeze(-1).repeat((1, 2))
+        else:
+            focal = focal.clone()
+        self.focal = focal.float()
+        self.focal[..., 1] *= -1.0
+
+        if c is None:
+            # Default principal point is center of image
+            c = (self.image_shape * 0.5).unsqueeze(0)
+        elif len(c.shape) == 0:
+            # Scalar: cx = cy = value for all views
+            c = c[None, None].repeat((1, 2))
+        elif len(c.shape) == 1:
+            # Vector c: cx = cy = c_i *for view i*
+            c = c.unsqueeze(-1).repeat((1, 2))
+        self.c = c
+
+        if self.use_global_encoder:
+            self.global_encoder(images)
+
     def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform):
         """
+        0. latent vectors from CNN encoder
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
         input:
@@ -113,6 +222,49 @@ class Decoder(nn.Module):
             z_slots: KxC, K: #slots, C: #feat_dim
             fg_transform: If self.fixed_locality, it is 1x4x4 matrix nss2cam0, otherwise it is 1x3x3 azimuth rotation of nss2cam0
         """
+
+        #self.poses = world2cam coord change
+        # NS = self.num_views_per_obj
+        NS = 1
+        # print(sampling_coor_fg.shape, 'coord fg shape')
+        # print(sampling_coor_bg.shape, 'coord bg shape')
+        # xyz_fg = repeat_interleave(sampling_coor_fg, NS) # ((K-1)*NS, P, 3)
+        xyz_bg = repeat_interleave(sampling_coor_bg.unsqueeze(0), NS) # (NS, P, 3)
+        # print(xyz_fg.shape, 'xyz_fg.shape')
+        # print(xyz_bg.shape, 'xyz_bg.shape')
+
+        #self.poses = (NS, 4, 4)
+        # poses_fg = repeat_interleave(self.poses, 4)
+        # xyz_fg_rot = torch.matmul(poses_fg[:, None, :3, :3], xyz_fg.unsqueeze(-1))[..., 0] # (NS, 1, 3, 3) * (NS*(K-1), P, 3, 1)
+        xyz_bg_rot = torch.matmul(fg_transform[0, None, :3, :3], xyz_bg.unsqueeze(-1))[..., 0]
+        # matmul: (j, 1, n, m), (k, m, p) -> (j, k, n, p)
+
+        # xyz_fg = xyz_fg_rot + poses_fg[:, None, :3, 3] # (NS*(K-1), P, 3, 1)
+        xyz_bg = xyz_bg_rot + fg_transform[0, None, :3, 3] # (NS, P, 3, 1)
+        # print(xyz_fg.shape, 'xyz_fg_after transform')
+        # print(xyz_bg.shape)
+
+        # uv_fg = -xyz_fg[:, :, :2] / xyz_fg[:, :, 2:] # (NS*(K-1), P, 2)
+        # uv_fg *= repeat_interleave(self.focal.unsqueeze(1), NS if self.focal.shape[0] > 1 else 1)
+        # uv_fg += repeat_interleave(self.c.unsqueeze(1), NS if self.c.shape[0]>1 else 1)
+        # print(uv_fg.shape, 'uv_fg.shape')
+        # print(self.image_shape, 'self.image_shape')
+        # pixel_latent_fg = self.encoder.index(uv_fg, None, self.image_shape) # (NS*(K-1), latent, B)
+        # if False: # stop_encoder_grad
+        #     pixel_latent_fg = pixel_latent_fg.detach()
+        # pixel_latent_fg = pixel_latent_fg.transpose(1, 2).reshape(-1, pixel_latent_fg.shape[1]) # (NS*(K-1)*B, latent)
+
+        uv_bg = -xyz_bg[:, :, :2] / xyz_bg[:, :, 2:]  # (NS*(K-1), P, 2)
+        uv_bg *= repeat_interleave(self.focal.unsqueeze(1), NS if self.focal.shape[0] > 1 else 1)
+        uv_bg += repeat_interleave(self.c.unsqueeze(1), NS if self.c.shape[0] > 1 else 1)
+        # print(uv_bg.shape, 'uv_bg.shape')
+        pixel_latent_bg = self.encoder.index(uv_bg, None, self.image_shape)  # (NS*(K-1), latent, B)
+        if False:  # stop_encoder_grad
+            pixel_latent_bg = pixel_latent_bg.detach()
+        pixel_latent_bg = pixel_latent_bg.transpose(1, 2).reshape(-1, pixel_latent_bg.shape[1])  # (NS*B, latent)
+        K = 5
+        pixel_latent_fg = pixel_latent_bg[None, ...].expand(K-1, -1, -1).reshape(-1, *pixel_latent_bg.shape[1:])
+
         K, C = z_slots.shape
         P = sampling_coor_bg.shape[0]
 
@@ -130,11 +282,14 @@ class Decoder(nn.Module):
         z_fg = z_slots[1:, :]  # (K-1)xC
         query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
         input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
+        # print(input_bg.shape, pixel_latent_bg.shape)
+        input_bg = torch.cat([input_bg, pixel_latent_bg], dim=1)
 
         sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
         query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
         z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
         input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
+        input_fg = torch.cat([input_fg, pixel_latent_fg], dim=1)
 
         tmp = self.b_before(input_bg)
         bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
