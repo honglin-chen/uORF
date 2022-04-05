@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.nn import init
 from torchvision.models import vgg16
 from torch import autograd
+from .networks import get_norm_layer
 
 
 class Encoder(nn.Module):
@@ -60,9 +61,246 @@ class Encoder(nn.Module):
         feature_map = self.enc_up_1(torch.cat([x_up_2, x_down_1], dim=1))  # BxCxHxW
         return feature_map
 
+"""
+Implements image encoders
+"""
+import torchvision
+# from model.custom_encoder import ConvEncoder
+import torch.autograd.profiler as profiler
+
+
+class PixelEncoder(nn.Module):
+    """
+    2D (Spatial/Pixel-aligned/local) image encoder
+    """
+
+    def __init__(
+        self,
+        backbone="resnet34",
+        pretrained=True,
+        num_layers=2, # 4 in pixelnerf
+        index_interp="bilinear",
+        index_padding="border",
+        upsample_interp="bilinear",
+        feature_scale=1.0,
+        use_first_pool=True,
+        norm_type="batch",
+    ):
+        """
+        :param backbone Backbone network. Either custom, in which case
+        model.custom_encoder.ConvEncoder is used OR resnet18/resnet34, in which case the relevant
+        model from torchvision is used
+        :param num_layers number of resnet layers to use, 1-5
+        :param pretrained Whether to use model weights pretrained on ImageNet
+        :param index_interp Interpolation to use for indexing
+        :param index_padding Padding mode to use for indexing, border | zeros | reflection
+        :param upsample_interp Interpolation to use for upscaling latent code
+        :param feature_scale factor to scale all latent by. Useful (<1) if image
+        is extremely large, to fit in memory.
+        :param use_first_pool if false, skips first maxpool layer to avoid downscaling image
+        features too much (ResNet only)
+        :param norm_type norm type to applied; pretrained model must use batch
+        """
+        super().__init__()
+
+        if norm_type != "batch":
+            assert not pretrained
+
+        self.use_custom_resnet = backbone == "custom"
+        self.feature_scale = feature_scale
+        self.use_first_pool = use_first_pool
+        norm_layer = get_norm_layer(norm_type)
+
+        if self.use_custom_resnet:
+            print("WARNING: Custom encoder is experimental only")
+            print("Using simple convolutional encoder")
+            self.model = ConvEncoder(3, norm_layer=norm_layer)
+            self.latent_size = self.model.dims[-1]
+        else:
+            print("Using torchvision", backbone, "encoder")
+            self.model = getattr(torchvision.models, backbone)(
+                pretrained=pretrained, norm_layer=norm_layer
+            )
+            # Following 2 lines need to be uncommented for older configs
+            self.model.fc = nn.Sequential()
+            self.model.avgpool = nn.Sequential()
+            self.latent_size = [0, 64, 128, 256, 512, 1024][num_layers]
+
+        self.num_layers = num_layers
+        self.index_interp = index_interp
+        self.index_padding = index_padding
+        self.upsample_interp = upsample_interp
+        self.register_buffer("latent", torch.empty(1, 1, 1, 1), persistent=False)
+        self.register_buffer(
+            "latent_scaling", torch.empty(2, dtype=torch.float32), persistent=False
+        )
+        # self.latent (B, L, H, W)
+
+    def index(self, uv, cam_z=None, image_size=(), z_bounds=None):
+        """
+        Get pixel-aligned image features at 2D image coordinates
+        :param uv (B, N, 2) image points (x,y)
+        :param cam_z ignored (for compatibility)
+        :param image_size image size, either (width, height) or single int.
+        if not specified, assumes coords are in [-1, 1]
+        :param z_bounds ignored (for compatibility)
+        :return (B, L, N) L is latent size
+        """
+        with profiler.record_function("encoder_index"):
+            if uv.shape[0] == 1 and self.latent.shape[0] > 1:
+                uv = uv.expand(self.latent.shape[0], -1, -1)
+
+            with profiler.record_function("encoder_index_pre"):
+                if len(image_size) > 0:
+                    if len(image_size) == 1:
+                        image_size = (image_size, image_size)
+                    scale = self.latent_scaling / image_size
+                    uv = uv * scale - 1.0
+
+            uv = uv.unsqueeze(2)  # (B, N, 1, 2)
+            samples = F.grid_sample(
+                self.latent,
+                uv,
+                align_corners=True,
+                mode=self.index_interp,
+                padding_mode=self.index_padding,
+            )
+            return samples[:, :, :, 0]  # (B, C, N)
+
+    def forward(self, x):
+        """
+        For extracting ResNet's features.
+        :param x image (B, C, H, W)
+        :return latent (B, latent_size, H, W)
+        """
+        if self.feature_scale != 1.0:
+            x = F.interpolate(
+                x,
+                scale_factor=self.feature_scale,
+                mode="bilinear" if self.feature_scale > 1.0 else "area",
+                align_corners=True if self.feature_scale > 1.0 else None,
+                recompute_scale_factor=True,
+            )
+        x = x.to(device=self.latent.device)
+
+        if self.use_custom_resnet:
+            self.latent = self.model(x)
+        else:
+            x = self.model.conv1(x)
+            x = self.model.bn1(x)
+            x = self.model.relu(x)
+
+            latents = [x]
+            if self.num_layers > 1:
+                if self.use_first_pool:
+                    x = self.model.maxpool(x)
+                x = self.model.layer1(x)
+                latents.append(x)
+            if self.num_layers > 2:
+                x = self.model.layer2(x)
+                latents.append(x)
+            if self.num_layers > 3:
+                x = self.model.layer3(x)
+                latents.append(x)
+            if self.num_layers > 4:
+                x = self.model.layer4(x)
+                latents.append(x)
+
+            self.latents = latents
+            align_corners = None if self.index_interp == "nearest " else True
+            latent_sz = latents[0].shape[-2:]
+            for i in range(len(latents)):
+                latents[i] = F.interpolate(
+                    latents[i],
+                    latent_sz,
+                    mode=self.upsample_interp,
+                    align_corners=align_corners,
+                )
+            self.latent = torch.cat(latents, dim=1)
+        self.latent_scaling[0] = self.latent.shape[-1]
+        self.latent_scaling[1] = self.latent.shape[-2]
+        self.latent_scaling = self.latent_scaling / (self.latent_scaling - 1) * 2.0
+        return self.latent
+
+    @classmethod
+    def from_conf(cls, conf):
+        return cls(
+            conf.get_string("backbone"),
+            pretrained=conf.get_bool("pretrained", True),
+            num_layers=conf.get_int("num_layers", 4),
+            index_interp=conf.get_string("index_interp", "bilinear"),
+            index_padding=conf.get_string("index_padding", "border"),
+            upsample_interp=conf.get_string("upsample_interp", "bilinear"),
+            feature_scale=conf.get_float("feature_scale", 1.0),
+            use_first_pool=conf.get_bool("use_first_pool", True),
+        )
+
+
+class ImageEncoder(nn.Module):
+    """
+    Global image encoder
+    """
+
+    def __init__(self, backbone="resnet34", pretrained=True, latent_size=128):
+        """
+        :param backbone Backbone network. Assumes it is resnet*
+        e.g. resnet34 | resnet50
+        :param num_layers number of resnet layers to use, 1-5
+        :param pretrained Whether to use model pretrained on ImageNet
+        """
+        super().__init__()
+        self.model = getattr(torchvision.models, backbone)(pretrained=pretrained)
+        self.model.fc = nn.Sequential()
+        self.register_buffer("latent", torch.empty(1, 1), persistent=False)
+        # self.latent (B, L)
+        self.latent_size = latent_size
+        if latent_size != 512:
+            self.fc = nn.Linear(512, latent_size)
+
+    def index(self, uv, cam_z=None, image_size=(), z_bounds=()):
+        """
+        Params ignored (compatibility)
+        :param uv (B, N, 2) only used for shape
+        :return latent vector (B, L, N)
+        """
+        return self.latent.unsqueeze(-1).expand(-1, -1, uv.shape[1])
+
+    def forward(self, x):
+        """
+        For extracting ResNet's features.
+        :param x image (B, C, H, W)
+        :return latent (B, latent_size)
+        """
+        x = x.to(device=self.latent.device)
+        x = self.model.conv1(x)
+        x = self.model.bn1(x)
+        x = self.model.relu(x)
+
+        x = self.model.maxpool(x)
+        x = self.model.layer1(x)
+        x = self.model.layer2(x)
+        x = self.model.layer3(x)
+        x = self.model.layer4(x)
+
+        x = self.model.avgpool(x)
+        x = torch.flatten(x, 1)
+
+        if self.latent_size != 512:
+            x = self.fc(x)
+
+        self.latent = x  # (B, latent_size)
+        return self.latent
+
+    @classmethod
+    def from_conf(cls, conf):
+        return cls(
+            conf.get_string("backbone"),
+            pretrained=conf.get_bool("pretrained", True),
+            latent_size=conf.get_int("latent_size", 128),
+        )
 
 class Decoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False):
+    def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -103,7 +341,7 @@ class Decoder(nn.Module):
         self.b_before = nn.Sequential(*before_skip)
         self.b_after = nn.Sequential(*after_skip)
 
-    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform):
+    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -130,11 +368,14 @@ class Decoder(nn.Module):
         z_fg = z_slots[1:, :]  # (K-1)xC
         query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
         input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
+        input_bg = torch.cat([input_bg, pixel_feat[0:1].squeeze(0)], dim=1)
 
         sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
         query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
         z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
         input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
+        input_fg = torch.cat([input_fg, pixel_feat[1:].flatten(0, 1)], dim=1)
+        # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape
 
         tmp = self.b_before(input_bg)
         bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
@@ -158,6 +399,138 @@ class Decoder(nn.Module):
         raws = masked_raws.sum(dim=0)
 
         return raws, masked_raws, unmasked_raws, masks
+
+class ImplicitNet(nn.Module):
+    """
+    Represents a MLP;
+    Original code from IGR
+    """
+
+    def __init__(
+        self,
+        d_in,
+        dims,
+        skip_in=(),
+        d_out=4,
+        geometric_init=True,
+        radius_init=0.3,
+        beta=0.0,
+        output_init_gain=2.0,
+        num_position_inputs=3,
+        sdf_scale=1.0,
+        dim_excludes_skip=False,
+        combine_layer=1000,
+        combine_type="average",
+    ):
+        """
+        :param d_in input size
+        :param dims dimensions of hidden layers. Num hidden layers == len(dims)
+        :param skip_in layers with skip connections from input (residual)
+        :param d_out output size
+        :param geometric_init if true, uses geometric initialization
+               (to SDF of sphere)
+        :param radius_init if geometric_init, then SDF sphere will have
+               this radius
+        :param beta softplus beta, 100 is reasonable; if <=0 uses ReLU activations instead
+        :param output_init_gain output layer normal std, only used for
+                                output dimension >= 1, when d_out >= 1
+        :param dim_excludes_skip if true, dimension sizes do not include skip
+        connections
+        """
+        super().__init__()
+
+        dims = [d_in] + dims + [d_out]
+        if dim_excludes_skip:
+            for i in range(1, len(dims) - 1):
+                if i in skip_in:
+                    dims[i] += d_in
+
+        self.num_layers = len(dims)
+        self.skip_in = skip_in
+        self.dims = dims
+        self.combine_layer = combine_layer
+        self.combine_type = combine_type
+
+        for layer in range(0, self.num_layers - 1):
+            if layer + 1 in skip_in:
+                out_dim = dims[layer + 1] - d_in
+            else:
+                out_dim = dims[layer + 1]
+            lin = nn.Linear(dims[layer], out_dim)
+
+            # if true preform geometric initialization
+            if geometric_init:
+                if layer == self.num_layers - 2:
+                    # Note our geometric init is negated (compared to IDR)
+                    # since we are using the opposite SDF convention:
+                    # inside is +
+                    nn.init.normal_(
+                        lin.weight[0],
+                        mean=-np.sqrt(np.pi) / np.sqrt(dims[layer]) * sdf_scale,
+                        std=0.00001,
+                    )
+                    nn.init.constant_(lin.bias[0], radius_init)
+                    if d_out > 1:
+                        # More than SDF output
+                        nn.init.normal_(lin.weight[1:], mean=0.0, std=output_init_gain)
+                        nn.init.constant_(lin.bias[1:], 0.0)
+                else:
+                    nn.init.constant_(lin.bias, 0.0)
+                    nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                if d_in > num_position_inputs and (layer == 0 or layer in skip_in):
+                    # Special handling for input to allow positional encoding
+                    nn.init.constant_(lin.weight[:, -d_in + num_position_inputs :], 0.0)
+            else:
+                nn.init.constant_(lin.bias, 0.0)
+                nn.init.kaiming_normal_(lin.weight, a=0, mode="fan_in")
+
+            setattr(self, "lin" + str(layer), lin)
+
+        if beta > 0:
+            self.activation = nn.Softplus(beta=beta)
+        else:
+            # Vanilla ReLU
+            self.activation = nn.ReLU()
+
+    def forward(self, x, combine_inner_dims=(1,)):
+        """
+        :param x (..., d_in)
+        :param combine_inner_dims Combining dimensions for use with multiview inputs.
+        Tensor will be reshaped to (-1, combine_inner_dims, ...) and reduced using combine_type
+        on dim 1, at combine_layer
+        """
+        x_init = x
+        for layer in range(0, self.num_layers - 1):
+            lin = getattr(self, "lin" + str(layer))
+
+            if layer == self.combine_layer:
+                x = util.combine_interleaved(x, combine_inner_dims, self.combine_type)
+                x_init = util.combine_interleaved(
+                    x_init, combine_inner_dims, self.combine_type
+                )
+
+            if layer < self.combine_layer and layer in self.skip_in:
+                x = torch.cat([x, x_init], -1) / np.sqrt(2)
+
+            x = lin(x)
+            if layer < self.num_layers - 2:
+                x = self.activation(x)
+
+        return x
+
+    @classmethod
+    def from_conf(cls, conf, d_in, **kwargs):
+        # PyHocon construction
+        return cls(
+            d_in,
+            conf.get_list("dims"),
+            skip_in=conf.get_list("skip_in"),
+            beta=conf.get_float("beta", 0.0),
+            dim_excludes_skip=conf.get_bool("dim_excludes_skip", False),
+            combine_layer=conf.get_int("combine_layer", 1000),
+            combine_type=conf.get_string("combine_type", "average"),  # average | max
+            **kwargs
+        )
 
 
 class SlotAttention(nn.Module):

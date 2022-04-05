@@ -16,7 +16,7 @@ class Identity(nn.Module):
         return x
 
 
-def get_norm_layer(norm_type='instance'):
+def get_norm_layer(norm_type='instance', group_norm_groups=32):
     """Return a normalization layer
 
     Parameters:
@@ -29,6 +29,8 @@ def get_norm_layer(norm_type='instance'):
         norm_layer = functools.partial(nn.BatchNorm2d, affine=True, track_running_stats=True)
     elif norm_type == 'instance':
         norm_layer = functools.partial(nn.InstanceNorm2d, affine=False, track_running_stats=False)
+    elif norm_type == "group":
+        norm_layer = functools.partial(nn.GroupNorm, group_norm_groups)
     elif norm_type == 'none':
         norm_layer = lambda x: Identity()
     else:
@@ -89,6 +91,8 @@ def init_weights(net, init_type='normal', init_gain=0.02):
                 init.kaiming_normal_(m.weight.data, mode='fan_out', nonlinearity='relu')
             elif init_type == 'orthogonal':
                 init.orthogonal_(m.weight.data, gain=init_gain)
+            elif init_type == 'None':
+                pass
             else:
                 raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
             if hasattr(m, 'bias') and m.bias is not None:
