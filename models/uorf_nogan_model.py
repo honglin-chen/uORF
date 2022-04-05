@@ -9,7 +9,7 @@ import os
 import time
 from .projection import Projection
 from torchvision.transforms import Normalize
-from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder
+from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder
 import pdb
 from util import util
 
@@ -50,6 +50,8 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--far_plane', type=float, default=20)
         parser.add_argument('--fixed_locality', action='store_true', help='enforce locality in world space instead of transformed view space')
         parser.add_argument('--gt_seg', action='store_true', help='replace slot attention with GT segmentation')
+        parser.add_argument('--pixel_decoder', action='store_true', help='change decoder to pixel_decoder')
+        parser.add_argument('--pixel_encoder', action='store_true', help='change encoder to pixel_encoder')
         parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -91,17 +93,26 @@ class uorfNoGanModel(BaseModel):
         self.num_slots = opt.num_slots
         self.netEncoder = networks.init_net(Encoder(3, z_dim=z_dim, bottom=opt.bottom),
                                             gpu_ids=self.gpu_ids, init_type='normal')
-        self.netPixelEncoder = networks.init_net(PixelEncoder(), gpu_ids=self.gpu_ids, init_type='None')
         self.netSlotAttention = networks.init_net(
             SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter, gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
-        self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim+128, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                                                    locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
-        self.netPixelDecoder = None
+        parameters = [self.netEncoder.parameters(), self.netSlotAttention.parameters()]
+        if self.opt.pixel_encoder:
+            self.netPixelEncoder = networks.init_net(PixelEncoder(), gpu_ids=self.gpu_ids, init_type='None')
+            parameters.append(self.netPixelEncoder.parameters())
+            self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, pixel_dim=128, z_dim=opt.z_dim, n_layers=opt.n_layer,
+                                                        locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
+            parameters.append(self.netDecoder.parameters())
+            if self.opt.pixel_decoder:
+                self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim+128, z_dim=opt.z_dim, n_layers=opt.n_layer,
+                                                    locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='None')
+                parameters.append(self.netPixelDecoder.parameters())
+        else:
+            self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
+                                                        locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
+            parameters.append(self.netDecoder.parameters())
 
         if self.isTrain:  # only defined during training time
-            self.optimizer = optim.Adam(chain(
-                self.netEncoder.parameters(), self.netSlotAttention.parameters(), self.netDecoder.parameters()
-            ), lr=opt.lr)
+            self.optimizer = optim.Adam(chain(*parameters), lr=opt.lr)
             self.optimizers = [self.optimizer]
 
         self.L2_loss = nn.MSELoss()
@@ -147,7 +158,8 @@ class uorfNoGanModel(BaseModel):
 
         # Encoding images
         feature_map = self.netEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
-        feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False)) # BxCxHxW
+        if self.opt.pixel_encoder:
+            feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False)) # BxCxHxW
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention
@@ -181,21 +193,33 @@ class uorfNoGanModel(BaseModel):
         sampling_coor_fg = frus_nss_coor[None, ...].expand(K - 1, -1, -1)  # (K-1)xPx3
         sampling_coor_bg = frus_nss_coor  # Px3
 
-        # construct uv in the first image coordinates
-        cam02world = cam2world[0:1] # 1x4x4
-        world2cam0 = cam02world.squeeze(0).inverse() # 4x4
-        frus_cam0_coor = torch.matmul(world2cam0, frus_world_coor.transpose(0, 1)) # 4, 4xNx(WxHxD)
-        pixel_cam0_coor = torch.matmul(self.cam2spixel, frus_cam0_coor) # 4xNx(WxHxD)
-        uv = pixel_cam0_coor[0:2].permute([1, 2, 0]) # Nx(WxHxD)x2
-        uv = uv.flatten(0, 1)[None, ...] # 1x(NxWxHxD)x2
-        pixel_feat = self.netPixelEncoder.index(uv) # 1x(NxWxHxD)x2 -> 1xCx(NxWxHxD)
-        pixel_feat = pixel_feat.transpose(1, 2) # 1x(NxWxHxD)xC
-        pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxWxHxD)xC
-
         W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
-        raws, masked_raws, unmasked_raws, masks = \
-            self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat)
-                        # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
+        if self.opt.pixel_encoder:
+            # construct uv in the first image coordinates
+            cam02world = cam2world[0:1] # 1x4x4
+            world2cam0 = cam02world.squeeze(0).inverse() # 4x4
+            frus_cam0_coor = torch.matmul(world2cam0, frus_world_coor.transpose(0, 1)) # 4, 4xNx(WxHxD)
+            pixel_cam0_coor = torch.matmul(self.cam2spixel, frus_cam0_coor) # 4xNx(WxHxD)
+            uv = pixel_cam0_coor[0:2].permute([1, 2, 0]) # Nx(WxHxD)x2
+            uv = uv.flatten(0, 1)[None, ...] # 1x(NxWxHxD)x2
+            pixel_feat = self.netPixelEncoder.index(uv) # 1x(NxWxHxD)x2 -> 1xCx(NxWxHxD)
+            pixel_feat = pixel_feat.transpose(1, 2) # 1x(NxWxHxD)xC
+            pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxWxHxD)xC
+
+
+            if self.opt.pixel_decoder:
+                raws, masked_raws, unmasked_raws, masks = \
+                    self.netPixelDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat)
+                # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
+            else:
+                raws, masked_raws, unmasked_raws, masks = \
+                    self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat)
+                                # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
+        else:
+            raws, masked_raws, unmasked_raws, masks = \
+                self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0)
+            # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
+
         raws = raws.view([N, D, H, W, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
         masked_raws = masked_raws.view([K, N, D, H, W, 4])
         unmasked_raws = unmasked_raws.view([K, N, D, H, W, 4])

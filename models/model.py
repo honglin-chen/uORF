@@ -7,6 +7,7 @@ from torch.nn import init
 from torchvision.models import vgg16
 from torch import autograd
 from .networks import get_norm_layer
+from .resnetfc import ResnetFC
 
 
 class Encoder(nn.Module):
@@ -300,10 +301,11 @@ class ImageEncoder(nn.Module):
         )
 
 class Decoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False):
+    def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
+        pixel_dim: pixel encoder latent dim (0 or None to disable)
         z_dim: network latent dim
         n_layers: #layers before/after skip connection.
         locality: if True, for each obj slot, clamp sigma values to 0 outside obj_scale.
@@ -316,6 +318,8 @@ class Decoder(nn.Module):
         self.locality_ratio = locality_ratio
         self.fixed_locality = fixed_locality
         self.out_ch = 4
+        if pixel_dim is not None:
+            input_dim += pixel_dim
         before_skip = [nn.Linear(input_dim, z_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(z_dim+input_dim, z_dim), nn.ReLU(True)]
         for i in range(n_layers-1):
@@ -340,6 +344,91 @@ class Decoder(nn.Module):
         after_skip.append(nn.Linear(z_dim, self.out_ch))
         self.b_before = nn.Sequential(*before_skip)
         self.b_after = nn.Sequential(*after_skip)
+
+    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None):
+        """
+        1. pos emb by Fourier
+        2. for each slot, decode all points from coord and slot feature
+        input:
+            sampling_coor_bg: Px3, P = #points, typically P = NxDxHxW
+            sampling_coor_fg: (K-1)xPx3
+            z_slots: KxC, K: #slots, C: #feat_dim
+            fg_transform: If self.fixed_locality, it is 1x4x4 matrix nss2cam0, otherwise it is 1x3x3 azimuth rotation of nss2cam0
+        """
+        K, C = z_slots.shape
+        P = sampling_coor_bg.shape[0]
+
+        if self.fixed_locality:
+            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
+            sampling_coor_fg = torch.cat([sampling_coor_fg, torch.ones_like(sampling_coor_fg[:, :, 0:1])], dim=-1)  # (K-1)xPx4
+            sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx4x1
+            sampling_coor_fg = sampling_coor_fg.squeeze(-1)[:, :, :3]  # (K-1)xPx3
+        else:
+            sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx3x1
+            sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
+            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
+
+        z_bg = z_slots[0:1, :]  # 1xC
+        z_fg = z_slots[1:, :]  # (K-1)xC
+        query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
+        input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
+        if pixel_feat is not None:
+            input_bg = torch.cat([pixel_feat[0:1].squeeze(0), input_bg], dim=1)
+
+        sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
+        query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
+        z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
+        input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
+        if pixel_feat is not None:
+            input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
+            # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape in tdw
+
+        tmp = self.b_before(input_bg)
+        bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
+        tmp = self.f_before(input_fg)
+        tmp = self.f_after(torch.cat([input_fg, tmp], dim=1))  # ((K-1)xP)x64
+        latent_fg = self.f_after_latent(tmp)  # ((K-1)xP)x64
+        fg_raw_rgb = self.f_color(latent_fg).view([K-1, P, 3])  # ((K-1)xP)x3 -> (K-1)xPx3
+        fg_raw_shape = self.f_after_shape(tmp).view([K - 1, P])  # ((K-1)xP)x1 -> (K-1)xP, density
+        if self.locality:
+            fg_raw_shape[outsider_idx] *= 0
+        fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # (K-1)xPx4
+
+        all_raws = torch.cat([bg_raws, fg_raws], dim=0)  # KxPx4
+        raw_masks = F.relu(all_raws[:, :, -1:], True)  # KxPx1
+        masks = raw_masks / (raw_masks.sum(dim=0) + 1e-5)  # KxPx1
+        raw_rgb = (all_raws[:, :, :3].tanh() + 1) / 2
+        raw_sigma = raw_masks
+
+        unmasked_raws = torch.cat([raw_rgb, raw_sigma], dim=2)  # KxPx4
+        masked_raws = unmasked_raws * masks
+        raws = masked_raws.sum(dim=0)
+
+        return raws, masked_raws, unmasked_raws, masks
+
+class PixelDecoder(nn.Module):
+    def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False):
+        """
+        freq: raised frequency
+        input_dim: pos emb dim + slot dim
+        z_dim: network latent dim
+        n_layers: #layers before/after skip connection.
+        locality: if True, for each obj slot, clamp sigma values to 0 outside obj_scale.
+        locality_ratio: if locality, what value is the boundary to clamp?
+        fixed_locality: if True, compute locality in world space instead of in transformed view space
+        """
+        super().__init__()
+        self.n_freq = n_freq
+        self.locality = locality
+        self.locality_ratio = locality_ratio
+        self.fixed_locality = fixed_locality
+        self.out_ch = 4
+        self.d_out = 4
+
+        self.bg = ResnetFC(d_in=input_dim-128, d_out=4, n_blocks=3, d_latent=128, d_hidden=64,
+                          beta=0.0, combine_layer=1, combine_type="average", use_spade=False,)
+        self.fg = ResnetFC(d_in=input_dim-128, d_out=4, n_blocks=3, d_latent=128, d_hidden=64,
+                          beta=0.0, combine_layer=1, combine_type="average", use_spade=False, )
 
     def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat):
         """
@@ -368,25 +457,34 @@ class Decoder(nn.Module):
         z_fg = z_slots[1:, :]  # (K-1)xC
         query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
         input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
-        input_bg = torch.cat([input_bg, pixel_feat[0:1].squeeze(0)], dim=1)
+        input_bg = torch.cat([pixel_feat[0:1].squeeze(0), input_bg], dim=1)
 
         sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
         query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
         z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
         input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
-        input_fg = torch.cat([input_fg, pixel_feat[1:].flatten(0, 1)], dim=1)
+        input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
         # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape
 
-        tmp = self.b_before(input_bg)
-        bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
-        tmp = self.f_before(input_fg)
-        tmp = self.f_after(torch.cat([input_fg, tmp], dim=1))  # ((K-1)xP)x64
-        latent_fg = self.f_after_latent(tmp)  # ((K-1)xP)x64
-        fg_raw_rgb = self.f_color(latent_fg).view([K-1, P, 3])  # ((K-1)xP)x3 -> (K-1)xPx3
-        fg_raw_shape = self.f_after_shape(tmp).view([K - 1, P])  # ((K-1)xP)x1 -> (K-1)xP, density
+        # Camera frustum culling stuff, currently disabled
+        combine_index = None
+        dim_size = None
+        self.num_views_per_obj = 1
+        B = input_fg.shape[0] # B is batch of points (in rays)
+
+        # Run main NeRF network
+        mlp_output_fg = self.fg(input_fg, combine_inner_dims=(self.num_views_per_obj, B),)
+        mlp_output_bg = self.bg(input_bg, combine_inner_dims=(self.num_views_per_obj, B//(K-1)),)
+
+        mlp_output_fg = mlp_output_fg.reshape(-1, B//(K-1), self.d_out)
+        fg_raw_shape = mlp_output_fg[..., 3]
+        fg_raw_rgb = mlp_output_fg[..., :3]
         if self.locality:
             fg_raw_shape[outsider_idx] *= 0
         fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # (K-1)xPx4
+
+        mlp_output_bg = mlp_output_bg.reshape(-1, B//(K-1), self.d_out)
+        bg_raws = mlp_output_bg
 
         all_raws = torch.cat([bg_raws, fg_raws], dim=0)  # KxPx4
         raw_masks = F.relu(all_raws[:, :, -1:], True)  # KxPx1
@@ -399,138 +497,6 @@ class Decoder(nn.Module):
         raws = masked_raws.sum(dim=0)
 
         return raws, masked_raws, unmasked_raws, masks
-
-class ImplicitNet(nn.Module):
-    """
-    Represents a MLP;
-    Original code from IGR
-    """
-
-    def __init__(
-        self,
-        d_in,
-        dims,
-        skip_in=(),
-        d_out=4,
-        geometric_init=True,
-        radius_init=0.3,
-        beta=0.0,
-        output_init_gain=2.0,
-        num_position_inputs=3,
-        sdf_scale=1.0,
-        dim_excludes_skip=False,
-        combine_layer=1000,
-        combine_type="average",
-    ):
-        """
-        :param d_in input size
-        :param dims dimensions of hidden layers. Num hidden layers == len(dims)
-        :param skip_in layers with skip connections from input (residual)
-        :param d_out output size
-        :param geometric_init if true, uses geometric initialization
-               (to SDF of sphere)
-        :param radius_init if geometric_init, then SDF sphere will have
-               this radius
-        :param beta softplus beta, 100 is reasonable; if <=0 uses ReLU activations instead
-        :param output_init_gain output layer normal std, only used for
-                                output dimension >= 1, when d_out >= 1
-        :param dim_excludes_skip if true, dimension sizes do not include skip
-        connections
-        """
-        super().__init__()
-
-        dims = [d_in] + dims + [d_out]
-        if dim_excludes_skip:
-            for i in range(1, len(dims) - 1):
-                if i in skip_in:
-                    dims[i] += d_in
-
-        self.num_layers = len(dims)
-        self.skip_in = skip_in
-        self.dims = dims
-        self.combine_layer = combine_layer
-        self.combine_type = combine_type
-
-        for layer in range(0, self.num_layers - 1):
-            if layer + 1 in skip_in:
-                out_dim = dims[layer + 1] - d_in
-            else:
-                out_dim = dims[layer + 1]
-            lin = nn.Linear(dims[layer], out_dim)
-
-            # if true preform geometric initialization
-            if geometric_init:
-                if layer == self.num_layers - 2:
-                    # Note our geometric init is negated (compared to IDR)
-                    # since we are using the opposite SDF convention:
-                    # inside is +
-                    nn.init.normal_(
-                        lin.weight[0],
-                        mean=-np.sqrt(np.pi) / np.sqrt(dims[layer]) * sdf_scale,
-                        std=0.00001,
-                    )
-                    nn.init.constant_(lin.bias[0], radius_init)
-                    if d_out > 1:
-                        # More than SDF output
-                        nn.init.normal_(lin.weight[1:], mean=0.0, std=output_init_gain)
-                        nn.init.constant_(lin.bias[1:], 0.0)
-                else:
-                    nn.init.constant_(lin.bias, 0.0)
-                    nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                if d_in > num_position_inputs and (layer == 0 or layer in skip_in):
-                    # Special handling for input to allow positional encoding
-                    nn.init.constant_(lin.weight[:, -d_in + num_position_inputs :], 0.0)
-            else:
-                nn.init.constant_(lin.bias, 0.0)
-                nn.init.kaiming_normal_(lin.weight, a=0, mode="fan_in")
-
-            setattr(self, "lin" + str(layer), lin)
-
-        if beta > 0:
-            self.activation = nn.Softplus(beta=beta)
-        else:
-            # Vanilla ReLU
-            self.activation = nn.ReLU()
-
-    def forward(self, x, combine_inner_dims=(1,)):
-        """
-        :param x (..., d_in)
-        :param combine_inner_dims Combining dimensions for use with multiview inputs.
-        Tensor will be reshaped to (-1, combine_inner_dims, ...) and reduced using combine_type
-        on dim 1, at combine_layer
-        """
-        x_init = x
-        for layer in range(0, self.num_layers - 1):
-            lin = getattr(self, "lin" + str(layer))
-
-            if layer == self.combine_layer:
-                x = util.combine_interleaved(x, combine_inner_dims, self.combine_type)
-                x_init = util.combine_interleaved(
-                    x_init, combine_inner_dims, self.combine_type
-                )
-
-            if layer < self.combine_layer and layer in self.skip_in:
-                x = torch.cat([x, x_init], -1) / np.sqrt(2)
-
-            x = lin(x)
-            if layer < self.num_layers - 2:
-                x = self.activation(x)
-
-        return x
-
-    @classmethod
-    def from_conf(cls, conf, d_in, **kwargs):
-        # PyHocon construction
-        return cls(
-            d_in,
-            conf.get_list("dims"),
-            skip_in=conf.get_list("skip_in"),
-            beta=conf.get_float("beta", 0.0),
-            dim_excludes_skip=conf.get_bool("dim_excludes_skip", False),
-            combine_layer=conf.get_int("combine_layer", 1000),
-            combine_type=conf.get_string("combine_type", "average"),  # average | max
-            **kwargs
-        )
 
 
 class SlotAttention(nn.Module):
