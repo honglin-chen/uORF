@@ -7,9 +7,9 @@ python train_without_gan.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_eac
     --checkpoints_dir 'checkpoints' --name $DATAROOT \
     --display_port $PORT --display_ncols 4 --print_freq 200 --display_freq 200 --display_grad \
     --load_size 128 --n_samp 64 --input_size 64 --supervision_size 64 --z_dim 64 --num_slots 5 \
-    --nss_scale 10 --obj_scale 8 --fixed_locality --niter 2000 --coarse_epoch 1000 \
+    --niter 2000 --coarse_epoch 1000 \
     --model 'uorf_nogan' \
     --focal_ratio 0.9605 0.9605 \
-    --near_plane 1 --far_plane 18 --gt_seg
+    --near_plane 2 --far_plane 12 --gt_seg
 # done
 echo "Done"
