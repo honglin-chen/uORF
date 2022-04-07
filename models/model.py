@@ -407,7 +407,7 @@ class Decoder(nn.Module):
         return raws, masked_raws, unmasked_raws, masks
 
 class PixelDecoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False):
+    def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, pixel_positional_encoding=False, use_ray_dir=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -424,13 +424,22 @@ class PixelDecoder(nn.Module):
         self.fixed_locality = fixed_locality
         self.out_ch = 4
         self.d_out = 4
+        self.pixel_positional_encoding = pixel_positional_encoding
+        self.use_ray_dir = use_ray_dir
+        if pixel_positional_encoding:
+            self.positional_encoding = PositionalEncoding(num_freqs=6, d_in=3, freq_factor=np.pi, include_input=True)
+            input_dim += self.positional_encoding.d_out
+            print(self.positional_encoding.d_out)
+        if use_ray_dir:
+            input_dim += 3
 
+        print(input_dim, 'input_dim')
         self.bg = ResnetFC(d_in=input_dim-128, d_out=4, n_blocks=3, d_latent=128, d_hidden=64,
                           beta=0.0, combine_layer=1, combine_type="average", use_spade=False,)
         self.fg = ResnetFC(d_in=input_dim-128, d_out=4, n_blocks=3, d_latent=128, d_hidden=64,
-                          beta=0.0, combine_layer=1, combine_type="average", use_spade=False, )
+                          beta=0.0, combine_layer=1, combine_type="average", use_spade=False,)
 
-    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat):
+    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat, ray_dir=None):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -440,7 +449,10 @@ class PixelDecoder(nn.Module):
             z_slots: KxC, K: #slots, C: #feat_dim
             fg_transform: If self.fixed_locality, it is 1x4x4 matrix nss2cam0, otherwise it is 1x3x3 azimuth rotation of nss2cam0
         """
-        K, C = z_slots.shape
+        if self.pixel_positional_encoding:
+            K = 2
+        else:
+            K, C = z_slots.shape
         P = sampling_coor_bg.shape[0]
 
         if self.fixed_locality:
@@ -453,17 +465,30 @@ class PixelDecoder(nn.Module):
             sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
 
-        z_bg = z_slots[0:1, :]  # 1xC
-        z_fg = z_slots[1:, :]  # (K-1)xC
-        query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
-        input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
+        if not self.pixel_positional_encoding:
+            z_bg = z_slots[0:1, :]  # 1xC
+            z_fg = z_slots[1:, :]  # (K-1)xC
+        if not self.pixel_positional_encoding:
+            query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
+            input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
+        else:
+            input_bg = self.positional_encoding(sampling_coor_bg)
         input_bg = torch.cat([pixel_feat[0:1].squeeze(0), input_bg], dim=1)
+        if ray_dir is not None:
+            input_bg = torch.cat([input_bg, ray_dir.expand(P, -1)], dim=1)
 
         sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
-        query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
-        z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
-        input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
+        if not self.pixel_positional_encoding:
+            query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
+        else:
+            input_fg = self.positional_encoding(sampling_coor_fg_)
+        if not self.pixel_positional_encoding:
+            z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
+            input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
         input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
+        if ray_dir is not None:
+            input_fg = torch.cat([input_fg, ray_dir.expand(P, -1)], dim=1)
+            #TODO: need to generalize for the case K-1 != 1
         # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape
 
         # Camera frustum culling stuff, currently disabled
@@ -472,6 +497,8 @@ class PixelDecoder(nn.Module):
         self.num_views_per_obj = 1
         B = input_fg.shape[0] # B is batch of points (in rays)
 
+        # print(input_fg.shape, 'input_fg.shape')
+        # print(input_bg.shape, 'input_bg.shape')
         # Run main NeRF network
         mlp_output_fg = self.fg(input_fg, combine_inner_dims=(self.num_views_per_obj, B),)
         mlp_output_bg = self.bg(input_bg, combine_inner_dims=(self.num_views_per_obj, B//(K-1)),)
@@ -895,3 +922,54 @@ class Discriminator(nn.Module):
 
         return out
 
+
+import torch.autograd.profiler as profiler
+import numpy as np
+
+class PositionalEncoding(torch.nn.Module):
+    """
+    Implement NeRF's positional encoding
+    """
+
+    def __init__(self, num_freqs=6, d_in=3, freq_factor=np.pi, include_input=True):
+        super().__init__()
+        self.num_freqs = num_freqs
+        self.d_in = d_in
+        self.freqs = freq_factor * 2.0 ** torch.arange(0, num_freqs)
+        self.d_out = self.num_freqs * 2 * d_in
+        self.include_input = include_input
+        if include_input:
+            self.d_out += d_in
+        # f1 f1 f2 f2 ... to multiply x by
+        self.register_buffer(
+            "_freqs", torch.repeat_interleave(self.freqs, 2).view(1, -1, 1)
+        )
+        # 0 pi/2 0 pi/2 ... so that
+        # (sin(x + _phases[0]), sin(x + _phases[1]) ...) = (sin(x), cos(x)...)
+        _phases = torch.zeros(2 * self.num_freqs)
+        _phases[1::2] = np.pi * 0.5
+        self.register_buffer("_phases", _phases.view(1, -1, 1))
+
+    def forward(self, x):
+        """
+        Apply positional encoding (new implementation)
+        :param x (batch, self.d_in)
+        :return (batch, self.d_out)
+        """
+        with profiler.record_function("positional_enc"):
+            embed = x.unsqueeze(1).repeat(1, self.num_freqs * 2, 1)
+            embed = torch.sin(torch.addcmul(self._phases, embed, self._freqs))
+            embed = embed.view(x.shape[0], -1)
+            if self.include_input:
+                embed = torch.cat((x, embed), dim=-1)
+            return embed
+
+    @classmethod
+    def from_conf(cls, conf, d_in=3):
+        # PyHocon construction
+        return cls(
+            conf.get_int("num_freqs", 6),
+            d_in,
+            conf.get_float("freq_factor", np.pi),
+            conf.get_bool("include_input", True),
+        )
