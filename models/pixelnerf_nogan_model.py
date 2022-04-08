@@ -106,14 +106,14 @@ class pixelnerfNoGanModel(BaseModel):
         # self.nets.append(self.netSlotAttention)
         # parameters.extend([self.netEncoder.parameters(), self.netSlotAttention.parameters()])
         if self.opt.pixel_encoder:
-            self.netPixelEncoder = networks.init_net(PixelEncoder(), gpu_ids=self.gpu_ids, init_type='None')
+            self.netPixelEncoder = networks.init_net(PixelEncoder(reduce_latent_size=False), gpu_ids=self.gpu_ids, init_type='None')
             parameters.append(self.netPixelEncoder.parameters())
             self.nets.append(self.netPixelEncoder)
-            self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, pixel_dim=128, z_dim=opt.z_dim, n_layers=opt.n_layer,
+            self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, pixel_dim=512, z_dim=opt.z_dim, n_layers=opt.n_layer,
                                                         locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
             # parameters.append(self.netDecoder.parameters())
             if self.opt.pixel_decoder:
-                self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=128, z_dim=opt.z_dim, n_layers=opt.n_layer,
+                self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=512, z_dim=opt.z_dim, n_layers=opt.n_layer,
                                                     locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality, pixel_positional_encoding=True, use_ray_dir=True), gpu_ids=self.gpu_ids, init_type='None')
                 parameters.append(self.netPixelDecoder.parameters())
                 self.nets.append(self.netPixelDecoder)
@@ -223,32 +223,19 @@ class pixelnerfNoGanModel(BaseModel):
         if self.opt.pixel_encoder:
             # construct uv in the first image coordinates
             cam02world = cam2world[0:1] # 1x4x4
-            world2cam0 = cam02world.inverse() # 4x4
-            nss2world = self.world2nss.inverse()
-            # print(world2cam0[None, ...].shape, 'a')
-            # print(frus_world_coor[..., None].shape, 'b') # Nx4x(WxHxD)
-            frus_world_coor = frus_world_coor.transpose(1, 2)
-            # print(frus_nss_coor.shape, 'frus_nss_coor.shape')
-            frus_nss_coor = torch.cat([frus_nss_coor, torch.ones_like(frus_nss_coor[:, 0].unsqueeze(1))], dim=-1)
-            # print(frus_nss_coor.shape, 'frus_nss_coor.shape after transform')
-            frus_world_coor = torch.matmul(nss2world[None, ...], frus_nss_coor[None, ..., None])
-            # frus_cam0_coor = torch.matmul(world2cam0[None, ...], frus_world_coor[..., None]) # 1x1x4x4, Nx(WxHxD)x4x1
-            frus_cam0_coor = torch.matmul(world2cam0[None, ...], frus_world_coor)
-            # print(frus_cam0_coor)
-            pixel_cam0_coor = torch.matmul(self.cam2spixel[None, ...], frus_cam0_coor) # 1x1x4x4, Nx(WxHxD)x4x1
-            pixel_cam0_coor = pixel_cam0_coor.squeeze(-1)
-            # print(pixel_cam0_coor[:, :, 3], 'pixel_cam0_coor last (should be 1.)')
-            uv = pixel_cam0_coor[:, :, 0:2]/pixel_cam0_coor[:, :, 2].unsqueeze(-1) # Nx(WxHxD)x2
-            uv = (uv/frustum_size[0:2][None, None, :] - 0.5) * 2
-            # uv = uv.flatten(0, 1)[None, ...]/frustum_size[0:2][None, None, :] # 1x(NxWxHxD)x2
-            # uv = uv.flatten(0, 1)[None, ...]
-            # print(uv.shape, 'uv.shape')
-            # print(uv, 'uv')
-            # print(uv.max(), uv.min(), 'uv max min')
-            u = uv[..., 0]
-            v = uv[..., 1]
-            print(u.max(), u.min(), u.median(), u.mean(), u.std(), 'u max min median mean std')
-            print(v.max(), v.min(), v.median(), v.mean(), v.std(), 'v max min median mean std')
+            world2cam0 = cam02world.inverse() # 1x4x4
+            nss2world = self.world2nss.inverse() # 1x4x4
+            frus_nss_coor = torch.cat([frus_nss_coor, torch.ones_like(frus_nss_coor[:, 0].unsqueeze(1))], dim=-1) # Px4
+            frus_world_coor = torch.matmul(nss2world[None, ...], frus_nss_coor[None, ..., None]) # 1xPx4x1
+            frus_cam0_coor = torch.matmul(world2cam0[None, ...], frus_world_coor) #1x1x4x4, 1x(NxWxHxD)x4x1 -> 1x(NxWxHxD)x4x1
+            pixel_cam0_coor = torch.matmul(self.cam2spixel[None, ...], frus_cam0_coor) # 1x1x4x4, 1x(NxWxHxD)x4x1
+            pixel_cam0_coor = pixel_cam0_coor.squeeze(-1) # 1x(NxWxHxD)x4
+            uv = pixel_cam0_coor[:, :, 0:2]/pixel_cam0_coor[:, :, 2].unsqueeze(-1) # 1x(NxWxHxD)x2
+            uv = (uv/frustum_size[0:2][None, None, :] - 0.5) * 2 # nomalize to fit in with [-1, 1] grid #
+            '''
+            tensor(3.4756, device='cuda:0') tensor(-4.4286, device='cuda:0') tensor(-0.0233, device='cuda:0') tensor(-0.0241, device='cuda:0') tensor(0.6644, device='cuda:0') u max min median mean std
+            tensor(12.8928, device='cuda:0') tensor(-1.7501, device='cuda:0') tensor(1.1921e-07, device='cuda:0') tensor(0.1183, device='cuda:0') tensor(0.9658, device='cuda:0') v max min median mean std
+            '''
             pixel_feat = self.netPixelEncoder.index(uv) # 1x(NxWxHxD)x2 -> 1xCx(NxWxHxD)
             pixel_feat = pixel_feat.transpose(1, 2) # 1x(NxWxHxD)xC
             pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxWxHxD)xC

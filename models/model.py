@@ -79,13 +79,14 @@ class PixelEncoder(nn.Module):
         self,
         backbone="resnet34",
         pretrained=True,
-        num_layers=2, # 4 in pixelnerf
+        num_layers=4, # 4 in pixelnerf
         index_interp="bilinear",
         index_padding="border",
         upsample_interp="bilinear",
         feature_scale=1.0,
         use_first_pool=True,
         norm_type="batch",
+        reduce_latent_size=True,
     ):
         """
         :param backbone Backbone network. Either custom, in which case
@@ -110,6 +111,7 @@ class PixelEncoder(nn.Module):
         self.use_custom_resnet = backbone == "custom"
         self.feature_scale = feature_scale
         self.use_first_pool = use_first_pool
+        self.reduce_latent_size = reduce_latent_size
         norm_layer = get_norm_layer(norm_type)
 
         if self.use_custom_resnet:
@@ -126,6 +128,8 @@ class PixelEncoder(nn.Module):
             self.model.fc = nn.Sequential()
             self.model.avgpool = nn.Sequential()
             self.latent_size = [0, 64, 128, 256, 512, 1024][num_layers]
+            if self.reduce_latent_size:
+                self.mlp = nn.Linear(self.latent_size, 128)
 
         self.num_layers = num_layers
         self.index_interp = index_interp
@@ -159,7 +163,6 @@ class PixelEncoder(nn.Module):
                     uv = uv * scale - 1.0
 
             uv = uv.unsqueeze(2)  # (B, N, 1, 2)
-            # print(uv, 'uv in index')
             samples = F.grid_sample(
                 self.latent,
                 uv,
@@ -222,6 +225,8 @@ class PixelEncoder(nn.Module):
         self.latent_scaling[0] = self.latent.shape[-1]
         self.latent_scaling[1] = self.latent.shape[-2]
         self.latent_scaling = self.latent_scaling / (self.latent_scaling - 1) * 2.0
+        if self.reduce_latent_size:
+            self.latent = self.mlp(self.latent.transpose(3, 1)).transpose(3, 1)
         return self.latent
 
     @classmethod

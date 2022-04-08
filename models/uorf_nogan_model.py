@@ -182,8 +182,8 @@ class uorfNoGanModel(BaseModel):
             frus_nss_coor, z_vals, ray_dir, frus_world_coor = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             self.cam2spixel = self.projection.cam2spixel
+            self.world2nss = self.projection.world2nss
             frustum_size = torch.Tensor(self.projection.frustum_size).to(self.device)
-
             x = F.interpolate(self.x, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
             self.z_vals, self.ray_dir = z_vals, ray_dir
         else:
@@ -193,8 +193,8 @@ class uorfNoGanModel(BaseModel):
             frus_nss_coor, z_vals, ray_dir, frus_world_coor = self.projection_fine.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             self.cam2spixel = self.projection_fine.cam2spixel
+            self.world2nss = self.projection_fine.world2nss
             frustum_size = torch.Tensor(self.projection_fine.frustum_size).to(self.device)
-
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor.view([N, D, H, W, 3]), z_vals.view([N, H, W, D]), ray_dir.view([N, H, W, 3])
             H_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             W_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
@@ -210,12 +210,20 @@ class uorfNoGanModel(BaseModel):
         if self.opt.pixel_encoder:
             # construct uv in the first image coordinates
             cam02world = cam2world[0:1] # 1x4x4
-            world2cam0 = cam02world.squeeze(0).inverse() # 4x4
-            frus_cam0_coor = torch.matmul(world2cam0, frus_world_coor.transpose(0, 1)) # 4, 4xNx(WxHxD)
-            pixel_cam0_coor = torch.matmul(self.cam2spixel, frus_cam0_coor) # 4xNx(WxHxD)
-            uv = (pixel_cam0_coor[0:2]/pixel_cam0_coor[2]).permute([1, 2, 0]) # Nx(WxHxD)x2
-            uv = uv.flatten(0, 1)[None, ...] # 1x(NxWxHxD)x2
-            pixel_feat = self.netPixelEncoder.index(uv, image_size=frustum_size[0:2]) # 1x(NxWxHxD)x2 -> 1xCx(NxWxHxD)
+            world2cam0 = cam02world.inverse() # 1x4x4
+            nss2world = self.world2nss.inverse() # 1x4x4
+            frus_nss_coor = torch.cat([frus_nss_coor, torch.ones_like(frus_nss_coor[:, 0].unsqueeze(1))], dim=-1) # Px4
+            frus_world_coor = torch.matmul(nss2world[None, ...], frus_nss_coor[None, ..., None]) # 1xPx4x1
+            frus_cam0_coor = torch.matmul(world2cam0[None, ...], frus_world_coor) #1x1x4x4, 1x(NxWxHxD)x4x1 -> 1x(NxWxHxD)x4x1
+            pixel_cam0_coor = torch.matmul(self.cam2spixel[None, ...], frus_cam0_coor) # 1x1x4x4, 1x(NxWxHxD)x4x1
+            pixel_cam0_coor = pixel_cam0_coor.squeeze(-1) # 1x(NxWxHxD)x4
+            uv = pixel_cam0_coor[:, :, 0:2]/pixel_cam0_coor[:, :, 2].unsqueeze(-1) # 1x(NxWxHxD)x2
+            uv = (uv/frustum_size[0:2][None, None, :] - 0.5) * 2 # nomalize to fit in with [-1, 1] grid #
+            '''
+            tensor(3.4756, device='cuda:0') tensor(-4.4286, device='cuda:0') tensor(-0.0233, device='cuda:0') tensor(-0.0241, device='cuda:0') tensor(0.6644, device='cuda:0') u max min median mean std
+            tensor(12.8928, device='cuda:0') tensor(-1.7501, device='cuda:0') tensor(1.1921e-07, device='cuda:0') tensor(0.1183, device='cuda:0') tensor(0.9658, device='cuda:0') v max min median mean std
+            '''
+            pixel_feat = self.netPixelEncoder.index(uv) # 1x(NxWxHxD)x2 -> 1xCx(NxWxHxD)
             pixel_feat = pixel_feat.transpose(1, 2) # 1x(NxWxHxD)xC
             pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxWxHxD)xC
 
