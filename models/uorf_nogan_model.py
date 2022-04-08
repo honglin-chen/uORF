@@ -121,7 +121,7 @@ class uorfNoGanModel(BaseModel):
             self.nets.append(self.netDecoder)
 
         if self.isTrain:  # only defined during training time
-            self.optimizer = optim.Adam(chain(*parameters), lr=opt.lr)
+            self.optimizer = optim.Adam(chain(*self.parameters), lr=opt.lr)
             self.optimizers = [self.optimizer]
 
         self.L2_loss = nn.MSELoss()
@@ -182,6 +182,8 @@ class uorfNoGanModel(BaseModel):
             frus_nss_coor, z_vals, ray_dir, frus_world_coor = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             self.cam2spixel = self.projection.cam2spixel
+            frustum_size = torch.Tensor(self.projection.frustum_size).to(self.device)
+
             x = F.interpolate(self.x, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
             self.z_vals, self.ray_dir = z_vals, ray_dir
         else:
@@ -190,7 +192,9 @@ class uorfNoGanModel(BaseModel):
             rs = self.opt.render_size
             frus_nss_coor, z_vals, ray_dir, frus_world_coor = self.projection_fine.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
-            self.cam2spixel = self.projection.cam2spixel
+            self.cam2spixel = self.projection_fine.cam2spixel
+            frustum_size = torch.Tensor(self.projection_fine.frustum_size).to(self.device)
+
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor.view([N, D, H, W, 3]), z_vals.view([N, H, W, D]), ray_dir.view([N, H, W, 3])
             H_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             W_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
@@ -209,9 +213,9 @@ class uorfNoGanModel(BaseModel):
             world2cam0 = cam02world.squeeze(0).inverse() # 4x4
             frus_cam0_coor = torch.matmul(world2cam0, frus_world_coor.transpose(0, 1)) # 4, 4xNx(WxHxD)
             pixel_cam0_coor = torch.matmul(self.cam2spixel, frus_cam0_coor) # 4xNx(WxHxD)
-            uv = pixel_cam0_coor[0:2].permute([1, 2, 0]) # Nx(WxHxD)x2
+            uv = (pixel_cam0_coor[0:2]/pixel_cam0_coor[2]).permute([1, 2, 0]) # Nx(WxHxD)x2
             uv = uv.flatten(0, 1)[None, ...] # 1x(NxWxHxD)x2
-            pixel_feat = self.netPixelEncoder.index(uv) # 1x(NxWxHxD)x2 -> 1xCx(NxWxHxD)
+            pixel_feat = self.netPixelEncoder.index(uv, image_size=frustum_size[0:2]) # 1x(NxWxHxD)x2 -> 1xCx(NxWxHxD)
             pixel_feat = pixel_feat.transpose(1, 2) # 1x(NxWxHxD)xC
             pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxWxHxD)xC
 

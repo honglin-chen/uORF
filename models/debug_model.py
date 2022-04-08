@@ -13,7 +13,7 @@ from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outp
 import pdb
 from util import util
 
-class pixelnerfNoGanModel(BaseModel):
+class debugModel(BaseModel):
 
     @staticmethod
     def modify_commandline_options(parser, is_train=True):
@@ -53,7 +53,6 @@ class pixelnerfNoGanModel(BaseModel):
         parser.add_argument('--pixel_decoder', action='store_true', help='change decoder to pixel_decoder')
         parser.add_argument('--pixel_encoder', action='store_true', help='change encoder to pixel_encoder')
         parser.add_argument('--pixel_nerf', action='store_true', help='change model to pixelnerf')
-        parser.add_argument('--no_use_background', action='store_true', help='do not use backbround')
         parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -75,14 +74,11 @@ class pixelnerfNoGanModel(BaseModel):
         BaseModel.__init__(self, opt)  # call the initialization method of BaseModel
         self.loss_names = ['recon', 'perc']
         n = opt.n_img_each_scene
-        num_slots = opt.num_slots
-        if opt.no_use_background:
-            num_slots = opt.num_slots - 1
         self.visual_names = ['x{}'.format(i) for i in range(n)] + \
                             ['x_rec{}'.format(i) for i in range(n)] + \
-                            ['slot{}_view{}'.format(k, i) for k in range(num_slots) for i in range(n)] + \
-                            ['unmasked_slot{}_view{}'.format(k, i) for k in range(num_slots) for i in range(n)] + \
-                            ['slot{}_attn'.format(k) for k in range(num_slots)]
+                            ['slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
+                            ['unmasked_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
+                            ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
         self.model_names = ['PixelEncoder', 'PixelDecoder']
         self.perceptual_net = get_perceptual_net().cuda()
         self.vgg_norm = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -191,8 +187,7 @@ class pixelnerfNoGanModel(BaseModel):
             frus_nss_coor, z_vals, ray_dir, frus_world_coor = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             self.cam2spixel = self.projection.cam2spixel
-            self.world2nss = self.projection.world2nss
-            frustum_size = torch.Tensor(self.projection.frustum_size).to(self.device)
+            frustum_size = self.projection.frustum_size
             x = F.interpolate(self.x, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
             self.z_vals, self.ray_dir = z_vals, ray_dir
             ray_dir_input = ray_dir.view([N, H, W, 3])
@@ -204,8 +199,7 @@ class pixelnerfNoGanModel(BaseModel):
             frus_nss_coor, z_vals, ray_dir, frus_world_coor = self.projection_fine.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             self.cam2spixel = self.projection_fine.cam2spixel
-            self.world2nss = self.projection_fine.world2nss
-            frustum_size = torch.Tensor(self.projection_fine.frustum_size).to(self.device)
+            frustum_size = self.projection_fine.frustum_size
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor.view([N, D, H, W, 3]), z_vals.view([N, H, W, D]), ray_dir.view([N, H, W, 3])
             ray_dir_input = ray_dir
             ray_dir_input = ray_dir_input[:, None, ...].expand(-1, D, -1, -1, -1).flatten(0, 3)
@@ -223,41 +217,25 @@ class pixelnerfNoGanModel(BaseModel):
         if self.opt.pixel_encoder:
             # construct uv in the first image coordinates
             cam02world = cam2world[0:1] # 1x4x4
-            world2cam0 = cam02world.inverse() # 4x4
-            nss2world = self.world2nss.inverse()
-            # print(world2cam0[None, ...].shape, 'a')
-            # print(frus_world_coor[..., None].shape, 'b') # Nx4x(WxHxD)
-            frus_world_coor = frus_world_coor.transpose(1, 2)
-            # print(frus_nss_coor.shape, 'frus_nss_coor.shape')
-            frus_nss_coor = torch.cat([frus_nss_coor, torch.ones_like(frus_nss_coor[:, 0].unsqueeze(1))], dim=-1)
-            # print(frus_nss_coor.shape, 'frus_nss_coor.shape after transform')
-            frus_world_coor = torch.matmul(nss2world[None, ...], frus_nss_coor[None, ..., None])
-            # frus_cam0_coor = torch.matmul(world2cam0[None, ...], frus_world_coor[..., None]) # 1x1x4x4, Nx(WxHxD)x4x1
-            frus_cam0_coor = torch.matmul(world2cam0[None, ...], frus_world_coor)
-            # print(frus_cam0_coor)
-            pixel_cam0_coor = torch.matmul(self.cam2spixel[None, ...], frus_cam0_coor) # 1x1x4x4, Nx(WxHxD)x4x1
-            pixel_cam0_coor = pixel_cam0_coor.squeeze(-1)
-            # print(pixel_cam0_coor[:, :, 3], 'pixel_cam0_coor last (should be 1.)')
-            uv = pixel_cam0_coor[:, :, 0:2]/pixel_cam0_coor[:, :, 2].unsqueeze(-1) # Nx(WxHxD)x2
-            uv = (uv/frustum_size[0:2][None, None, :] - 0.5) * 2
-            # uv = uv.flatten(0, 1)[None, ...]/frustum_size[0:2][None, None, :] # 1x(NxWxHxD)x2
-            # uv = uv.flatten(0, 1)[None, ...]
-            # print(uv.shape, 'uv.shape')
+            # print(cam02world, 'cam02world')
+            world2cam0 = cam02world.inverse().squeeze(0) # 4x4
+            # print(world2cam0, 'world2cam0')
+            frus_cam0_coor = torch.matmul(world2cam0, frus_world_coor.transpose(0, 1)) # 4, 4xNx(WxHxD)
+            # print(frus_cam0_coor, 'frus_cam0_coor')
+            pixel_cam0_coor = torch.matmul(self.cam2spixel, frus_cam0_coor) # 4xNx(WxHxD)
+            # print(pixel_cam0_coor, 'pixel_cam0_coor')
+            uv = (pixel_cam0_coor[0:2]/pixel_cam0_coor[2]).permute([1, 2, 0]) # Nx(WxHxD)x2
             # print(uv, 'uv')
-            # print(uv.max(), uv.min(), 'uv max min')
-            u = uv[..., 0]
-            v = uv[..., 1]
-            print(u.max(), u.min(), u.median(), u.mean(), u.std(), 'u max min median mean std')
-            print(v.max(), v.min(), v.median(), v.mean(), v.std(), 'v max min median mean std')
-            pixel_feat = self.netPixelEncoder.index(uv) # 1x(NxWxHxD)x2 -> 1xCx(NxWxHxD)
+            uv = uv.flatten(0, 1)[None, ...] # 1x(NxWxHxD)x2
+            pixel_feat = self.netPixelEncoder.index(uv, image_size=frustum_size[0:2]) # 1x(NxWxHxD)x2 -> 1xCx(NxWxHxD)
             pixel_feat = pixel_feat.transpose(1, 2) # 1x(NxWxHxD)xC
             pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxWxHxD)xC
+            # print(pixel_feat, 'pixel_feat')
 
 
             if self.opt.pixel_decoder:
-                use_background = False if self.opt.no_use_background else True
                 raws, masked_raws, unmasked_raws, masks = \
-                    self.netPixelDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, ray_dir_input, use_background)
+                    self.netPixelDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, ray_dir_input)
                 # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
             # else:
             #     raws, masked_raws, unmasked_raws, masks = \
@@ -267,10 +245,6 @@ class pixelnerfNoGanModel(BaseModel):
         #     raws, masked_raws, unmasked_raws, masks = \
         #         self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0)
             # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
-
-        if self.opt.no_use_background:
-            K = K-1
-            attn = attn[0, ...]
 
         raws = raws.view([N, D, H, W, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
         masked_raws = masked_raws.view([K, N, D, H, W, 4])
@@ -289,10 +263,7 @@ class pixelnerfNoGanModel(BaseModel):
             attn = attn.detach().cpu()  # KxN
             H_, W_ = feature_map_pixel.shape[2], feature_map_pixel.shape[3]
             # H_, W_ = pixel_feat.shape[2], pixel_feat.shape[3]
-            num_slots = self.opt.num_slots
-            if self.opt.no_use_background:
-                num_slots += -1
-            attn = attn.view(num_slots, 1, H_, W_)
+            attn = attn.view(self.opt.num_slots, 1, H_, W_)
             if H_ != H:
                 pass
                 attn = F.interpolate(attn, size=[H, W], mode='bilinear')
@@ -308,10 +279,7 @@ class pixelnerfNoGanModel(BaseModel):
             _, N, D, H, W, _ = self.masked_raws.shape
             masked_raws = self.masked_raws  # KxNxDxHxWx4
             unmasked_raws = self.unmasked_raws  # KxNxDxHxWx4
-            num_slots = self.num_slots
-            if self.opt.no_use_background:
-                num_slots += -1
-            for k in range(num_slots):
+            for k in range(self.num_slots):
                 raws = masked_raws[k]  # NxDxHxWx4
                 z_vals, ray_dir = self.z_vals, self.ray_dir
                 raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4

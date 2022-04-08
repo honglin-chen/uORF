@@ -159,6 +159,7 @@ class PixelEncoder(nn.Module):
                     uv = uv * scale - 1.0
 
             uv = uv.unsqueeze(2)  # (B, N, 1, 2)
+            # print(uv, 'uv in index')
             samples = F.grid_sample(
                 self.latent,
                 uv,
@@ -439,7 +440,7 @@ class PixelDecoder(nn.Module):
         self.fg = ResnetFC(d_in=input_dim-128, d_out=4, n_blocks=3, d_latent=128, d_hidden=64,
                           beta=0.0, combine_layer=1, combine_type="average", use_spade=False,)
 
-    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat, ray_dir=None):
+    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat, ray_dir=None, use_background=True):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -501,27 +502,45 @@ class PixelDecoder(nn.Module):
         # print(input_bg.shape, 'input_bg.shape')
         # Run main NeRF network
         mlp_output_fg = self.fg(input_fg, combine_inner_dims=(self.num_views_per_obj, B),)
-        mlp_output_bg = self.bg(input_bg, combine_inner_dims=(self.num_views_per_obj, B//(K-1)),)
+        if use_background:
+            mlp_output_bg = self.bg(input_bg, combine_inner_dims=(self.num_views_per_obj, B//(K-1)),)
 
-        mlp_output_fg = mlp_output_fg.reshape(-1, B//(K-1), self.d_out)
-        fg_raw_shape = mlp_output_fg[..., 3]
-        fg_raw_rgb = mlp_output_fg[..., :3]
-        if self.locality:
-            fg_raw_shape[outsider_idx] *= 0
-        fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # (K-1)xPx4
+            mlp_output_fg = mlp_output_fg.reshape(-1, B//(K-1), self.d_out)
+            fg_raw_shape = mlp_output_fg[..., 3]
+            fg_raw_rgb = mlp_output_fg[..., :3]
+            if self.locality:
+                fg_raw_shape[outsider_idx] *= 0
+            fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # (K-1)xPx4
 
-        mlp_output_bg = mlp_output_bg.reshape(-1, B//(K-1), self.d_out)
-        bg_raws = mlp_output_bg
+            mlp_output_bg = mlp_output_bg.reshape(-1, B//(K-1), self.d_out)
+            bg_raws = mlp_output_bg
 
-        all_raws = torch.cat([bg_raws, fg_raws], dim=0)  # KxPx4
-        raw_masks = F.relu(all_raws[:, :, -1:], True)  # KxPx1
-        masks = raw_masks / (raw_masks.sum(dim=0) + 1e-5)  # KxPx1
-        raw_rgb = (all_raws[:, :, :3].tanh() + 1) / 2
-        raw_sigma = raw_masks
+            all_raws = torch.cat([bg_raws, fg_raws], dim=0)  # KxPx4
+            raw_masks = F.relu(all_raws[:, :, -1:], True)  # KxPx1
+            masks = raw_masks / (raw_masks.sum(dim=0) + 1e-5)  # KxPx1
+            raw_rgb = (all_raws[:, :, :3].tanh() + 1) / 2
+            raw_sigma = raw_masks
 
-        unmasked_raws = torch.cat([raw_rgb, raw_sigma], dim=2)  # KxPx4
-        masked_raws = unmasked_raws * masks
-        raws = masked_raws.sum(dim=0)
+            unmasked_raws = torch.cat([raw_rgb, raw_sigma], dim=2)  # KxPx4
+            masked_raws = unmasked_raws * masks
+            raws = masked_raws.sum(dim=0)
+        else:
+            mlp_output_fg = mlp_output_fg.reshape(-1, B // (K - 1), self.d_out)
+            fg_raw_shape = mlp_output_fg[..., 3]
+            fg_raw_rgb = mlp_output_fg[..., :3]
+            if self.locality:
+                fg_raw_shape[outsider_idx] *= 0
+            fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # 1xPx4
+
+            all_raws = fg_raws  # 1xPx4
+            raw_masks = F.relu(all_raws[:, :, -1:], True)  # 1xPx1
+            masks = raw_masks / (raw_masks.sum(dim=0) + 1e-5)  # 1xPx1
+            raw_rgb = (all_raws[:, :, :3].tanh() + 1) / 2
+            raw_sigma = raw_masks
+
+            unmasked_raws = torch.cat([raw_rgb, raw_sigma], dim=2)  # KxPx4
+            masked_raws = unmasked_raws * masks
+            raws = masked_raws.sum(dim=0)
 
         return raws, masked_raws, unmasked_raws, masks
 

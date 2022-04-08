@@ -46,8 +46,11 @@ class Projection(object):
         z_cam = depth_range[z_frus].to(self.device)
 
         x_unnorm_pix = x_frus * z_cam
+        # print(x_unnorm_pix, 'x_unnorm_pix')
         y_unnorm_pix = y_frus * z_cam
+        # print(y_unnorm_pix, 'y_unnorm_pix')
         z_unnorm_pix = z_cam
+        # print(z_unnorm_pix, 'z_unnorm_pix')
         pixel_coor = torch.stack([x_unnorm_pix, y_unnorm_pix, z_unnorm_pix, torch.ones_like(x_unnorm_pix)])
         return pixel_coor
 
@@ -65,6 +68,7 @@ class Projection(object):
         W, H, D = self.frustum_size
         pixel_coor = self.construct_frus_coor()
         frus_cam_coor = torch.matmul(self.spixel2cam, pixel_coor.float())  # 4x(WxHxD)
+        # print(self.spixel2cam, 'self.spixel2cam')
 
         frus_world_coor = torch.matmul(cam2world, frus_cam_coor)  # Nx4x(WxHxD)
         frus_nss_coor = torch.matmul(self.world2nss, frus_world_coor)  # Nx4x(WxHxD)
