@@ -307,7 +307,7 @@ class ImageEncoder(nn.Module):
         )
 
 class Decoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False):
+    def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, no_concatenate=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -325,7 +325,10 @@ class Decoder(nn.Module):
         self.fixed_locality = fixed_locality
         self.out_ch = 4
         if pixel_dim is not None:
-            input_dim += pixel_dim
+            if no_concatenate:
+                pass
+            else:
+                input_dim += pixel_dim
         before_skip = [nn.Linear(input_dim, z_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(z_dim+input_dim, z_dim), nn.ReLU(True)]
         for i in range(n_layers-1):
@@ -351,7 +354,17 @@ class Decoder(nn.Module):
         self.b_before = nn.Sequential(*before_skip)
         self.b_after = nn.Sequential(*after_skip)
 
-    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None):
+        if no_concatenate:
+            self.change_dim = nn.Linear(pixel_dim, z_dim)
+        self.pixel_norm = nn.LayerNorm(z_dim)
+        self.object_norm = nn.LayerNorm(z_dim)
+        self.norm2feat = nn.Sequential(
+            nn.Linear(z_dim, z_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(z_dim, z_dim)
+        )
+
+    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -374,20 +387,37 @@ class Decoder(nn.Module):
             sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
 
-        z_bg = z_slots[0:1, :]  # 1xC
-        z_fg = z_slots[1:, :]  # (K-1)xC
-        query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
-        input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
-        if pixel_feat is not None:
-            input_bg = torch.cat([pixel_feat[0:1].squeeze(0), input_bg], dim=1)
+        if no_concatenate:
+            if pixel_feat==None:
+                raise NotImplementedError('there should be pixel_feat for no_concatenate')
+            pixel_feat = self.change_dim(pixel_feat) # Kx(P)xC_z_slot
+            # z_slots: KxC
+            pixel_feat = self.pixel_norm(pixel_feat)
+            z_slots = self.object_norm(z_slots)
+            z_slots = z_slots[:, None, :].expand(-1, P, -1)
+            feat = pixel_feat+z_slots
+            feat = self.norm2feat(feat)
+            query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)
+            input_bg = torch.cat([feat[0:1].squeeze(0), query_bg], dim=1)
+            sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
+            query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
+            input_fg = torch.cat([feat[1:].flatten(0, 1), query_fg_ex], dim=1)
 
-        sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
-        query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
-        z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
-        input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
-        if pixel_feat is not None:
-            input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
-            # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape in tdw
+        else:
+            z_bg = z_slots[0:1, :]  # 1xC
+            z_fg = z_slots[1:, :]  # (K-1)xC
+            query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
+            input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
+            if pixel_feat is not None:
+                input_bg = torch.cat([pixel_feat[0:1].squeeze(0), input_bg], dim=1)
+
+            sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
+            query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
+            z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
+            input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
+            if pixel_feat is not None:
+                input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
+                # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape in tdw
 
         tmp = self.b_before(input_bg)
         bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
@@ -413,7 +443,7 @@ class Decoder(nn.Module):
         return raws, masked_raws, unmasked_raws, masks
 
 class PixelDecoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, pixel_positional_encoding=False, use_ray_dir=False):
+    def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, pixel_positional_encoding=False, use_ray_dir=False, slot_repeat=None):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -440,12 +470,18 @@ class PixelDecoder(nn.Module):
             input_dim += 3
 
         print(input_dim, 'input_dim')
-        self.bg = ResnetFC(d_in=input_dim-128, d_out=4, n_blocks=3, d_latent=128, d_hidden=64,
-                          beta=0.0, combine_layer=1, combine_type="average", use_spade=False,)
-        self.fg = ResnetFC(d_in=input_dim-128, d_out=4, n_blocks=3, d_latent=128, d_hidden=64,
-                          beta=0.0, combine_layer=1, combine_type="average", use_spade=False,)
+        if slot_repeat:
+            self.bg = ResnetFC(d_in=input_dim-64, d_out=4, n_blocks=4, d_latent=64, d_hidden=64,
+                            beta=0.0, combine_layer=2, combine_type="average", use_spade=False, slot_repeat=slot_repeat,)
+            self.fg = ResnetFC(d_in=input_dim-64, d_out=4, n_blocks=4, d_latent=64, d_hidden=64,
+                            beta=0.0, combine_layer=2, combine_type="average", use_spade=False, slot_repeat=slot_repeat,)
+        else:
+            self.bg = ResnetFC(d_in=input_dim-128, d_out=4, n_blocks=3, d_latent=128, d_hidden=64,
+                               beta=0.0, combine_layer=1, combine_type="average", use_spade=False,)
+            self.fg = ResnetFC(d_in=input_dim-128, d_out=4, n_blocks=3, d_latent=128, d_hidden=64,
+                               beta=0.0, combine_layer=1, combine_type="average", use_spade=False,)
 
-    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat, ray_dir=None, use_background=True):
+    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat, ray_dir=None, use_background=True, slot_repeat=None):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -456,7 +492,7 @@ class PixelDecoder(nn.Module):
             fg_transform: If self.fixed_locality, it is 1x4x4 matrix nss2cam0, otherwise it is 1x3x3 azimuth rotation of nss2cam0
         """
         if self.pixel_positional_encoding:
-            K = 2
+            K = 2 # because it is pixelnerf
         else:
             K, C = z_slots.shape
         P = sampling_coor_bg.shape[0]

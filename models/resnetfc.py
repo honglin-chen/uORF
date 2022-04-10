@@ -85,6 +85,7 @@ class ResnetFC(nn.Module):
         combine_layer=1000,
         combine_type="average",
         use_spade=False,
+        slot_repeat=None,
     ):
         """
         :param d_in input size
@@ -113,6 +114,7 @@ class ResnetFC(nn.Module):
         self.combine_layer = combine_layer
         self.combine_type = combine_type
         self.use_spade = use_spade
+        self.slot_repeat = slot_repeat
 
         self.blocks = nn.ModuleList(
             [ResnetBlockFC(d_hidden, beta=beta) for i in range(n_blocks)]
@@ -150,8 +152,14 @@ class ResnetFC(nn.Module):
         with profiler.record_function("resnetfc_infer"):
             assert zx.size(-1) == self.d_latent + self.d_in
             if self.d_latent > 0:
-                z = zx[..., : self.d_latent]
-                x = zx[..., self.d_latent :]
+                if self.slot_repeat:
+                    z = zx[..., 128:128+self.d_latent]
+                    x1 = zx[..., :128]
+                    x2 = zx[..., 128+self.d_latent:]
+                    x = torch.cat([x1, x2], dim=-1)
+                else:
+                    z = zx[..., : self.d_latent]
+                    x = zx[..., self.d_latent :]
             else:
                 x = zx
             if self.d_in > 0:

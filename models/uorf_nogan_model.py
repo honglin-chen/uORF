@@ -53,6 +53,10 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--pixel_decoder', action='store_true', help='change decoder to pixel_decoder')
         parser.add_argument('--pixel_encoder', action='store_true', help='change encoder to pixel_encoder')
         parser.add_argument('--pixel_nerf', action='store_true', help='change model to pixelnerf')
+        parser.add_argument('--mask_image_feature', action='store_true', help='mask image feature in pixelnerf decoder. if pixelencoder==False: this does not make sense')
+        parser.add_argument('--mask_image', action='store_true', help='mask image in pixelnerf encoder. if pixelencoder==False: this does not make sense')
+        parser.add_argument('--slot_repeat', action='store_true', help='put slot features repeatedly in the uORF decoder setting')
+        parser.add_argument('--no_concatenate', action='store_true', help='do not concatenate object feature and pixel feature; instead, add them')
         parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -93,32 +97,59 @@ class uorfNoGanModel(BaseModel):
         z_dim = opt.z_dim
         self.parameters = []
         self.nets = []
+
+        # [uORF Encoder] & [Slot attention]
         self.num_slots = opt.num_slots
-        self.netEncoder = networks.init_net(Encoder(3, z_dim=z_dim, bottom=opt.bottom),
-                                            gpu_ids=self.gpu_ids, init_type='normal')
+        self.netEncoder = networks.init_net(Encoder(3, z_dim=z_dim, bottom=opt.bottom), gpu_ids=self.gpu_ids, init_type='normal')
         self.nets.append(self.netEncoder)
         self.netSlotAttention = networks.init_net(
             SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter, gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
         self.nets.append(self.netSlotAttention)
         self.parameters.extend([self.netEncoder.parameters(), self.netSlotAttention.parameters()])
+
+        # Add [pixel Encoder] or do not add
         if self.opt.pixel_encoder:
             self.netPixelEncoder = networks.init_net(PixelEncoder(), gpu_ids=self.gpu_ids, init_type='None')
             self.parameters.append(self.netPixelEncoder.parameters())
             self.nets.append(self.netPixelEncoder)
-            self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, pixel_dim=128, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                                                        locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
-            self.parameters.append(self.netDecoder.parameters())
-            self.nets.append(self.netDecoder)
-            if self.opt.pixel_decoder:
+            pixel_dim = 128
+        else:
+            pixel_dim = None
+
+        # [pixel Decoder] or [uORF Decoder]
+        if self.opt.pixel_decoder:
+            if self.opt.slot_repeat:
                 self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim+128, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                                                    locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='None')
+                                                    locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality, slot_repeat=self.opt.slot_repeat), gpu_ids=self.gpu_ids, init_type='None')
                 self.parameters.append(self.netPixelDecoder.parameters())
                 self.nets.append(self.netPixelDecoder)
+                self.netDecoder = networks.init_net(
+                    Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim,
+                            z_dim=opt.z_dim, n_layers=opt.n_layer,
+                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality),
+                    gpu_ids=self.gpu_ids, init_type='xavier')
+            else:
+                self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim + 128, z_dim=opt.z_dim, n_layers=opt.n_layer,
+                                 locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='None')
+                self.parameters.append(self.netPixelDecoder.parameters())
+                self.nets.append(self.netPixelDecoder)
+                self.netDecoder = networks.init_net(
+                    Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim,
+                            z_dim=opt.z_dim, n_layers=opt.n_layer,
+                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality),
+                    gpu_ids=self.gpu_ids, init_type='xavier')
         else:
-            self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                                                        locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
-            self.parameters.append(self.netDecoder.parameters())
-            self.nets.append(self.netDecoder)
+            if self.opt.no_concatenate:
+                self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
+                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, no_concatenate=self.opt.no_concatenate), gpu_ids=self.gpu_ids, init_type='xavier')
+                self.parameters.append(self.netDecoder.parameters())
+                self.nets.append(self.netDecoder)
+            else:
+                self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
+                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
+                self.parameters.append(self.netDecoder.parameters())
+                self.nets.append(self.netDecoder)
+
 
         if self.isTrain:  # only defined during training time
             self.optimizer = optim.Adam(chain(*self.parameters), lr=opt.lr)
@@ -168,14 +199,18 @@ class uorfNoGanModel(BaseModel):
         # Encoding images
         feature_map = self.netEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
         if self.opt.pixel_encoder:
-            feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False)) # BxCxHxW
+            if self.opt.mask_image:
+                raise NotImplementedError('mask image is not available now.')
+            else:
+                feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False)) # BxCxHxW
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention
         z_slots, attn = self.netSlotAttention(feat, masks=self.masks)  # 1xKxC, 1xKxN
-        z_slots, attn = z_slots.squeeze(0), attn.squeeze(0)  # KxC, KxN
+        z_slots, attn = z_slots.squeeze(0), attn.squeeze(0)  # KxC, KxN (N = HxW)
         K = attn.shape[0]
 
+        # Get rays and coordinates
         cam2world = self.cam2world
         N = cam2world.shape[0]
         if self.opt.stage == 'coarse':
@@ -207,6 +242,8 @@ class uorfNoGanModel(BaseModel):
         sampling_coor_bg = frus_nss_coor  # Px3
 
         W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
+
+        # Get pixel feature if using [pixel Encoder]
         if self.opt.pixel_encoder:
             # construct uv in the first image coordinates
             cam02world = cam2world[0:1] # 1x4x4
@@ -214,32 +251,53 @@ class uorfNoGanModel(BaseModel):
             nss2world = self.world2nss.inverse() # 1x4x4
             frus_nss_coor = torch.cat([frus_nss_coor, torch.ones_like(frus_nss_coor[:, 0].unsqueeze(1))], dim=-1) # Px4
             frus_world_coor = torch.matmul(nss2world[None, ...], frus_nss_coor[None, ..., None]) # 1xPx4x1
-            frus_cam0_coor = torch.matmul(world2cam0[None, ...], frus_world_coor) #1x1x4x4, 1x(NxWxHxD)x4x1 -> 1x(NxWxHxD)x4x1
-            pixel_cam0_coor = torch.matmul(self.cam2spixel[None, ...], frus_cam0_coor) # 1x1x4x4, 1x(NxWxHxD)x4x1
-            pixel_cam0_coor = pixel_cam0_coor.squeeze(-1) # 1x(NxWxHxD)x4
-            uv = pixel_cam0_coor[:, :, 0:2]/pixel_cam0_coor[:, :, 2].unsqueeze(-1) # 1x(NxWxHxD)x2
+            frus_cam0_coor = torch.matmul(world2cam0[None, ...], frus_world_coor) #1x1x4x4, 1x(NxDxWxH)x4x1 -> 1x(NxDxWxH)x4x1
+            pixel_cam0_coor = torch.matmul(self.cam2spixel[None, ...], frus_cam0_coor) # 1x1x4x4, 1x(NxDxWxH)x4x1
+            pixel_cam0_coor = pixel_cam0_coor.squeeze(-1) # 1x(NxDxWxH)x4
+            uv = pixel_cam0_coor[:, :, 0:2]/pixel_cam0_coor[:, :, 2].unsqueeze(-1) # 1x(NxDxWxH)x2
             uv = (uv/frustum_size[0:2][None, None, :] - 0.5) * 2 # nomalize to fit in with [-1, 1] grid #
             '''
             tensor(3.4756, device='cuda:0') tensor(-4.4286, device='cuda:0') tensor(-0.0233, device='cuda:0') tensor(-0.0241, device='cuda:0') tensor(0.6644, device='cuda:0') u max min median mean std
             tensor(12.8928, device='cuda:0') tensor(-1.7501, device='cuda:0') tensor(1.1921e-07, device='cuda:0') tensor(0.1183, device='cuda:0') tensor(0.9658, device='cuda:0') v max min median mean std
             '''
-            pixel_feat = self.netPixelEncoder.index(uv) # 1x(NxWxHxD)x2 -> 1xCx(NxWxHxD)
-            pixel_feat = pixel_feat.transpose(1, 2) # 1x(NxWxHxD)xC
-            pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxWxHxD)xC
+            pixel_feat = self.netPixelEncoder.index(uv) # 1x(NxDxWxH)x2 -> 1xCx(NxDxWxH)
+            pixel_feat = pixel_feat.transpose(1, 2) # 1x(NxDxWxH)xC
+            if self.opt.mask_image:
+                raise NotImplementedError('mask_image is not implemented yet.') # in this case, pixel_feat is already Kx(NxDxWxH)xC
+            else:
+                pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxDxWxH)xC
 
+            if self.opt.mask_image_feature:
+                pixel_feat = pixel_feat.view(K, N, D, -1, pixel_feat.shape[-1]) # KxNxDx(HxW)xC
+                attn_pixel = attn[:, None, None, :, None] # Kx1x1x(HxW)x1
+                pixel_feat = pixel_feat.clone() * attn_pixel # KxNxDx(HxW)xC
+                pixel_feat = pixel_feat.flatten(1, 3) # Kx(NxDxHxW)xC (this includes dim 3)
+            else:
+                pass
+        else:
+            pixel_feat = None
 
-            if self.opt.pixel_decoder:
+        # Run [uORF Decoder] or [pixel Decoder]
+        if self.opt.pixel_decoder:
+            if self.opt.slot_repeat: # TODO: decoder is not changed yet (doesn't have to be)
+                raws, masked_raws, unmasked_raws, masks = \
+                    self.netPixelDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, slot_repeat = self.opt.slot_repeat)
+                # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
+            else:
                 raws, masked_raws, unmasked_raws, masks = \
                     self.netPixelDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat)
+                # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
+
+        else:
+            if self.opt.no_concatenate:
+                raws, masked_raws, unmasked_raws, masks = \
+                    self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, self.opt.no_concatenate)
                 # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
             else:
                 raws, masked_raws, unmasked_raws, masks = \
                     self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat)
                                 # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
-        else:
-            raws, masked_raws, unmasked_raws, masks = \
-                self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0)
-            # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
+
 
         raws = raws.view([N, D, H, W, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
         masked_raws = masked_raws.view([K, N, D, H, W, 4])
