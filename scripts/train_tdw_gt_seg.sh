@@ -10,6 +10,6 @@ python train_without_gan.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_eac
     --niter 2000 --coarse_epoch 1000 \
     --model 'uorf_nogan' \
     --focal_ratio 0.9605 0.9605 \
-    --near_plane 2 --far_plane 12 --gt_seg
+    --near_plane 1 --far_plane 15 --gt_seg
 # done
 echo "Done"

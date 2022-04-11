@@ -307,6 +307,8 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False):
     alpha = raw2alpha(raw[..., 3], dists)  # [N_rays, N_samples]
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=device), 1. - alpha + 1e-10], -1), -1)[:,:-1]
 
+
+
     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
 
     weights_norm = weights.detach() + 1e-5

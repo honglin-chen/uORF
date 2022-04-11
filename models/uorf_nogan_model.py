@@ -141,6 +141,7 @@ class uorfNoGanModel(BaseModel):
         self.loss_recon = 0
         self.loss_perc = 0
         dev = self.x[0:1].device
+
         nss2cam0 = self.cam2world[0:1].inverse() if self.opt.fixed_locality else self.cam2world_azi[0:1].inverse()
 
         # Encoding images
