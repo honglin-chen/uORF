@@ -57,6 +57,7 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--mask_image', action='store_true', help='mask image in pixelnerf encoder. if pixelencoder==False: this does not make sense')
         parser.add_argument('--slot_repeat', action='store_true', help='put slot features repeatedly in the uORF decoder setting')
         parser.add_argument('--no_concatenate', action='store_true', help='do not concatenate object feature and pixel feature; instead, add them')
+        parser.add_argument('--visualize_obj_feat', action='store_true', help='visualize object feature (after slot attention)')
         parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -109,7 +110,7 @@ class uorfNoGanModel(BaseModel):
 
         # Add [pixel Encoder] or do not add
         if self.opt.pixel_encoder:
-            self.netPixelEncoder = networks.init_net(PixelEncoder(), gpu_ids=self.gpu_ids, init_type='None')
+            self.netPixelEncoder = networks.init_net(PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature), gpu_ids=self.gpu_ids, init_type='None')
             self.parameters.append(self.netPixelEncoder.parameters())
             self.nets.append(self.netPixelEncoder)
             pixel_dim = 128
@@ -120,24 +121,26 @@ class uorfNoGanModel(BaseModel):
         if self.opt.pixel_decoder:
             if self.opt.slot_repeat:
                 self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim+128, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                                                    locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality, slot_repeat=self.opt.slot_repeat), gpu_ids=self.gpu_ids, init_type='None')
+                                                                      locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality, slot_repeat=self.opt.slot_repeat),
+                                                         gpu_ids=self.gpu_ids, init_type='None')
                 self.parameters.append(self.netPixelDecoder.parameters())
                 self.nets.append(self.netPixelDecoder)
                 self.netDecoder = networks.init_net(
                     Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim,
                             z_dim=opt.z_dim, n_layers=opt.n_layer,
                             locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality),
-                    gpu_ids=self.gpu_ids, init_type='xavier')
+                    gpu_ids=self.gpu_ids, init_type='xavier') # TODO: need to erase this. now it induces error
             else:
                 self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim + 128, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                                 locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='None')
+                                                                      locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality),
+                                                         gpu_ids=self.gpu_ids, init_type='None')
                 self.parameters.append(self.netPixelDecoder.parameters())
                 self.nets.append(self.netPixelDecoder)
                 self.netDecoder = networks.init_net(
                     Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim,
                             z_dim=opt.z_dim, n_layers=opt.n_layer,
                             locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality),
-                    gpu_ids=self.gpu_ids, init_type='xavier')
+                    gpu_ids=self.gpu_ids, init_type='xavier') # TODO: need to erase this. now it induces error
         else:
             if self.opt.no_concatenate:
                 self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
@@ -196,19 +199,27 @@ class uorfNoGanModel(BaseModel):
         dev = self.x[0:1].device
         nss2cam0 = self.cam2world[0:1].inverse() if self.opt.fixed_locality else self.cam2world_azi[0:1].inverse()
 
+        # Replace slot attention with GT segmentations
+        if self.opt.gt_seg:
+            masks = self.masks
+            attn_bg, attn_fg = masks[:, 0:1], masks[:, 1:]
+            attn = torch.cat([attn_bg, attn_fg], dim=1)
+
         # Encoding images
         feature_map = self.netEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
-        if self.opt.pixel_encoder:
-            if self.opt.mask_image:
-                raise NotImplementedError('mask image is not available now.')
-            else:
-                feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False)) # BxCxHxW
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention
         z_slots, attn = self.netSlotAttention(feat, masks=self.masks)  # 1xKxC, 1xKxN
         z_slots, attn = z_slots.squeeze(0), attn.squeeze(0)  # KxC, KxN (N = HxW)
         K = attn.shape[0]
+
+        # Pixel Encoder Forward (to get feature values in pixel coordinates (uv), call pixelEncoder.index(uv), not forward)
+        if self.opt.pixel_encoder:
+            if self.opt.mask_image or self.opt.mask_image_feature:
+                feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False), masks = attn)
+            else:
+                feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))
 
         # Get rays and coordinates
         cam2world = self.cam2world
@@ -261,19 +272,13 @@ class uorfNoGanModel(BaseModel):
             tensor(12.8928, device='cuda:0') tensor(-1.7501, device='cuda:0') tensor(1.1921e-07, device='cuda:0') tensor(0.1183, device='cuda:0') tensor(0.9658, device='cuda:0') v max min median mean std
             '''
             pixel_feat = self.netPixelEncoder.index(uv) # 1x(NxDxWxH)x2 -> 1xCx(NxDxWxH)
-            pixel_feat = pixel_feat.transpose(1, 2) # 1x(NxDxWxH)xC
-            if self.opt.mask_image:
-                raise NotImplementedError('mask_image is not implemented yet.') # in this case, pixel_feat is already Kx(NxDxWxH)xC
-            else:
-                pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxDxWxH)xC
 
-            if self.opt.mask_image_feature:
-                pixel_feat = pixel_feat.view(K, N, D, -1, pixel_feat.shape[-1]) # KxNxDx(HxW)xC
-                attn_pixel = attn[:, None, None, :, None] # Kx1x1x(HxW)x1
-                pixel_feat = pixel_feat.clone() * attn_pixel # KxNxDx(HxW)xC
-                pixel_feat = pixel_feat.flatten(1, 3) # Kx(NxDxHxW)xC (this includes dim 3)
+            if self.opt.mask_image or self.opt.mask_image_feature:
+                pixel_feat = torch.cat(pixel_feat, dim=0)
+                pixel_feat = pixel_feat.transpose(1, 2)
             else:
-                pass
+                pixel_feat = pixel_feat.transpose(1, 2)  # 1x(NxDxWxH)xC
+                pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxDxWxH)xC
         else:
             pixel_feat = None
 

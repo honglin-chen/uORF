@@ -207,14 +207,14 @@ class pixelnerfNoGanModel(BaseModel):
             self.world2nss = self.projection_fine.world2nss
             frustum_size = torch.Tensor(self.projection_fine.frustum_size).to(self.device)
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor.view([N, D, H, W, 3]), z_vals.view([N, H, W, D]), ray_dir.view([N, H, W, 3])
-            ray_dir_input = ray_dir
-            ray_dir_input = ray_dir_input[:, None, ...].expand(-1, D, -1, -1, -1).flatten(0, 3)
             H_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             W_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             frus_nss_coor_, z_vals_, ray_dir_ = frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(0, 3), z_vals_.flatten(0, 2), ray_dir_.flatten(0, 2)
             x = self.x[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.z_vals, self.ray_dir = z_vals, ray_dir
+            ray_dir_input = ray_dir.view([N, H, W, 3])
+            ray_dir_input = ray_dir_input[:, None, ...].expand(-1, D, -1, -1, -1).flatten(0, 3)
 
         sampling_coor_fg = frus_nss_coor[None, ...].expand(K - 1, -1, -1)  # (K-1)xPx3
         sampling_coor_bg = frus_nss_coor  # Px3

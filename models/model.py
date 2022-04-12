@@ -87,6 +87,8 @@ class PixelEncoder(nn.Module):
         use_first_pool=True,
         norm_type="batch",
         reduce_latent_size=True,
+        mask_image=False,
+        mask_image_feature=False,
     ):
         """
         :param backbone Backbone network. Either custom, in which case
@@ -141,6 +143,12 @@ class PixelEncoder(nn.Module):
         )
         # self.latent (B, L, H, W)
 
+        self.mask_image = mask_image
+        self.mask_image_feature = mask_image_feature
+        if self.mask_image_feature:
+            self.downsample = nn.AvgPool2d(kernel_size=2, stride=2, padding=0)
+        self.n_mask = 5 # TODO: make it configurable
+
     def index(self, uv, cam_z=None, image_size=(), z_bounds=None):
         """
         Get pixel-aligned image features at 2D image coordinates
@@ -151,83 +159,189 @@ class PixelEncoder(nn.Module):
         :param z_bounds ignored (for compatibility)
         :return (B, L, N) L is latent size
         """
-        with profiler.record_function("encoder_index"):
-            if uv.shape[0] == 1 and self.latent.shape[0] > 1:
-                uv = uv.expand(self.latent.shape[0], -1, -1)
+        if self.mask_image_feature or self.mask_image:
+            #then, the self.latent_list is a list of self.latent for each mask
+            sample_list = []
+            with profiler.record_function("encoder_index"):
+                if uv.shape[0] == 1 and self.latent.shape[0] > 1:
+                    uv = uv.expand(self.latent.shape[0], -1, -1)
 
-            with profiler.record_function("encoder_index_pre"):
-                if len(image_size) > 0:
-                    if len(image_size) == 1:
-                        image_size = (image_size, image_size)
-                    scale = self.latent_scaling / image_size
-                    uv = uv * scale - 1.0
+                with profiler.record_function("encoder_index_pre"):
+                    if len(image_size) > 0:
+                        if len(image_size) == 1:
+                            image_size = (image_size, image_size)
+                        scale = self.latent_scaling / image_size
+                        uv = uv * scale - 1.0
+                uv = uv.unsqueeze(2)  # (B, N, 1, 2)
+                for idx, latent in enumerate(self.latent_list):
+                    samples = F.grid_sample(
+                        latent,
+                        uv,
+                        align_corners=True,
+                        mode=self.index_interp,
+                        padding_mode=self.index_padding,
+                    )
+                    sample_list.append(samples[:, :, :, 0])  # (B, C, N)
+            return sample_list
 
-            uv = uv.unsqueeze(2)  # (B, N, 1, 2)
-            samples = F.grid_sample(
-                self.latent,
-                uv,
-                align_corners=True,
-                mode=self.index_interp,
-                padding_mode=self.index_padding,
-            )
-            return samples[:, :, :, 0]  # (B, C, N)
+        else:
+            with profiler.record_function("encoder_index"):
+                if uv.shape[0] == 1 and self.latent.shape[0] > 1:
+                    uv = uv.expand(self.latent.shape[0], -1, -1)
 
-    def forward(self, x):
+                with profiler.record_function("encoder_index_pre"):
+                    if len(image_size) > 0:
+                        if len(image_size) == 1:
+                            image_size = (image_size, image_size)
+                        scale = self.latent_scaling / image_size
+                        uv = uv * scale - 1.0
+
+                uv = uv.unsqueeze(2)  # (B, N, 1, 2)
+                samples = F.grid_sample(
+                    self.latent,
+                    uv,
+                    align_corners=True,
+                    mode=self.index_interp,
+                    padding_mode=self.index_padding,
+                )
+                return samples[:, :, :, 0]  # (B, C, N)
+
+    def forward(self, x, masks=None):
         """
         For extracting ResNet's features.
         :param x image (B, C, H, W)
         :return latent (B, latent_size, H, W)
         """
-        if self.feature_scale != 1.0:
-            x = F.interpolate(
-                x,
-                scale_factor=self.feature_scale,
-                mode="bilinear" if self.feature_scale > 1.0 else "area",
-                align_corners=True if self.feature_scale > 1.0 else None,
-                recompute_scale_factor=True,
-            )
-        x = x.to(device=self.latent.device)
+        # print(x.shape, 'x.shape')
+        # print(masks.shape, 'mask.shape after x')
+        shape = x.shape
+        if self.mask_image:
+            self.latent_list = []
+            xs = []
+            for _ in range(self.n_mask):
+                xs.append(x.clone())
+            for idx, x in enumerate(xs):
+                if self.feature_scale != 1.0:
+                    x = F.interpolate(
+                        x,
+                        scale_factor=self.feature_scale,
+                        mode="bilinear" if self.feature_scale > 1.0 else "area",
+                        align_corners=True if self.feature_scale > 1.0 else None,
+                        recompute_scale_factor=True,
+                    )
+                x = x.to(device=self.latent.device)
 
-        if self.use_custom_resnet:
-            self.latent = self.model(x)
+                if self.use_custom_resnet:
+                    self.latent = self.model(x)
+                else:
+                    x = self.model.conv1(x)
+                    x = self.model.bn1(x)
+                    x = self.model.relu(x)
+
+                    latents = [x]
+                    if self.num_layers > 1:
+                        if self.use_first_pool:
+                            x = self.model.maxpool(x)
+                        x = self.model.layer1(x)
+                        latents.append(x)
+                    if self.num_layers > 2:
+                        x = self.model.layer2(x)
+                        latents.append(x)
+                    if self.num_layers > 3:
+                        x = self.model.layer3(x)
+                        latents.append(x)
+                    if self.num_layers > 4:
+                        x = self.model.layer4(x)
+                        latents.append(x)
+
+                    self.latents = latents
+                    align_corners = None if self.index_interp == "nearest " else True
+                    latent_sz = latents[0].shape[-2:]
+                    for i in range(len(latents)):
+                        latents[i] = F.interpolate(
+                            latents[i],
+                            latent_sz,
+                            mode=self.upsample_interp,
+                            align_corners=align_corners,
+                        )
+                    self.latent = torch.cat(latents, dim=1)
+                self.latent_scaling[0] = self.latent.shape[-1]
+                self.latent_scaling[1] = self.latent.shape[-2]
+                self.latent_scaling = self.latent_scaling / (self.latent_scaling - 1) * 2.0
+                if self.reduce_latent_size:
+                    self.latent = self.mlp(self.latent.transpose(3, 1)).transpose(3, 1)
+
+                if self.mask_image_feature:
+                    mask = masks[idx].view(shape[-2], shape[-1])
+                    mask = self.downsample(mask[None, :])
+                    self.latent_list.append(self.latent.clone() * mask[None, :, :, :])
+                else:
+                    self.latent_list.append(self.latent.clone())
+
+            return self.latents
+
         else:
-            x = self.model.conv1(x)
-            x = self.model.bn1(x)
-            x = self.model.relu(x)
-
-            latents = [x]
-            if self.num_layers > 1:
-                if self.use_first_pool:
-                    x = self.model.maxpool(x)
-                x = self.model.layer1(x)
-                latents.append(x)
-            if self.num_layers > 2:
-                x = self.model.layer2(x)
-                latents.append(x)
-            if self.num_layers > 3:
-                x = self.model.layer3(x)
-                latents.append(x)
-            if self.num_layers > 4:
-                x = self.model.layer4(x)
-                latents.append(x)
-
-            self.latents = latents
-            align_corners = None if self.index_interp == "nearest " else True
-            latent_sz = latents[0].shape[-2:]
-            for i in range(len(latents)):
-                latents[i] = F.interpolate(
-                    latents[i],
-                    latent_sz,
-                    mode=self.upsample_interp,
-                    align_corners=align_corners,
+            if self.feature_scale != 1.0:
+                x = F.interpolate(
+                    x,
+                    scale_factor=self.feature_scale,
+                    mode="bilinear" if self.feature_scale > 1.0 else "area",
+                    align_corners=True if self.feature_scale > 1.0 else None,
+                    recompute_scale_factor=True,
                 )
-            self.latent = torch.cat(latents, dim=1)
-        self.latent_scaling[0] = self.latent.shape[-1]
-        self.latent_scaling[1] = self.latent.shape[-2]
-        self.latent_scaling = self.latent_scaling / (self.latent_scaling - 1) * 2.0
-        if self.reduce_latent_size:
-            self.latent = self.mlp(self.latent.transpose(3, 1)).transpose(3, 1)
-        return self.latent
+            x = x.to(device=self.latent.device)
+
+            if self.use_custom_resnet:
+                self.latent = self.model(x)
+            else:
+                x = self.model.conv1(x)
+                x = self.model.bn1(x)
+                x = self.model.relu(x)
+
+                latents = [x]
+                if self.num_layers > 1:
+                    if self.use_first_pool:
+                        x = self.model.maxpool(x)
+                    x = self.model.layer1(x)
+                    latents.append(x)
+                if self.num_layers > 2:
+                    x = self.model.layer2(x)
+                    latents.append(x)
+                if self.num_layers > 3:
+                    x = self.model.layer3(x)
+                    latents.append(x)
+                if self.num_layers > 4:
+                    x = self.model.layer4(x)
+                    latents.append(x)
+
+                self.latents = latents
+                align_corners = None if self.index_interp == "nearest " else True
+                latent_sz = latents[0].shape[-2:]
+                for i in range(len(latents)):
+                    latents[i] = F.interpolate(
+                        latents[i],
+                        latent_sz,
+                        mode=self.upsample_interp,
+                        align_corners=align_corners,
+                    )
+                self.latent = torch.cat(latents, dim=1)
+            self.latent_scaling[0] = self.latent.shape[-1]
+            self.latent_scaling[1] = self.latent.shape[-2]
+            self.latent_scaling = self.latent_scaling / (self.latent_scaling - 1) * 2.0
+            if self.reduce_latent_size:
+                self.latent = self.mlp(self.latent.transpose(3, 1)).transpose(3, 1)
+
+            if self.mask_image_feature:
+                self.latent_list = []
+                for idx in range(self.n_mask):
+                    # print(masks.shape, 'masks.shape')
+                    # print(self.latent.shape, 'self.latent.shape')
+                    mask = masks[idx].view(shape[-2], shape[-1])
+                    mask = self.downsample(mask[None, :])
+                    self.latent_list.append(self.latent.clone() * mask[None, :, :, :])
+                return self.latent_list
+
+            return self.latent
 
     @classmethod
     def from_conf(cls, conf):
@@ -356,8 +470,8 @@ class Decoder(nn.Module):
 
         if no_concatenate:
             self.change_dim = nn.Linear(pixel_dim, z_dim)
-        self.pixel_norm = nn.LayerNorm(z_dim)
-        self.object_norm = nn.LayerNorm(z_dim)
+        self.pixel_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
+        self.object_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
         self.norm2feat = nn.Sequential(
             nn.Linear(z_dim, z_dim),
             nn.ReLU(inplace=True),
@@ -469,7 +583,6 @@ class PixelDecoder(nn.Module):
         if use_ray_dir:
             input_dim += 3
 
-        print(input_dim, 'input_dim')
         if slot_repeat:
             self.bg = ResnetFC(d_in=input_dim-64, d_out=4, n_blocks=4, d_latent=64, d_hidden=64,
                             beta=0.0, combine_layer=2, combine_type="average", use_spade=False, slot_repeat=slot_repeat,)
@@ -539,8 +652,6 @@ class PixelDecoder(nn.Module):
         self.num_views_per_obj = 1
         B = input_fg.shape[0] # B is batch of points (in rays)
 
-        # print(input_fg.shape, 'input_fg.shape')
-        # print(input_bg.shape, 'input_bg.shape')
         # Run main NeRF network
         mlp_output_fg = self.fg(input_fg, combine_inner_dims=(self.num_views_per_obj, B),)
         if use_background:
@@ -663,6 +774,8 @@ class SlotAttention(nn.Module):
                 # Replace slot attention with GT segmentations
                 attn_bg, attn_fg = masks[:, 0:1], masks[:, 1:]
                 attn = torch.cat([attn_bg, attn_fg], dim=1)
+                # print(masks.shape, 'mask.shape') # 1x5x4096
+                # print(attn.shape, 'attn.shape') # 1x5x4096
             else:
                 attn = dots.softmax(dim=1) + self.eps  # BxKxN
                 attn_bg, attn_fg = attn[:, 0:1, :], attn[:, 1:, :]  # Bx1xN, Bx(K-1)xN

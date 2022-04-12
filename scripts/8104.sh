@@ -11,3 +11,5 @@ python train_without_gan.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_eac
     --gt_seg --pixel_nerf --pixel_decoder --pixel_encoder --no_use_background \
 # done
 echo "Done"
+# error at epoch 600, after coarse epoch
+# node 3 gpu 2
