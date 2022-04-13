@@ -7,13 +7,13 @@ from .base_model import BaseModel
 from . import networks
 import os
 import time
-from .projection import Projection
+from .projection_debug import Projection
 from torchvision.transforms import Normalize
 from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder
 import pdb
 from util import util
 
-class uorfNoGanModel(BaseModel):
+class uorfNoGandebugModel(BaseModel):
 
     @staticmethod
     def modify_commandline_options(parser, is_train=True):
@@ -58,9 +58,6 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--slot_repeat', action='store_true', help='put slot features repeatedly in the uORF decoder setting')
         parser.add_argument('--no_concatenate', action='store_true', help='do not concatenate object feature and pixel feature; instead, add them')
         parser.add_argument('--visualize_obj_feat', action='store_true', help='visualize object feature (after slot attention)')
-        parser.add_argument('--input_no_loss', action='store_true', help='for the first n (=100) epochs (hyperparameter), do not include first image in the recon loss for learning geometry first')
-        parser.add_argument('--bg_no_pixel', action='store_true', help='do not provide bg with pixel features, so that it can learn bg only from slot (object) features')
-        parser.add_argument('--use_ray_dir', action='store_true', help='concatenate ray direction on the view. now only work on decoder (not pixel)')
         parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -147,12 +144,12 @@ class uorfNoGanModel(BaseModel):
         else:
             if self.opt.no_concatenate:
                 self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, no_concatenate=self.opt.no_concatenate, bg_no_pixel=self.opt.bg_no_pixel, use_ray_dir=self.opt.use_ray_dir), gpu_ids=self.gpu_ids, init_type='xavier')
+                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, no_concatenate=self.opt.no_concatenate), gpu_ids=self.gpu_ids, init_type='xavier')
                 self.parameters.append(self.netDecoder.parameters())
                 self.nets.append(self.netDecoder)
             else:
                 self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, bg_no_pixel=self.opt.bg_no_pixel, use_ray_dir=self.opt.use_ray_dir), gpu_ids=self.gpu_ids, init_type='xavier')
+                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
                 self.parameters.append(self.netDecoder.parameters())
                 self.nets.append(self.netDecoder)
 
@@ -228,7 +225,6 @@ class uorfNoGanModel(BaseModel):
         cam2world = self.cam2world
         N = cam2world.shape[0]
         if self.opt.stage == 'coarse':
-            W, H, D = self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp
             frus_nss_coor, z_vals, ray_dir, frus_world_coor = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             self.cam2spixel = self.projection.cam2spixel
@@ -253,15 +249,13 @@ class uorfNoGanModel(BaseModel):
             x = self.x[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.z_vals, self.ray_dir = z_vals, ray_dir
 
-        if self.opt.use_ray_dir:
-            ray_dir_input = ray_dir.view([N, H, W, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
-            ray_dir_input = ray_dir_input.flatten(0, 3)
-        else:
-            ray_dir_input = None
         sampling_coor_fg = frus_nss_coor[None, ...].expand(K - 1, -1, -1)  # (K-1)xPx3
         sampling_coor_bg = frus_nss_coor  # Px3
 
         W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
+
+        """Debugging"""
+
 
         # Get pixel feature if using [pixel Encoder]
         if self.opt.pixel_encoder:
@@ -305,11 +299,11 @@ class uorfNoGanModel(BaseModel):
         else:
             if self.opt.no_concatenate:
                 raws, masked_raws, unmasked_raws, masks = \
-                    self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, self.opt.no_concatenate, ray_dir_input=ray_dir_input)
+                    self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, self.opt.no_concatenate)
                 # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
             else:
                 raws, masked_raws, unmasked_raws, masks = \
-                    self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, ray_dir_input=ray_dir_input)
+                    self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat)
                                 # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
 
 
@@ -321,13 +315,8 @@ class uorfNoGanModel(BaseModel):
         rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
         x_recon = rendered * 2 - 1
 
-        if self.opt.input_no_loss:
-            if epoch<100:
-                self.loss_recon = self.L2_loss(x_recon[1:], x[1:])
-            else:
-                self.loss_recon = self.L2_loss(x_recon, x)
-        else:
-            self.loss_recon = self.L2_loss(x_recon, x)
+        self.loss_recon = self.L2_loss(x_recon[0], x[0]) # Only the first image
+        # self.loss_recon = self.L2_loss(x_recon, x) # All images
         x_norm, rendered_norm = self.vgg_norm((x + 1) / 2), self.vgg_norm(rendered)
         rendered_feat, x_feat = self.perceptual_net(rendered_norm), self.perceptual_net(x_norm)
         self.loss_perc = self.weight_percept * self.L2_loss(rendered_feat, x_feat)

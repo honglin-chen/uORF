@@ -421,7 +421,7 @@ class ImageEncoder(nn.Module):
         )
 
 class Decoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, no_concatenate=False):
+    def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -437,12 +437,18 @@ class Decoder(nn.Module):
         self.locality = locality
         self.locality_ratio = locality_ratio
         self.fixed_locality = fixed_locality
+        self.bg_no_pixel = bg_no_pixel
+        self.use_ray_dir = use_ray_dir
         self.out_ch = 4
+
+        if use_ray_dir:
+            input_dim += 3
         if pixel_dim is not None:
             if no_concatenate:
                 pass
             else:
                 input_dim += pixel_dim
+
         before_skip = [nn.Linear(input_dim, z_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(z_dim+input_dim, z_dim), nn.ReLU(True)]
         for i in range(n_layers-1):
@@ -457,6 +463,8 @@ class Decoder(nn.Module):
         self.f_color = nn.Sequential(nn.Linear(z_dim, z_dim//4),
                                      nn.ReLU(True),
                                      nn.Linear(z_dim//4, 3))
+        if pixel_dim is not None and bg_no_pixel:
+            input_dim += -pixel_dim
         before_skip = [nn.Linear(input_dim, z_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(z_dim + input_dim, z_dim), nn.ReLU(True)]
         for i in range(n_layers - 1):
@@ -478,7 +486,7 @@ class Decoder(nn.Module):
             nn.Linear(z_dim, z_dim)
         )
 
-    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None):
+    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None, ray_dir_input=None):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -501,6 +509,13 @@ class Decoder(nn.Module):
             sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
 
+        query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
+        sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
+        query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
+        if self.use_ray_dir:
+            query_bg = torch.cat([query_bg, ray_dir_input], dim=1)
+            query_fg_ex = torch.cat([query_fg_ex, ray_dir_input[None, ...].expand(K-1, -1, -1).flatten(0, 1)], dim=1)
+
         if no_concatenate:
             if pixel_feat==None:
                 raise NotImplementedError('there should be pixel_feat for no_concatenate')
@@ -511,22 +526,15 @@ class Decoder(nn.Module):
             z_slots = z_slots[:, None, :].expand(-1, P, -1)
             feat = pixel_feat+z_slots
             feat = self.norm2feat(feat)
-            query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)
             input_bg = torch.cat([feat[0:1].squeeze(0), query_bg], dim=1)
-            sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
-            query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
             input_fg = torch.cat([feat[1:].flatten(0, 1), query_fg_ex], dim=1)
 
         else:
             z_bg = z_slots[0:1, :]  # 1xC
             z_fg = z_slots[1:, :]  # (K-1)xC
-            query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
             input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
-            if pixel_feat is not None:
+            if pixel_feat is not None and not self.bg_no_pixel:
                 input_bg = torch.cat([pixel_feat[0:1].squeeze(0), input_bg], dim=1)
-
-            sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
-            query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
             z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
             input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
             if pixel_feat is not None:
