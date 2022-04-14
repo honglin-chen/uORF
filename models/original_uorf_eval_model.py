@@ -7,10 +7,7 @@ from . import networks
 import os
 import time
 from .projection import Projection
-from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder
-import pdb
-from util import util
-# from .model import Encoder, Decoder, SlotAttention, raw2outputs
+from .model import Encoder, Decoder, SlotAttention, raw2outputs
 from util.util import AverageMeter
 from sklearn.metrics import adjusted_rand_score
 import lpips

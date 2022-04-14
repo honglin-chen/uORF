@@ -61,6 +61,24 @@ class MultiscenesDataset(BaseDataset):
         img = TF.normalize(img, [0.5] * img.shape[0], [0.5] * img.shape[0])  # [0,1] -> [-1,1]
         return img
 
+    @staticmethod
+    def _object_id_hash(objects, val=256, dtype=torch.long):
+        ''' Hash RGB values into unique integer indices '''
+        objects = torch.tensor(np.array(objects)).permute(2, 0, 1) # [3, H, W]
+
+        C = objects.shape[0]
+        objects = objects.to(dtype)
+        out = torch.zeros_like(objects[0:1, ...])
+        for c in range(C):
+            scale = val ** (C - 1 - c)
+            out += scale * objects[c:c + 1, ...]
+
+        _, out = torch.unique(out, return_inverse=True)
+        out -= out.min()
+
+        out = Image.fromarray(out.squeeze(0).numpy().astype(np.uint8))
+        return out
+
     def __getitem__(self, index):
         """Return a data point and its metadata information.
 
@@ -101,7 +119,8 @@ class MultiscenesDataset(BaseDataset):
             mask_path = path.replace('.png', '_mask.png')
             if os.path.isfile(mask_path):
                 mask = Image.open(mask_path).convert('RGB')
-                mask_l = mask.convert('L')
+                # mask_l = mask.convert('L')
+                mask_l = self._object_id_hash(mask)
                 mask = self._transform_mask(mask)
                 ret['mask'] = mask
                 mask_l = self._transform_mask(mask_l)
