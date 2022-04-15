@@ -421,7 +421,7 @@ class ImageEncoder(nn.Module):
         )
 
 class Decoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False):
+    def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -440,6 +440,7 @@ class Decoder(nn.Module):
         self.bg_no_pixel = bg_no_pixel
         self.use_ray_dir = use_ray_dir
         self.out_ch = 4
+        self.small_latent = small_latent
 
         if use_ray_dir:
             input_dim += 3
@@ -449,6 +450,8 @@ class Decoder(nn.Module):
             else:
                 input_dim += pixel_dim
 
+        if small_latent:
+            z_dim = z_dim // 2
         before_skip = [nn.Linear(input_dim, z_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(z_dim+input_dim, z_dim), nn.ReLU(True)]
         for i in range(n_layers-1):
@@ -478,13 +481,13 @@ class Decoder(nn.Module):
 
         if no_concatenate:
             self.change_dim = nn.Linear(pixel_dim, z_dim)
-        self.pixel_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
-        self.object_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
-        self.norm2feat = nn.Sequential(
-            nn.Linear(z_dim, z_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(z_dim, z_dim)
-        )
+            self.pixel_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
+            self.object_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
+            self.norm2feat = nn.Sequential(
+                nn.Linear(z_dim, z_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(z_dim, z_dim)
+            )
 
     def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None, ray_dir_input=None):
         """
@@ -565,7 +568,7 @@ class Decoder(nn.Module):
         return raws, masked_raws, unmasked_raws, masks
 
 class PixelDecoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, pixel_positional_encoding=False, use_ray_dir=False, slot_repeat=None):
+    def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, pixel_positional_encoding=None, use_ray_dir=None, slot_repeat=None):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -831,7 +834,7 @@ def sin_emb(x, n_freq=5, keep_ori=True):
     embedded_ = torch.cat(embedded, dim=1)
     return embedded_
 
-def raw2outputs(raw, z_vals, rays_d, render_mask=False):
+def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, raws_slot=None, wuv=None, KNDHW=None):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -841,6 +844,9 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False):
         rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
         depth_map: [num_rays]. Estimated distance to object.
     """
+    # uvw: 1x(NxDxHxW)x3
+    # raw: (NxHxW)xDx4
+
     raw2alpha = lambda x, y: 1. - torch.exp(-x * y)
     device = raw.device
 
@@ -849,12 +855,40 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False):
 
     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
-    rgb = raw[..., :3]
-
     alpha = raw2alpha(raw[..., 3], dists)  # [N_rays, N_samples]
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=device), 1. - alpha + 1e-10], -1), -1)[:,:-1]
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=device), 1. - alpha + 1e-10], -1), -1)[:,:-1] # [N_rays, N_samples]
 
-    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+    if weigh_pixelfeat:
+
+        K, N, D, H, W = KNDHW
+
+        weights_norm = weights.clone() + 1e-5
+        weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
+
+        weights_cam0 = weights_norm.view(N, H, W, D)[0]  # H, W, D
+        weights_cam0 = weights_cam0.permute([2, 0, 1]).unsqueeze(0).unsqueeze(0)
+
+        wuv = wuv.unsqueeze(2).unsqueeze(3)  # (1, (NxDxHxW), 1, 1, 3)
+        # self.latent(B, L, H, W)
+        weights_samples = F.grid_sample(
+            weights_cam0,
+            wuv,
+            align_corners=True,
+            mode='bilinear',
+            padding_mode='zeros',
+        ) # 1x1x(NxDxHxW)x1x1
+
+        weights_samples = weights_samples[0, 0, :, 0, 0] # (NxDxHxW)
+        weights_samples = weights_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2)
+        weights_pixel = weights * weights_samples
+        weights_slot = weights * (1.- weights_samples)
+        rgb_pixel = raw[..., :3]
+        rgb_slot = raws_slot[..., :3]
+        rgb_map = torch.sum(weights_pixel[..., None] * rgb_pixel + weights_slot[..., None] * rgb_slot, -2)
+
+    else:
+        rgb = raw[..., :3]
+        rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
 
     weights_norm = weights.detach() + 1e-5
     weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
