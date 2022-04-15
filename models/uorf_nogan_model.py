@@ -89,7 +89,7 @@ class uorfNoGanModel(BaseModel):
                             ['slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['unmasked_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
-        self.model_names = ['Encoder', 'SlotAttention', 'Decoder']
+        self.model_names = []
         self.perceptual_net = get_perceptual_net().cuda()
         self.vgg_norm = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         render_size = (opt.render_size, opt.render_size)
@@ -104,65 +104,52 @@ class uorfNoGanModel(BaseModel):
         self.parameters = []
         self.nets = []
 
-        # [uORF Encoder] & [Slot attention]
+        # [uORF Encoder]
         self.num_slots = opt.num_slots
         self.netEncoder = networks.init_net(Encoder(3, z_dim=z_dim, bottom=opt.bottom), gpu_ids=self.gpu_ids, init_type='normal')
+        self.parameters.append(self.netEncoder.parameters())
         self.nets.append(self.netEncoder)
+        self.model_names.append('Encoder')
+
+        # [Slot attention]
         self.netSlotAttention = networks.init_net(
             SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter, gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
         self.nets.append(self.netSlotAttention)
-        self.parameters.extend([self.netEncoder.parameters(), self.netSlotAttention.parameters()])
+        self.parameters.append(self.netSlotAttention.parameters())
+        self.model_names.append('SlotAttention')
 
         # Add [pixel Encoder] or do not add
         if self.opt.pixel_encoder:
             self.netPixelEncoder = networks.init_net(PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature), gpu_ids=self.gpu_ids, init_type='None')
             self.parameters.append(self.netPixelEncoder.parameters())
             self.nets.append(self.netPixelEncoder)
+            self.model_names.append('PixelEncoder')
             pixel_dim = 128
         else:
             pixel_dim = None
 
         # [pixel Decoder] or [uORF Decoder]
         if self.opt.pixel_decoder:
-            if self.opt.slot_repeat:
-                self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim+128, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                                                                      locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality, slot_repeat=self.opt.slot_repeat),
-                                                         gpu_ids=self.gpu_ids, init_type='None')
-                self.parameters.append(self.netPixelDecoder.parameters())
-                self.nets.append(self.netPixelDecoder)
-                self.netDecoder = networks.init_net(
-                    Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim,
-                            z_dim=opt.z_dim, n_layers=opt.n_layer,
-                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality),
-                    gpu_ids=self.gpu_ids, init_type='xavier') # TODO: need to erase this. now it induces error
-            else:
-                self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim + 128, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                                                                      locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality),
-                                                         gpu_ids=self.gpu_ids, init_type='None')
-                self.parameters.append(self.netPixelDecoder.parameters())
-                self.nets.append(self.netPixelDecoder)
-                self.netDecoder = networks.init_net(
-                    Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim,
-                            z_dim=opt.z_dim, n_layers=opt.n_layer,
-                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality),
-                    gpu_ids=self.gpu_ids, init_type='xavier') # TODO: need to erase this. now it induces error
-        else:
-            if self.opt.no_concatenate:
-                self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, no_concatenate=self.opt.no_concatenate, bg_no_pixel=self.opt.bg_no_pixel, use_ray_dir=self.opt.use_ray_dir), gpu_ids=self.gpu_ids, init_type='xavier')
-                self.parameters.append(self.netDecoder.parameters())
-                self.nets.append(self.netDecoder)
-            else:
-                self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                            locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, bg_no_pixel=self.opt.bg_no_pixel, use_ray_dir=self.opt.use_ray_dir), gpu_ids=self.gpu_ids, init_type='xavier')
-                self.parameters.append(self.netDecoder.parameters())
-                self.nets.append(self.netDecoder)
+            self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim+128, z_dim=opt.z_dim, n_layers=opt.n_layer,
+                                   locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality, slot_repeat=self.opt.slot_repeat), gpu_ids=self.gpu_ids, init_type='None')
+            self.parameters.append(self.netPixelDecoder.parameters())
+            self.nets.append(self.netPixelDecoder)
+            self.model_names.append('PixelDecoder')
 
+        else:
+            self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
+                        locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, no_concatenate=self.opt.no_concatenate, bg_no_pixel=self.opt.bg_no_pixel, use_ray_dir=self.opt.use_ray_dir), gpu_ids=self.gpu_ids, init_type='xavier')
+            self.parameters.append(self.netDecoder.parameters())
+            self.nets.append(self.netDecoder)
+            self.model_names.append('Decoder')
+
+        # if weigh_pixelfeat, we need to make a separate slot decoder
         if self.opt.weigh_pixelfeat:
             self.netSlotDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=None, z_dim=opt.z_dim, n_layers=opt.n_layer,
                             locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, no_concatenate=self.opt.no_concatenate, bg_no_pixel=self.opt.bg_no_pixel, use_ray_dir=self.opt.use_ray_dir, small_latent=True), gpu_ids=self.gpu_ids, init_type='xavier')
             self.parameters.append(self.netSlotDecoder.parameters())
             self.nets.append(self.netSlotDecoder)
+            self.model_names.append('SlotDecoder')
 
         if self.isTrain:  # only defined during training time
             self.optimizer = optim.Adam(chain(*self.parameters), lr=opt.lr)
@@ -312,6 +299,7 @@ class uorfNoGanModel(BaseModel):
                 pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxDxWxH)xC
         else:
             pixel_feat = None
+            wuv = None
 
         # Run [uORF Decoder] or [pixel Decoder]
         if self.opt.pixel_decoder:
@@ -356,10 +344,17 @@ class uorfNoGanModel(BaseModel):
         rendered_feat, x_feat = self.perceptual_net(rendered_norm), self.perceptual_net(x_norm)
         self.loss_perc = self.weight_percept * self.L2_loss(rendered_feat, x_feat)
 
-        self.unmasked_raws_slot = unmasked_raws_slot
-        self.wuv = wuv
-        self.KNDHW = (K, N, D, H, W)
+        if epoch <= 200:
+            with torch.no_grad():
+                self.loss_perc = 0.
+                self.loss_recon = 0.
+
         if self.opt.silhouette_loss:
+
+            self.unmasked_raws_slot = unmasked_raws_slot
+            self.wuv = wuv
+            self.KNDHW = (K, N, D, H, W) # not sure the location of this part
+
             if epoch <= 200:
                 setattr(self, 'unmasked_raws', unmasked_raws)
                 self.silhouette_list = []
@@ -368,11 +363,11 @@ class uorfNoGanModel(BaseModel):
                 silhouette = silhouette.flatten(2, 3)
                 # try to determine whether want to divide by max value (now silhouette has very small values, compared to 1. (ex. 0.07 for max)).
                 # this increase very soon, this loss might dominate in the beginning of learning
-                # silhouette = (silhouette.flatten(2, 3) > 0.5) * 1. # this threshold is currently hyperparameter
-                # print(silhouette.max(), silhouette.min(), silhouette.median(), 'silhouette.max(), silhouette.min(), silhouette.median()')
+                ## silhouette = (silhouette.flatten(2, 3) > 0.5) * 1. # this threshold is currently hyperparameter
+                print(silhouette.max(), silhouette.min(), silhouette.median(), 'silhouette.max(), silhouette.min(), silhouette.median()')
                 # self.silhouette_masks: NxKx(HxW)
                 silhouette_masks = self.silhouette_masks.transpose(0, 1)
-                # print(silhouette_masks.max(), silhouette_masks.min(), silhouette_masks.median(), 'silhouette_masks.max(), silhouette_masks.min(), silhouette_masks.median()')
+                print(silhouette_masks.max(), silhouette_masks.min(), silhouette_masks.median(), 'silhouette_masks.max(), silhouette_masks.min(), silhouette_masks.median()')
                 self.loss_silhouette = self.L2_loss(silhouette, silhouette_masks)
 
             else:

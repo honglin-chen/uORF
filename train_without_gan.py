@@ -27,9 +27,10 @@ if __name__ == '__main__':
         print('Dataset size:', len(dataset))
         meters_trn = {stat: AverageMeter() for stat in model.loss_names}
         opt.stage = 'coarse' if epoch < opt.coarse_epoch else 'fine'
-        model.netDecoder.locality = True if epoch < opt.no_locality_epoch else False
         if opt.pixel_decoder:
             model.netPixelDecoder.locality = True if epoch < opt.no_locality_epoch else False
+        else:
+            model.netDecoder.locality = True if epoch < opt.no_locality_epoch else False
         for i, data in enumerate(dataset):  # inner loop within one epoch
             iter_start_time = time.time()  # timer for computation per iteration
             if total_iters % opt.print_freq == 0:

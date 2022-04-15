@@ -880,6 +880,7 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, ra
 
         weights_samples = weights_samples[0, 0, :, 0, 0] # (NxDxHxW)
         weights_samples = weights_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2)
+        print(weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean(), 'weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean()')
         weights_pixel = weights * weights_samples
         weights_slot = weights * (1.- weights_samples)
         rgb_pixel = raw[..., :3]
