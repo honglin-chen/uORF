@@ -131,7 +131,7 @@ class PixelEncoder(nn.Module):
             self.model.avgpool = nn.Sequential()
             self.latent_size = [0, 64, 128, 256, 512, 1024][num_layers]
             if self.reduce_latent_size:
-                self.mlp = nn.Linear(self.latent_size, 128)
+                self.mlp = nn.Linear(self.latent_size, 64)
 
         self.num_layers = num_layers
         self.index_interp = index_interp
@@ -441,48 +441,51 @@ class Decoder(nn.Module):
         self.use_ray_dir = use_ray_dir
         self.out_ch = 4
         self.small_latent = small_latent
+        self.no_concatenate = no_concatenate
 
         if use_ray_dir:
             input_dim += 3
         if pixel_dim is not None:
-            if no_concatenate:
+            if self.no_concatenate:
                 pass
             else:
                 input_dim += pixel_dim
 
         if small_latent:
-            z_dim = z_dim // 2
-        before_skip = [nn.Linear(input_dim, z_dim), nn.ReLU(True)]
-        after_skip = [nn.Linear(z_dim+input_dim, z_dim), nn.ReLU(True)]
+            latent_dim = z_dim // 2
+        else:
+            latent_dim = z_dim
+        before_skip = [nn.Linear(input_dim, latent_dim), nn.ReLU(True)]
+        after_skip = [nn.Linear(latent_dim+input_dim, latent_dim), nn.ReLU(True)]
         for i in range(n_layers-1):
-            before_skip.append(nn.Linear(z_dim, z_dim))
+            before_skip.append(nn.Linear(latent_dim, latent_dim))
             before_skip.append(nn.ReLU(True))
-            after_skip.append(nn.Linear(z_dim, z_dim))
+            after_skip.append(nn.Linear(latent_dim, latent_dim))
             after_skip.append(nn.ReLU(True))
         self.f_before = nn.Sequential(*before_skip)
         self.f_after = nn.Sequential(*after_skip)
-        self.f_after_latent = nn.Linear(z_dim, z_dim)
-        self.f_after_shape = nn.Linear(z_dim, self.out_ch - 3)
-        self.f_color = nn.Sequential(nn.Linear(z_dim, z_dim//4),
+        self.f_after_latent = nn.Linear(latent_dim, latent_dim)
+        self.f_after_shape = nn.Linear(latent_dim, self.out_ch - 3)
+        self.f_color = nn.Sequential(nn.Linear(latent_dim, latent_dim//4),
                                      nn.ReLU(True),
-                                     nn.Linear(z_dim//4, 3))
-        if pixel_dim is not None and bg_no_pixel:
+                                     nn.Linear(latent_dim//4, 3))
+        if pixel_dim is not None and bg_no_pixel and not no_concatenate:
             input_dim += -pixel_dim
-        before_skip = [nn.Linear(input_dim, z_dim), nn.ReLU(True)]
-        after_skip = [nn.Linear(z_dim + input_dim, z_dim), nn.ReLU(True)]
+        before_skip = [nn.Linear(input_dim, latent_dim), nn.ReLU(True)]
+        after_skip = [nn.Linear(latent_dim + input_dim, latent_dim), nn.ReLU(True)]
         for i in range(n_layers - 1):
-            before_skip.append(nn.Linear(z_dim, z_dim))
+            before_skip.append(nn.Linear(latent_dim, latent_dim))
             before_skip.append(nn.ReLU(True))
-            after_skip.append(nn.Linear(z_dim, z_dim))
+            after_skip.append(nn.Linear(latent_dim, latent_dim))
             after_skip.append(nn.ReLU(True))
-        after_skip.append(nn.Linear(z_dim, self.out_ch))
+        after_skip.append(nn.Linear(latent_dim, self.out_ch))
         self.b_before = nn.Sequential(*before_skip)
         self.b_after = nn.Sequential(*after_skip)
 
-        if no_concatenate:
+        if self.no_concatenate:
             self.change_dim = nn.Linear(pixel_dim, z_dim)
-            self.pixel_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
-            self.object_norm = nn.LayerNorm(z_dim, elementwise_affine=False)
+            self.pixel_norm = nn.LayerNorm(z_dim, elementwise_affine=True)
+            self.object_norm = nn.LayerNorm(z_dim, elementwise_affine=True)
             self.norm2feat = nn.Sequential(
                 nn.Linear(z_dim, z_dim),
                 nn.ReLU(inplace=True),
@@ -519,7 +522,7 @@ class Decoder(nn.Module):
             query_bg = torch.cat([query_bg, ray_dir_input], dim=1)
             query_fg_ex = torch.cat([query_fg_ex, ray_dir_input[None, ...].expand(K-1, -1, -1).flatten(0, 1)], dim=1)
 
-        if no_concatenate:
+        if no_concatenate and pixel_feat is not None:
             if pixel_feat==None:
                 raise NotImplementedError('there should be pixel_feat for no_concatenate')
             pixel_feat = self.change_dim(pixel_feat) # Kx(P)xC_z_slot
@@ -544,6 +547,8 @@ class Decoder(nn.Module):
                 input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
                 # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape in tdw
 
+        # print(input_bg.shape, 'input_bg.shape')
+        # print(input_fg.shape, 'input_fg.shape')
         tmp = self.b_before(input_bg)
         bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
         tmp = self.f_before(input_fg)
@@ -834,7 +839,7 @@ def sin_emb(x, n_freq=5, keep_ori=True):
     embedded_ = torch.cat(embedded, dim=1)
     return embedded_
 
-def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, raws_slot=None, wuv=None, KNDHW=None):
+def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, raws_slot=None, wuv=None, KNDHW=None, div_by_max=None):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -879,8 +884,14 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, ra
         ) # 1x1x(NxDxHxW)x1x1
 
         weights_samples = weights_samples[0, 0, :, 0, 0] # (NxDxHxW)
-        weights_samples = weights_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2)
-        print(weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean(), 'weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean()')
+        if div_by_max:
+            weights_samples = weights_samples.view(N, D, H, W)
+            max = torch.max(weights_samples, dim=1, keepdim=True)
+            weights_samples = weights_samples/max
+            weights_samples = weights_samples.permute([0, 2, 3, 1]).flatten(0, 2)
+        else:
+            weights_samples = weights_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2)
+        # print(weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean(), 'weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean()')
         weights_pixel = weights * weights_samples
         weights_slot = weights * (1.- weights_samples)
         rgb_pixel = raw[..., :3]
