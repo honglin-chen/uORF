@@ -10,7 +10,7 @@ python train_without_gan.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_eac
     --model 'uorf_nogan' \
     --focal_ratio 0.9605 0.9605 \
     --near_plane 2 --far_plane 8 \
-    --gt_seg --pixel_encoder --mask_image_feature --bg_no_pixel --use_ray_dir \
+    --gt_seg --pixel_encoder --mask_image_feature --bg_no_pixel \
 # done
 echo "Done"
 # node 6 cuda 4

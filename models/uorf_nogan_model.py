@@ -238,10 +238,8 @@ class uorfNoGanModel(BaseModel):
 
         # Pixel Encoder Forward (to get feature values in pixel coordinates (uv), call pixelEncoder.index(uv), not forward)
         if self.opt.pixel_encoder:
-            if self.opt.mask_image or self.opt.mask_image_feature:
-                feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False), masks = attn)
-            else:
-                feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))
+            masks = attn if self.opt.mask_image or self.opt.mask_image_feature else None
+            feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False), masks = masks)
 
         # Get rays and coordinates
         cam2world = self.cam2world
@@ -271,6 +269,7 @@ class uorfNoGanModel(BaseModel):
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(0, 3), z_vals_.flatten(0, 2), ray_dir_.flatten(0, 2)
             x = self.x[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.z_vals, self.ray_dir = z_vals, ray_dir
+            W, H, D = self.opt.render_size, self.opt.render_size, self.opt.n_samp
 
         if self.opt.use_ray_dir:
             ray_dir_input = ray_dir.view([N, H, W, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
@@ -305,12 +304,13 @@ class uorfNoGanModel(BaseModel):
             tensor(3.4756, device='cuda:0') tensor(-4.4286, device='cuda:0') tensor(-0.0233, device='cuda:0') tensor(-0.0241, device='cuda:0') tensor(0.6644, device='cuda:0') u max min median mean std
             tensor(12.8928, device='cuda:0') tensor(-1.7501, device='cuda:0') tensor(1.1921e-07, device='cuda:0') tensor(0.1183, device='cuda:0') tensor(0.9658, device='cuda:0') v max min median mean std
             '''
-            pixel_feat = self.netPixelEncoder.index(uv) # 1x(NxDxWxH)x2 -> 1xCx(NxDxWxH)
 
             if self.opt.mask_image or self.opt.mask_image_feature:
-                pixel_feat = torch.cat(pixel_feat, dim=0)
+                uv = uv.expand(K, -1, -1) # 1x(NxDxWxH)x2 -> Kx(NxDxWxH)x2
+                pixel_feat = self.netPixelEncoder.index(uv)  # Kx(NxDxWxH)x2 -> KxCx(NxDxWxH)
                 pixel_feat = pixel_feat.transpose(1, 2)
             else:
+                pixel_feat = self.netPixelEncoder.index(uv)  # 1x(NxDxWxH)x2 -> 1xCx(NxDxWxH)
                 pixel_feat = pixel_feat.transpose(1, 2)  # 1x(NxDxWxH)xC
                 pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxDxWxH)xC
         else:

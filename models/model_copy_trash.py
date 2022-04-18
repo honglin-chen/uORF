@@ -145,7 +145,7 @@ class PixelEncoder(nn.Module):
 
         self.mask_image = mask_image
         self.mask_image_feature = mask_image_feature
-        if self.mask_image or self.mask_image_feature:
+        if self.mask_image_feature:
             self.downsample = nn.AvgPool2d(kernel_size=2, stride=2, padding=0)
         self.n_mask = 5 # TODO: make it configurable
 
@@ -159,27 +159,52 @@ class PixelEncoder(nn.Module):
         :param z_bounds ignored (for compatibility)
         :return (B, L, N) L is latent size
         """
+        if self.mask_image_feature or self.mask_image:
+            #then, the self.latent_list is a list of self.latent for each mask
+            sample_list = []
+            with profiler.record_function("encoder_index"):
+                if uv.shape[0] == 1 and self.latent.shape[0] > 1:
+                    uv = uv.expand(self.latent.shape[0], -1, -1)
 
-        with profiler.record_function("encoder_index"):
-            if uv.shape[0] == 1 and self.latent.shape[0] > 1:
-                uv = uv.expand(self.latent.shape[0], -1, -1)
+                with profiler.record_function("encoder_index_pre"):
+                    if len(image_size) > 0:
+                        if len(image_size) == 1:
+                            image_size = (image_size, image_size)
+                        scale = self.latent_scaling / image_size
+                        uv = uv * scale - 1.0
+                uv = uv.unsqueeze(2)  # (B, N, 1, 2)
+                for idx, latent in enumerate(self.latent_list):
+                    samples = F.grid_sample(
+                        latent,
+                        uv,
+                        align_corners=True,
+                        mode=self.index_interp,
+                        padding_mode=self.index_padding,
+                    )
+                    sample_list.append(samples[:, :, :, 0])  # (B, C, N)
+            return sample_list
 
-            with profiler.record_function("encoder_index_pre"):
-                if len(image_size) > 0:
-                    if len(image_size) == 1:
-                        image_size = (image_size, image_size)
-                    scale = self.latent_scaling / image_size
-                    uv = uv * scale - 1.0
+        else:
+            with profiler.record_function("encoder_index"):
+                if uv.shape[0] == 1 and self.latent.shape[0] > 1:
+                    uv = uv.expand(self.latent.shape[0], -1, -1)
 
-            uv = uv.unsqueeze(2)  # (B, N, 1, 2)
-            samples = F.grid_sample(
-                self.latent,
-                uv,
-                align_corners=True,
-                mode=self.index_interp,
-                padding_mode=self.index_padding,
-            )
-            return samples[:, :, :, 0]  # (B, C, N)
+                with profiler.record_function("encoder_index_pre"):
+                    if len(image_size) > 0:
+                        if len(image_size) == 1:
+                            image_size = (image_size, image_size)
+                        scale = self.latent_scaling / image_size
+                        uv = uv * scale - 1.0
+
+                uv = uv.unsqueeze(2)  # (B, N, 1, 2)
+                samples = F.grid_sample(
+                    self.latent,
+                    uv,
+                    align_corners=True,
+                    mode=self.index_interp,
+                    padding_mode=self.index_padding,
+                )
+                return samples[:, :, :, 0]  # (B, C, N)
 
     def forward(self, x, masks=None):
         """
@@ -187,73 +212,136 @@ class PixelEncoder(nn.Module):
         :param x image (B, C, H, W)
         :return latent (B, latent_size, H, W)
         """
-        H, W = x.shape[2], x.shape[3]
-
-        if self.mask_image or self.mask_image_feature:
-            K = masks.shape[0]
-            masks = masks.view(K, H, W).unsqueeze(1)
-
+        # print(x.shape, 'x.shape')
+        # print(masks.shape, 'mask.shape after x')
+        shape = x.shape
         if self.mask_image:
-            x = x.expand(K, -1, -1, -1).clone() # KxCxHxW
-            x *= masks
+            self.latent_list = []
+            xs = []
+            for _ in range(self.n_mask):
+                xs.append(x.clone())
+            for idx, x in enumerate(xs):
+                if self.feature_scale != 1.0:
+                    x = F.interpolate(
+                        x,
+                        scale_factor=self.feature_scale,
+                        mode="bilinear" if self.feature_scale > 1.0 else "area",
+                        align_corners=True if self.feature_scale > 1.0 else None,
+                        recompute_scale_factor=True,
+                    )
+                x = x.to(device=self.latent.device)
 
-        if self.feature_scale != 1.0:
-            x = F.interpolate(
-                x,
-                scale_factor=self.feature_scale,
-                mode="bilinear" if self.feature_scale > 1.0 else "area",
-                align_corners=True if self.feature_scale > 1.0 else None,
-                recompute_scale_factor=True,
-            )
-        x = x.to(device=self.latent.device)
+                if self.use_custom_resnet:
+                    self.latent = self.model(x)
+                else:
+                    x = self.model.conv1(x)
+                    x = self.model.bn1(x)
+                    x = self.model.relu(x)
 
-        if self.use_custom_resnet:
-            self.latent = self.model(x)
+                    latents = [x]
+                    if self.num_layers > 1:
+                        if self.use_first_pool:
+                            x = self.model.maxpool(x)
+                        x = self.model.layer1(x)
+                        latents.append(x)
+                    if self.num_layers > 2:
+                        x = self.model.layer2(x)
+                        latents.append(x)
+                    if self.num_layers > 3:
+                        x = self.model.layer3(x)
+                        latents.append(x)
+                    if self.num_layers > 4:
+                        x = self.model.layer4(x)
+                        latents.append(x)
+
+                    self.latents = latents
+                    align_corners = None if self.index_interp == "nearest " else True
+                    latent_sz = latents[0].shape[-2:]
+                    for i in range(len(latents)):
+                        latents[i] = F.interpolate(
+                            latents[i],
+                            latent_sz,
+                            mode=self.upsample_interp,
+                            align_corners=align_corners,
+                        )
+                    self.latent = torch.cat(latents, dim=1)
+                self.latent_scaling[0] = self.latent.shape[-1]
+                self.latent_scaling[1] = self.latent.shape[-2]
+                self.latent_scaling = self.latent_scaling / (self.latent_scaling - 1) * 2.0
+                if self.reduce_latent_size:
+                    self.latent = self.mlp(self.latent.transpose(3, 1)).transpose(3, 1)
+
+                if self.mask_image_feature:
+                    mask = masks[idx].view(shape[-2], shape[-1])
+                    mask = self.downsample(mask[None, :])
+                    self.latent_list.append(self.latent.clone() * mask[None, :, :, :])
+                else:
+                    self.latent_list.append(self.latent.clone())
+
+            return self.latents
+
         else:
-            x = self.model.conv1(x)
-            x = self.model.bn1(x)
-            x = self.model.relu(x)
-
-            latents = [x]
-            if self.num_layers > 1:
-                if self.use_first_pool:
-                    x = self.model.maxpool(x)
-                x = self.model.layer1(x)
-                latents.append(x)
-            if self.num_layers > 2:
-                x = self.model.layer2(x)
-                latents.append(x)
-            if self.num_layers > 3:
-                x = self.model.layer3(x)
-                latents.append(x)
-            if self.num_layers > 4:
-                x = self.model.layer4(x)
-                latents.append(x)
-
-            self.latents = latents
-            align_corners = None if self.index_interp == "nearest " else True
-            latent_sz = latents[0].shape[-2:]
-            for i in range(len(latents)):
-                latents[i] = F.interpolate(
-                    latents[i],
-                    latent_sz,
-                    mode=self.upsample_interp,
-                    align_corners=align_corners,
+            if self.feature_scale != 1.0:
+                x = F.interpolate(
+                    x,
+                    scale_factor=self.feature_scale,
+                    mode="bilinear" if self.feature_scale > 1.0 else "area",
+                    align_corners=True if self.feature_scale > 1.0 else None,
+                    recompute_scale_factor=True,
                 )
-            self.latent = torch.cat(latents, dim=1)
-        self.latent_scaling[0] = self.latent.shape[-1]
-        self.latent_scaling[1] = self.latent.shape[-2]
-        self.latent_scaling = self.latent_scaling / (self.latent_scaling - 1) * 2.0
-        if self.reduce_latent_size:
-            self.latent = self.mlp(self.latent.transpose(3, 1)).transpose(3, 1)
+            x = x.to(device=self.latent.device)
 
-        if self.mask_image_feature:
-            masks = self.downsample(masks)
-            if self.latent.shape[0]==1:
-                self.latent = self.latent.expand(K, -1, -1, -1).clone()
-            self.latent *= masks
+            if self.use_custom_resnet:
+                self.latent = self.model(x)
+            else:
+                x = self.model.conv1(x)
+                x = self.model.bn1(x)
+                x = self.model.relu(x)
 
-        return self.latent
+                latents = [x]
+                if self.num_layers > 1:
+                    if self.use_first_pool:
+                        x = self.model.maxpool(x)
+                    x = self.model.layer1(x)
+                    latents.append(x)
+                if self.num_layers > 2:
+                    x = self.model.layer2(x)
+                    latents.append(x)
+                if self.num_layers > 3:
+                    x = self.model.layer3(x)
+                    latents.append(x)
+                if self.num_layers > 4:
+                    x = self.model.layer4(x)
+                    latents.append(x)
+
+                self.latents = latents
+                align_corners = None if self.index_interp == "nearest " else True
+                latent_sz = latents[0].shape[-2:]
+                for i in range(len(latents)):
+                    latents[i] = F.interpolate(
+                        latents[i],
+                        latent_sz,
+                        mode=self.upsample_interp,
+                        align_corners=align_corners,
+                    )
+                self.latent = torch.cat(latents, dim=1)
+            self.latent_scaling[0] = self.latent.shape[-1]
+            self.latent_scaling[1] = self.latent.shape[-2]
+            self.latent_scaling = self.latent_scaling / (self.latent_scaling - 1) * 2.0
+            if self.reduce_latent_size:
+                self.latent = self.mlp(self.latent.transpose(3, 1)).transpose(3, 1)
+
+            if self.mask_image_feature:
+                self.latent_list = []
+                for idx in range(self.n_mask):
+                    # print(masks.shape, 'masks.shape')
+                    # print(self.latent.shape, 'self.latent.shape')
+                    mask = masks[idx].view(shape[-2], shape[-1])
+                    mask = self.downsample(mask[None, :])
+                    self.latent_list.append(self.latent.clone() * mask[None, :, :, :])
+                return self.latent_list
+
+            return self.latent
 
     @classmethod
     def from_conf(cls, conf):
@@ -798,7 +886,7 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, ra
         weights_samples = weights_samples[0, 0, :, 0, 0] # (NxDxHxW)
         if div_by_max:
             weights_samples = weights_samples.view(N, D, H, W)
-            max, _ = torch.max(weights_samples, dim=1, keepdim=True)
+            max = torch.max(weights_samples, dim=1, keepdim=True)
             weights_samples = weights_samples/max
             weights_samples = weights_samples.permute([0, 2, 3, 1]).flatten(0, 2)
         else:
