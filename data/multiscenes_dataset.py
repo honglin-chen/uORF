@@ -29,7 +29,9 @@ class MultiscenesDataset(BaseDataset):
         BaseDataset.__init__(self, opt)
         self.n_scenes = opt.n_scenes
         self.n_img_each_scene = opt.n_img_each_scene
-        self.min_num_masks = 4
+        self.min_num_masks = opt.num_slots - 1
+        import pdb;pdb.set_trace()
+        self.pred_seg = False
         image_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*.png')))  # root/00000_sc000_az00_el00.png
         mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask.png')))
         fg_mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask_for_moving.png')))
@@ -46,7 +48,7 @@ class MultiscenesDataset(BaseDataset):
         filenames = sorted(list(filenames_set))
         self.scenes = []
         for i in range(self.n_scenes):
-            scene_filenames = [x for x in filenames if 'sc{:04d}'.format(i) in x]
+            scene_filenames = [x for x in filenames if 'sc{:04d}_frame5'.format(i) in x]
             self.scenes.append(scene_filenames)
 
     def _transform(self, img):
@@ -102,7 +104,7 @@ class MultiscenesDataset(BaseDataset):
                 print('filenotfound error: {}'.format(pose_path))
                 assert False
             pose = torch.tensor(pose, dtype=torch.float32)
-            azi_path = pose_path.replace('_RT.txt', '_azi_rot.txt')
+            azi_path = pose_path.replace('_RT.txt', '_azi_rot.txt').replace('_frame5_', '_')
             if self.opt.fixed_locality:
                 azi_rot = np.eye(3)  # not used; placeholder
             else:
@@ -116,7 +118,7 @@ class MultiscenesDataset(BaseDataset):
                 ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot, 'depth': depth}
             else:
                 ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot}
-            mask_path = path.replace('.png', '_mask.png')
+            mask_path = path.replace('.png', '_pred_mask.png' if self.pred_seg else '_mask.png')
             if os.path.isfile(mask_path):
                 mask = Image.open(mask_path).convert('RGB')
                 # mask_l = mask.convert('L')
@@ -143,16 +145,31 @@ class MultiscenesDataset(BaseDataset):
                 # additional attributes: GT background mask and object masks
                 ret['bg_mask'] = mask_l == bg_color
                 obj_masks = []
-                for i in range(len(greyscale_dict)):
-                    if greyscale_dict[i] == bg_color:
-                        continue
-                    obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
-                    obj_masks.append(obj_mask)
-                obj_masks = torch.stack(obj_masks)  # Kx1xHxW
 
+                if self.pred_seg:
+                    area = (mask_l == greyscale_dict[:, None, None]).sum(dim=[1, 2])
+                    if self.min_num_masks < len(greyscale_dict):
+                        _, idx = area.topk(k=self.min_num_masks)
+                    else:
+                        idx = range(len(greyscale_dict))
+
+                    for i in range(len(greyscale_dict)):
+                        if greyscale_dict[i] == bg_color:
+                            continue
+                        if i in idx:
+                            obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
+                            obj_masks.append(obj_mask)
+                else:
+
+                    for i in range(len(greyscale_dict)):
+                        if greyscale_dict[i] == bg_color:
+                            continue
+                        obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
+                        obj_masks.append(obj_mask)
+                obj_masks = torch.stack(obj_masks)  # Kx1xHxW
                 # if the number of masks is too small, pad with empty masks
                 if obj_masks.shape[0] < self.min_num_masks:
-                    obj_masks = torch.cat([obj_masks, torch.zeros_like(obj_masks[0:(self.min_num_masks-obj_masks.shape[0])])], dim=0)
+                    obj_masks = torch.cat([obj_masks, torch.zeros(self.min_num_masks-obj_masks.shape[0], 1, obj_masks.shape[2], obj_masks.shape[3]).to(obj_masks)], dim=0)
 
                 ret['obj_masks'] = obj_masks  # KxHxW
 
