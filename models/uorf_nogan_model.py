@@ -66,6 +66,7 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--reduce_latent_size', action='store_true', help='reduce latent size of pixel encoder. this option is not true for default and not configurable. TODO')
         parser.add_argument('--shared_pixel_slot_decoder', action='store_true', help='use pixel decoder for slot decoder. need to check whether this reduce memory burden')
         parser.add_argument('--div_by_max', action='store_true', help='divide pixel feature importance by max per each ray')
+        parser.add_argument('--learn_only_silhouette', action='store_true', help='loss function contains only silhouette loss')
         parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -133,7 +134,7 @@ class uorfNoGanModel(BaseModel):
 
         # [pixel Decoder] or [uORF Decoder]
         if self.opt.pixel_decoder:
-            self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim+128, z_dim=opt.z_dim, n_layers=opt.n_layer,
+            self.netPixelDecoder = networks.init_net(PixelDecoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim+64, z_dim=opt.z_dim, n_layers=opt.n_layer,
                                    locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality, slot_repeat=self.opt.slot_repeat), gpu_ids=self.gpu_ids, init_type='None')
             self.parameters.append(self.netPixelDecoder.parameters())
             self.nets.append(self.netPixelDecoder)
@@ -306,13 +307,13 @@ class uorfNoGanModel(BaseModel):
             '''
 
             if self.opt.mask_image or self.opt.mask_image_feature:
-                uv = uv.expand(K, -1, -1) # 1x(NxDxWxH)x2 -> Kx(NxDxWxH)x2
+                uv = uv.expand(K, -1, -1).clone() # 1x(NxDxWxH)x2 -> Kx(NxDxWxH)x2
                 pixel_feat = self.netPixelEncoder.index(uv)  # Kx(NxDxWxH)x2 -> KxCx(NxDxWxH)
                 pixel_feat = pixel_feat.transpose(1, 2)
             else:
                 pixel_feat = self.netPixelEncoder.index(uv)  # 1x(NxDxWxH)x2 -> 1xCx(NxDxWxH)
                 pixel_feat = pixel_feat.transpose(1, 2)  # 1x(NxDxWxH)xC
-                pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxDxWxH)xC
+                pixel_feat = pixel_feat.expand(K, -1, -1).clone() # Kx(NxDxWxH)xC
         else:
             pixel_feat = None
             wuv = None
@@ -341,6 +342,10 @@ class uorfNoGanModel(BaseModel):
             masked_raws_slot = masked_raws_slot.view([K, N, D, H, W, 4])
             unmasked_raws_slot = unmasked_raws_slot.view([K, N, D, H, W, 4])
 
+            self.masked_raws_slot = masked_raws_slot
+            self.wuv = wuv
+            self.KNDHW = (K, N, D, H, W)  # not sure the location of this part
+
         else:
             raws_slot = None
 
@@ -350,7 +355,7 @@ class uorfNoGanModel(BaseModel):
         x_recon = rendered * 2 - 1
 
         if self.opt.input_no_loss:
-            if epoch<100:
+            if epoch<10000:
                 self.loss_recon = self.L2_loss(x_recon[1:], x[1:])
             else:
                 self.loss_recon = self.L2_loss(x_recon, x)
@@ -361,17 +366,12 @@ class uorfNoGanModel(BaseModel):
         self.loss_perc = self.weight_percept * self.L2_loss(rendered_feat, x_feat)
 
         if self.opt.silhouette_loss:
-
-            if epoch <= 50:
+            if self.opt.learn_only_silhouette:
                 with torch.no_grad():
                     self.loss_perc = 0.
                     self.loss_recon = 0.
 
-            self.masked_raws_slot = masked_raws_slot
-            self.wuv = wuv
-            self.KNDHW = (K, N, D, H, W) # not sure the location of this part
-
-            if epoch <= 50:
+            if epoch <= 10000:
                 setattr(self, 'masked_raws', masked_raws)
                 self.silhouette_list = []
                 self.compute_visuals(only_masked=True)
@@ -410,6 +410,7 @@ class uorfNoGanModel(BaseModel):
 
     def compute_visuals(self, only_masked=False):
         if only_masked:
+            # this is for silhouette loss
             _, N, D, H, W, _ = self.masked_raws.shape
             masked_raws = self.masked_raws  # KxNxDxHxWx4
             for k in range(self.num_slots):
@@ -421,7 +422,7 @@ class uorfNoGanModel(BaseModel):
                     rgb_map, depth_map, _, mask_map = raw2outputs(raws, self.z_vals, self.ray_dir, render_mask=True, weigh_pixelfeat=self.opt.weigh_pixelfeat,
                                                         raws_slot=raws_slot, wuv=self.wuv, KNDHW=self.KNDHW, div_by_max=self.opt.div_by_max)
                 else:
-                    rgb_map, depth_map, _, mask_map = raw2outputs(raws, z_vals, ray_dir, render_mask=True)
+                    rgb_map, depth_map, _, mask_map = raw2outputs(raws, self.z_vals, self.ray_dir, render_mask=True)
                 # rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
                 # x_recon = rendered * 2 - 1
                 self.silhouette_list.append(mask_map.view(N, H, W))
