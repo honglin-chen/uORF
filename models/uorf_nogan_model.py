@@ -163,7 +163,7 @@ class uorfNoGanModel(BaseModel):
             else:
                 self.netSlotDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=None, z_dim=opt.z_dim, n_layers=opt.n_layer,
                             locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, no_concatenate=self.opt.no_concatenate, bg_no_pixel=self.opt.bg_no_pixel,
-                                                            use_ray_dir=self.opt.use_ray_dir, small_latent=True), gpu_ids=self.gpu_ids, init_type='xavier')
+                                                            use_ray_dir=self.opt.use_ray_dir, small_latent=False), gpu_ids=self.gpu_ids, init_type='xavier')
             self.parameters.append(self.netSlotDecoder.parameters())
             self.nets.append(self.netSlotDecoder)
             self.model_names.append('SlotDecoder')

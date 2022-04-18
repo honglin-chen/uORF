@@ -798,8 +798,9 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, ra
         weights_samples = weights_samples[0, 0, :, 0, 0] # (NxDxHxW)
         if div_by_max:
             weights_samples = weights_samples.view(N, D, H, W)
+            # with torch.no_grad():
             max, _ = torch.max(weights_samples, dim=1, keepdim=True)
-            weights_samples = weights_samples/max
+            weights_samples = weights_samples/(max+1e-5)
             weights_samples = weights_samples.permute([0, 2, 3, 1]).flatten(0, 2)
         else:
             weights_samples = weights_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2)
