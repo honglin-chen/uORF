@@ -86,10 +86,12 @@ class uorfNoGanModel(BaseModel):
         - define loss function, visualization images, model names, and optimizers
         """
         BaseModel.__init__(self, opt)  # call the initialization method of BaseModel
-        self.loss_names = ['recon', 'perc']
+        self.loss_names = ['recon', 'perc', 'silhouette']
         n = opt.n_img_each_scene
         self.visual_names = ['x{}'.format(i) for i in range(n)] + \
                             ['x_rec{}'.format(i) for i in range(n)] + \
+                            ['seg{}'.format(i) for i in range(n)] + \
+                            ['seg_rec{}'.format(i) for i in range(n)] + \
                             ['slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['unmasked_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
@@ -173,6 +175,7 @@ class uorfNoGanModel(BaseModel):
             self.optimizers = [self.optimizer]
 
         self.L2_loss = nn.MSELoss()
+        self.L1_loss = nn.L1Loss(reduction='none')
 
     def setup(self, opt):
         """Load and print networks; create schedulers
@@ -325,13 +328,16 @@ class uorfNoGanModel(BaseModel):
             # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
 
         else:
-            raws, masked_raws, unmasked_raws, masks = \
+            raws, masked_raws, unmasked_raws, masks, raws_seg = \
                 self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, no_concatenate=self.opt.no_concatenate, ray_dir_input=ray_dir_input)
             # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
 
         raws = raws.view([N, D, H, W, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
         masked_raws = masked_raws.view([K, N, D, H, W, 4])
         unmasked_raws = unmasked_raws.view([K, N, D, H, W, 4])
+
+        raws_seg = raws_seg.view([N, D, H, W, -1]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDxK
+
 
         if self.opt.weigh_pixelfeat:
             raws_slot, masked_raws_slot, unmasked_raws_slot, masks_slot = \
@@ -365,30 +371,49 @@ class uorfNoGanModel(BaseModel):
         rendered_feat, x_feat = self.perceptual_net(rendered_norm), self.perceptual_net(x_norm)
         self.loss_perc = self.weight_percept * self.L2_loss(rendered_feat, x_feat)
 
+        seg_map, _, _ = raw2outputs(raws_seg, z_vals, ray_dir, weigh_pixelfeat=self.opt.weigh_pixelfeat,
+                                    raws_slot=raws_slot, wuv=wuv, KNDHW=(K, N, D, H, W),
+                                    div_by_max=self.opt.div_by_max)
+        silhouette = seg_map.view(N, H, W, K).permute([0, 3, 1, 2])  # NxKxHxW
+        seg_map_recon = silhouette.argmax(1).unsqueeze(1)
+
         if self.opt.silhouette_loss:
             if self.opt.learn_only_silhouette:
                 with torch.no_grad():
                     self.loss_perc = 0.
                     self.loss_recon = 0.
 
-            if epoch <= 10000:
-                setattr(self, 'masked_raws', masked_raws)
-                self.silhouette_list = []
-                self.compute_visuals(only_masked=True)
-                silhouette = torch.stack(self.silhouette_list, dim=0) # KxNx3xHxW, self.masks: KxNx(HxW)
-                silhouette = silhouette.flatten(2, 3)
-                # try to determine whether want to divide by max value (now silhouette has very small values, compared to 1. (ex. 0.07 for max)).
-                # this increase very soon, this loss might dominate in the beginning of learning
-                ## silhouette = (silhouette.flatten(2, 3) > 0.5) * 1. # this threshold is currently hyperparameter
-                # print(silhouette.max(), silhouette.min(), silhouette.median(), 'silhouette.max(), silhouette.min(), silhouette.median()')
-                # self.silhouette_masks: NxKx(HxW)
-                silhouette_masks = self.silhouette_masks.transpose(0, 1)
-                # print(silhouette_masks.max(), silhouette_masks.min(), silhouette_masks.median(), 'silhouette_masks.max(), silhouette_masks.min(), silhouette_masks.median()')
-                self.loss_silhouette = self.L2_loss(silhouette, silhouette_masks)
 
-            else:
-                with torch.no_grad():
-                    self.loss_silhouette = 0.
+            def dice_loss(pred, targ):
+                numer = (pred * targ).sum(-1)
+                denom = pred.sum(-1) + targ.sum(-1)
+                loss = 1. - (2 * numer + 1) / (denom + 1)  # [B,K]
+                return loss
+            self.loss_silhouette = self.L1_loss(silhouette.flatten(2, 3), self.silhouette_masks)
+
+            self.loss_silhouette = self.loss_silhouette.mean()
+            
+            # if epoch <= 10000:
+            #     setattr(self, 'masked_raws', masked_raws)
+            #     self.silhouette_list = []
+            #     self.compute_visuals(only_masked=True)
+            #     silhouette = torch.stack(self.silhouette_list, dim=0) # KxNx3xHxW, self.masks: KxNx(HxW)
+            #     silhouette = silhouette.flatten(2, 3)
+            #     # try to determine whether want to divide by max value (now silhouette has very small values, compared to 1. (ex. 0.07 for max)).
+            #     # this increase very soon, this loss might dominate in the beginning of learning
+            #     ## silhouette = (silhouette.flatten(2, 3) > 0.5) * 1. # this threshold is currently hyperparameter
+            #     # print(silhouette.max(), silhouette.min(), silhouette.median(), 'silhouette.max(), silhouette.min(), silhouette.median()')
+            #     # self.silhouette_masks: NxKx(HxW)
+            #     silhouette_masks = self.silhouette_masks.transpose(0, 1)
+            #     # print(silhouette_masks.max(), silhouette_masks.min(), silhouette_masks.median(), 'silhouette_masks.max(), silhouette_masks.min(), silhouette_masks.median()')
+            #     self.loss_silhouette = self.L2_loss(silhouette, silhouette_masks)
+            #     print('Silhouette shape: ', silhouette.shape)
+            #     seg_map_recon = silhouette.argmax(0).reshape(4, 1, 64, 64)
+            #
+        else:
+            with torch.no_grad():
+                self.loss_silhouette = 0.
+
 
         with torch.no_grad():
             attn = attn.detach().cpu()  # KxN
@@ -399,6 +424,13 @@ class uorfNoGanModel(BaseModel):
             for i in range(self.opt.n_img_each_scene):
                 setattr(self, 'x_rec{}'.format(i), x_recon[i])
                 setattr(self, 'x{}'.format(i), x[i])
+                if self.opt.silhouette_loss:
+                    setattr(self, 'seg_rec{}'.format(i), seg_map_recon[i])
+                    setattr(self, 'seg{}'.format(i), self.silhouette_masks[i].argmax(0).reshape(1, 64, 64))
+                else:
+                    setattr(self, 'seg_rec{}'.format(i), torch.zeros_like(x_recon[i]))
+                    setattr(self, 'seg{}'.format(i), torch.zeros_like(x_recon[i]))
+
             setattr(self, 'masked_raws', masked_raws.detach())
             setattr(self, 'unmasked_raws', unmasked_raws.detach())
             setattr(self, 'attn', attn)
@@ -465,9 +497,10 @@ class uorfNoGanModel(BaseModel):
 
     def backward(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
-        loss = self.loss_recon + self.loss_perc
         if self.opt.silhouette_loss:
-            loss += self.loss_silhouette
+            loss = self.loss_recon + self.loss_perc + self.loss_silhouette # in place update might be undesirable
+        else:
+            loss = self.loss_recon + self.loss_perc
         loss.backward()
         self.loss_perc = self.loss_perc / self.weight_percept if self.weight_percept > 0 else self.loss_perc
 

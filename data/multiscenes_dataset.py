@@ -89,6 +89,7 @@ class MultiscenesDataset(BaseDataset):
         """
         scene_idx = index
         scene_filenames = self.scenes[scene_idx]
+
         if self.opt.isTrain and not self.opt.no_shuffle:
             filenames = random.sample(scene_filenames, self.n_img_each_scene)
         else:
@@ -118,7 +119,9 @@ class MultiscenesDataset(BaseDataset):
                 ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot, 'depth': depth}
             else:
                 ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot}
+
             mask_path = path.replace('.png', '_pred_mask.png' if self.pred_seg else '_mask.png')
+
             if os.path.isfile(mask_path):
                 mask = Image.open(mask_path).convert('RGB')
                 # mask_l = mask.convert('L')

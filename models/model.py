@@ -482,7 +482,13 @@ class Decoder(nn.Module):
         masked_raws = unmasked_raws * masks
         raws = masked_raws.sum(dim=0)
 
-        return raws, masked_raws, unmasked_raws, masks
+        segment_indices = torch.arange(K).reshape(K, 1).expand(-1, P)
+        raw_seg = F.one_hot(segment_indices, num_classes=K).to(raw_rgb)
+        unmasked_raws_seg = torch.cat([raw_seg, raw_sigma], dim=2)  # KxPxK
+        masked_raws_seg = unmasked_raws_seg * masks
+        raws_seg = masked_raws_seg.sum(dim=0)
+
+        return raws, masked_raws, unmasked_raws, masks, raws_seg
 
 class PixelDecoder(nn.Module):
     def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, pixel_positional_encoding=None, use_ray_dir=None, slot_repeat=None):
@@ -612,8 +618,6 @@ class PixelDecoder(nn.Module):
                 fg_raw_shape[outsider_idx] *= 0
             fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # 1xPx4
 
-            all_raws = fg_raws  # 1xPx4
-            raw_masks = F.relu(all_raws[:, :, -1:], True)  # 1xPx1
             masks = raw_masks / (raw_masks.sum(dim=0) + 1e-5)  # 1xPx1
             raw_rgb = (all_raws[:, :, :3].tanh() + 1) / 2
             raw_sigma = raw_masks
@@ -772,7 +776,7 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, ra
 
     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
-    alpha = raw2alpha(raw[..., 3], dists)  # [N_rays, N_samples]
+    alpha = raw2alpha(raw[..., -1], dists)  # [N_rays, N_samples]
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=device), 1. - alpha + 1e-10], -1), -1)[:,:-1] # [N_rays, N_samples]
 
     if weigh_pixelfeat:
@@ -806,12 +810,12 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, ra
         # print(weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean(), 'weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean()')
         weights_pixel = weights * weights_samples
         weights_slot = weights * (1.- weights_samples)
-        rgb_pixel = raw[..., :3]
-        rgb_slot = raws_slot[..., :3]
+        rgb_pixel = raw[..., :-1]
+        rgb_slot = raws_slot[..., :-1]
         rgb_map = torch.sum(weights_pixel[..., None] * rgb_pixel + weights_slot[..., None] * rgb_slot, -2)
 
     else:
-        rgb = raw[..., :3]
+        rgb = raw[..., :-1]
         rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
 
     weights_norm = weights.detach() + 1e-5
@@ -819,7 +823,7 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, ra
     depth_map = torch.sum(weights_norm * z_vals, -1)
 
     if render_mask:
-        density = raw[..., 3]  # [N_rays, N_samples]
+        density = raw[..., -1]  # [N_rays, N_samples]
         mask_map = torch.sum(weights * density, dim=1)  # [N_rays,]
         return rgb_map, depth_map, weights_norm, mask_map
 
