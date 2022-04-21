@@ -41,6 +41,7 @@ class Projection(object):
         x_frus = x.flatten().to(self.device)
         y_frus = y.flatten().to(self.device)
         z_frus = z.flatten().to(self.device)
+
         # project frustum points to vol coord
         depth_range = torch.linspace(self.near, self.far, self.frustum_size[2])
         z_cam = depth_range[z_frus].to(self.device)
@@ -63,10 +64,10 @@ class Projection(object):
         """
         N = cam2world.shape[0]
         W, H, D = self.frustum_size
-        pixel_coor = self.construct_frus_coor()
-        frus_cam_coor = torch.matmul(self.spixel2cam, pixel_coor.float())  # 4x(WxHxD)
-        frus_world_coor = torch.matmul(cam2world, frus_cam_coor)  # Nx4x(WxHxD)
-        frus_nss_coor = torch.matmul(self.world2nss, frus_world_coor)  # Nx4x(WxHxD)
+        pixel_coor = self.construct_frus_coor() # 4x(WxHxD)
+        frus_cam_coor = torch.matmul(self.spixel2cam, pixel_coor.float())  # 4x4, 4x(WxHxD) -> 4x(WxHxD)
+        frus_world_coor = torch.matmul(cam2world, frus_cam_coor)  # Nx4x4, 4x(WxHxD) -> Nx4x(WxHxD)
+        frus_nss_coor = torch.matmul(self.world2nss, frus_world_coor)  # 1x4x4,Nx4x(WxHxD) -> Nx4x(WxHxD)
         frus_nss_coor = frus_nss_coor.view(N, 4, W, H, D).permute([0, 4, 3, 2, 1])  # NxDxHxWx4
         frus_nss_coor = frus_nss_coor[..., :3]  # NxDxHxWx3
         scale = H // self.render_size[0]
