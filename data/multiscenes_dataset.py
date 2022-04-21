@@ -87,6 +87,8 @@ class MultiscenesDataset(BaseDataset):
         """
         scene_idx = index
         scene_filenames = self.scenes[scene_idx]
+        if self.opt.no_shuffle:
+            print('Warning: no shuffle')
         if self.opt.isTrain and not self.opt.no_shuffle:
             filenames = random.sample(scene_filenames, self.n_img_each_scene)
         else:

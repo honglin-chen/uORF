@@ -333,7 +333,8 @@ class ImageEncoder(nn.Module):
         )
 
 class Decoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False):
+    def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7,
+                 fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False, predict_centroid=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -354,6 +355,7 @@ class Decoder(nn.Module):
         self.out_ch = 4
         self.small_latent = small_latent
         self.no_concatenate = no_concatenate
+        self.predict_centroid = predict_centroid
 
         if use_ray_dir:
             input_dim += 3
@@ -381,6 +383,23 @@ class Decoder(nn.Module):
         self.f_color = nn.Sequential(nn.Linear(latent_dim, latent_dim//4),
                                      nn.ReLU(True),
                                      nn.Linear(latent_dim//4, 3))
+
+        if self.predict_centroid:
+            before_skip = [nn.Linear(z_dim, latent_dim), nn.ReLU(True)]
+            after_skip = [nn.Linear(latent_dim + z_dim, latent_dim), nn.ReLU(True)]
+            for i in range(n_layers - 1):
+                before_skip.append(nn.Linear(latent_dim, latent_dim))
+                before_skip.append(nn.ReLU(True))
+                after_skip.append(nn.Linear(latent_dim, latent_dim))
+                after_skip.append(nn.ReLU(True))
+
+            self.p_before = nn.Sequential(*before_skip)
+            self.p_after = nn.Sequential(*after_skip)
+            self.p_after_latent = nn.Linear(latent_dim, latent_dim)
+            self.p_pos = nn.Sequential(nn.Linear(latent_dim, latent_dim // 4),
+                                         nn.ReLU(True),
+                                         nn.Linear(latent_dim // 4, 3))
+
         if pixel_dim is not None and bg_no_pixel and not no_concatenate:
             input_dim += -pixel_dim
         before_skip = [nn.Linear(input_dim, latent_dim), nn.ReLU(True)]
@@ -404,7 +423,7 @@ class Decoder(nn.Module):
                 nn.Linear(z_dim, z_dim)
             )
 
-    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None, ray_dir_input=None):
+    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None, ray_dir_input=None, p_slots=None):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -430,6 +449,17 @@ class Decoder(nn.Module):
         query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
         sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
         query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
+
+        if self.predict_centroid:
+            assert p_slots is not None
+            p_fg = p_slots[1:]  # (K-1)xC
+            tmp = self.p_before(p_fg)
+            tmp = self.p_after(torch.cat([p_fg, tmp], dim=1))
+            latent = self.p_after_latent(tmp)
+            fg_pos = self.p_pos(latent)
+        else:
+            fg_pos = None
+
         if self.use_ray_dir:
             query_bg = torch.cat([query_bg, ray_dir_input], dim=1)
             query_fg_ex = torch.cat([query_fg_ex, ray_dir_input[None, ...].expand(K-1, -1, -1).flatten(0, 1)], dim=1)
@@ -459,6 +489,7 @@ class Decoder(nn.Module):
                 input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
                 # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape in tdw
 
+
         # print(input_bg.shape, 'input_bg.shape')
         # print(input_fg.shape, 'input_fg.shape')
         tmp = self.b_before(input_bg)
@@ -482,7 +513,7 @@ class Decoder(nn.Module):
         masked_raws = unmasked_raws * masks
         raws = masked_raws.sum(dim=0)
 
-        return raws, masked_raws, unmasked_raws, masks
+        return raws, masked_raws, unmasked_raws, masks, fg_pos
 
 class PixelDecoder(nn.Module):
     def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, pixel_positional_encoding=None, use_ray_dir=None, slot_repeat=None):
@@ -667,12 +698,13 @@ class SlotAttention(nn.Module):
         self.norm_feat = nn.LayerNorm(in_dim)
         self.slot_dim = slot_dim
 
-    def forward(self, feat, num_slots=None, masks=None):
+    def forward(self, feat, num_slots=None, masks=None, norm_feat=True):
         """
         input:
             feat: visual feature with position information, BxNxC
         output: slots: BxKxC, attn: BxKxN
         """
+
         B, _, _ = feat.shape
         K = num_slots if num_slots is not None else self.num_slots
 
@@ -683,7 +715,8 @@ class SlotAttention(nn.Module):
         sigma_bg = self.slots_logsigma_bg.exp().expand(B, 1, -1)
         slot_bg = mu_bg + sigma_bg * torch.randn_like(mu_bg)
 
-        feat = self.norm_feat(feat)
+        if norm_feat:
+            feat = self.norm_feat(feat)
         k = self.to_k(feat)
         v = self.to_v(feat)
 
