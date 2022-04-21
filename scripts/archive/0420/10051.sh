@@ -11,6 +11,7 @@ python train_without_gan.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_eac
     --focal_ratio 0.9605 0.9605 \
     --near_plane 1 --far_plane 15 \
     --gt_seg --pixel_encoder --mask_image_feature --mask_image --bg_no_pixel --use_ray_dir --silhouette_loss \
+    --continue_train --exp_id 'run-2022-04-18-00-01-39' \
 # done
 echo "Done"
 # node 5 cuda 3

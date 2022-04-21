@@ -112,7 +112,7 @@ class Projection(object):
             ray_dir = ray_dir.flatten(start_dim=1, end_dim=3)  # 4x(Nx(H/s)x(W/s))x3
         else:
             ray_dir = ray_dir.expand(N, H, W, 3).flatten(start_dim=0, end_dim=2)  # (NxHxW)x3
-        return frus_nss_coor, z_vals, ray_dir, frus_world_coor
+        return frus_nss_coor, z_vals, ray_dir
 
 if __name__ == '__main__':
     pass

@@ -61,13 +61,14 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--input_no_loss', action='store_true', help='for the first n (=100) epochs (hyperparameter), do not include first image in the recon loss for learning geometry first')
         parser.add_argument('--bg_no_pixel', action='store_true', help='do not provide bg with pixel features, so that it can learn bg only from slot (object) features')
         parser.add_argument('--use_ray_dir', action='store_true', help='concatenate ray direction on the view. now only work on decoder (not pixel)')
-        parser.add_argument('--weigh_pixelfeat', action='store_true', help='weigh pixel_color and slot color using the transmittance from the input view')
+        parser.add_argument('--weight_pixelfeat', action='store_true', help='weigh pixel_color and slot color using the transmittance from the input view')
         parser.add_argument('--silhouette_loss', action='store_true', help='enable silhouette loss')
         parser.add_argument('--reduce_latent_size', action='store_true', help='reduce latent size of pixel encoder. this option is not true for default and not configurable. TODO')
         parser.add_argument('--shared_pixel_slot_decoder', action='store_true', help='use pixel decoder for slot decoder. need to check whether this reduce memory burden')
         parser.add_argument('--div_by_max', action='store_true', help='divide pixel feature importance by max per each ray')
         parser.add_argument('--learn_only_silhouette', action='store_true', help='loss function contains only silhouette loss')
         parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
+
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
 
@@ -86,6 +87,7 @@ class uorfNoGanModel(BaseModel):
         - define loss function, visualization images, model names, and optimizers
         """
         BaseModel.__init__(self, opt)  # call the initialization method of BaseModel
+        print(self.isTrain, 'self.isTrain')
         self.loss_names = ['recon', 'perc']
         n = opt.n_img_each_scene
         self.visual_names = ['x{}'.format(i) for i in range(n)] + \
@@ -141,7 +143,7 @@ class uorfNoGanModel(BaseModel):
             self.model_names.append('PixelDecoder')
 
         else:
-            if self.opt.weigh_pixelfeat and self.opt.shared_pixel_slot_decoder:
+            if self.opt.weight_pixelfeat and self.opt.shared_pixel_slot_decoder:
                 self.netDecoder = networks.init_net(
                     Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim,
                             z_dim=opt.z_dim, n_layers=opt.n_layer,
@@ -156,8 +158,8 @@ class uorfNoGanModel(BaseModel):
             self.nets.append(self.netDecoder)
             self.model_names.append('Decoder')
 
-        # if weigh_pixelfeat, we need to make a separate slot decoder
-        if self.opt.weigh_pixelfeat:
+        # if weight_pixelfeat, we need to make a separate slot decoder
+        if self.opt.weight_pixelfeat:
             if self.opt.shared_pixel_slot_decoder and self.opt.no_concatenate:
                 self.netSlotDecoder = self.netDecoder
             else:
@@ -173,6 +175,7 @@ class uorfNoGanModel(BaseModel):
             self.optimizers = [self.optimizer]
 
         self.L2_loss = nn.MSELoss()
+        self.L1_loss = nn.L1Loss()
 
     def setup(self, opt):
         """Load and print networks; create schedulers
@@ -193,6 +196,7 @@ class uorfNoGanModel(BaseModel):
             input: a dictionary that contains the data itself and its metadata information.
         """
         self.x = input['img_data'].to(self.device)
+        # print(self.x.shape, 'self.x.shape')
         self.cam2world = input['cam2world'].to(self.device)
         if not self.opt.fixed_locality:
             self.cam2world_azi = input['azi_rot'].to(self.device)
@@ -210,9 +214,12 @@ class uorfNoGanModel(BaseModel):
             obj_masks = input['obj_masks'].to(self.device)
 
             masks = torch.cat([bg_masks, obj_masks], dim=1)
+            self.silhouette_masks_fine = masks
             masks = F.interpolate(masks.float(), size=[64, 64], mode='nearest')
 
-            self.silhouette_masks = masks.flatten(2, 3) # NxKx(HxW)
+            # self.silhouette_masks = masks.flatten(2, 3) # NxKx(HxW)
+            self.silhouette_masks = masks # NxKxHxW
+
 
     def forward(self, epoch=0):
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
@@ -247,7 +254,7 @@ class uorfNoGanModel(BaseModel):
         N = cam2world.shape[0]
         if self.opt.stage == 'coarse':
             W, H, D = self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp
-            frus_nss_coor, z_vals, ray_dir, frus_world_coor = self.projection.construct_sampling_coor(cam2world)
+            frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             self.cam2spixel = self.projection.cam2spixel
             self.world2nss = self.projection.world2nss
@@ -258,7 +265,7 @@ class uorfNoGanModel(BaseModel):
             W, H, D = self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp
             start_range = self.opt.frustum_size_fine - self.opt.render_size
             rs = self.opt.render_size
-            frus_nss_coor, z_vals, ray_dir, frus_world_coor = self.projection_fine.construct_sampling_coor(cam2world)
+            frus_nss_coor, z_vals, ray_dir = self.projection_fine.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             self.cam2spixel = self.projection_fine.cam2spixel
             self.world2nss = self.projection_fine.world2nss
@@ -269,6 +276,7 @@ class uorfNoGanModel(BaseModel):
             frus_nss_coor_, z_vals_, ray_dir_ = frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(0, 3), z_vals_.flatten(0, 2), ray_dir_.flatten(0, 2)
             x = self.x[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
+            self.silhouette_masks = self.silhouette_masks_fine[..., H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.z_vals, self.ray_dir = z_vals, ray_dir
             W, H, D = self.opt.render_size, self.opt.render_size, self.opt.n_samp
 
@@ -284,18 +292,23 @@ class uorfNoGanModel(BaseModel):
 
         # Get pixel feature if using [pixel Encoder]
         if self.opt.pixel_encoder:
+            # get cam matrices
+            W, H, D = self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp
+            self.cam2spixel = self.projection.cam2spixel
+            self.world2nss = self.projection.world2nss
+            frustum_size = torch.Tensor(self.projection.frustum_size).to(self.device)
             # construct uv in the first image coordinates
             cam02world = cam2world[0:1] # 1x4x4
             world2cam0 = cam02world.inverse() # 1x4x4
             nss2world = self.world2nss.inverse() # 1x4x4
             frus_nss_coor = torch.cat([frus_nss_coor, torch.ones_like(frus_nss_coor[:, 0].unsqueeze(1))], dim=-1) # Px4
             frus_world_coor = torch.matmul(nss2world[None, ...], frus_nss_coor[None, ..., None]) # 1xPx4x1
-            frus_cam0_coor = torch.matmul(world2cam0[None, ...], frus_world_coor) #1x1x4x4, 1x(NxDxHxW)x4x1 -> 1x(NxDxHxW)x4x1
+            frus_cam0_coor = torch.matmul(world2cam0[None, ...], frus_world_coor) #1x1x4x4, 1x(NxDxHxW)x4x1 -> 1x(NxDxHxW)x4x1 # TODO: check this
             pixel_cam0_coor = torch.matmul(self.cam2spixel[None, ...], frus_cam0_coor) # 1x1x4x4, 1x(NxDxHxW)x4x1
             pixel_cam0_coor = pixel_cam0_coor.squeeze(-1) # 1x(NxDxHxW)x4
             uv = pixel_cam0_coor[:, :, 0:2]/pixel_cam0_coor[:, :, 2].unsqueeze(-1) # 1x(NxDxHxW)x2
-            uv = (uv/frustum_size[0:2][None, None, :] - 0.5) * 2 # nomalize to fit in with [-1, 1] grid #
-            if self.opt.weigh_pixelfeat:
+            uv = (uv/frustum_size[0:2][None, None, :] - 0.5) * 2 # nomalize to fit in with [-1, 1] grid # TODO: check this
+            if self.opt.weight_pixelfeat:
                 w = pixel_cam0_coor[:, :, 2].unsqueeze(-1)
                 w = (w - self.opt.near_plane) / (self.opt.far_plane - self.opt.near_plane)
                 wuv = torch.cat([w, uv], dim=-1) # 1x(NxDxHxW)x3
@@ -333,7 +346,7 @@ class uorfNoGanModel(BaseModel):
         masked_raws = masked_raws.view([K, N, D, H, W, 4])
         unmasked_raws = unmasked_raws.view([K, N, D, H, W, 4])
 
-        if self.opt.weigh_pixelfeat:
+        if self.opt.weight_pixelfeat:
             raws_slot, masked_raws_slot, unmasked_raws_slot, masks_slot = \
                 self.netSlotDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat=None, no_concatenate=self.opt.no_concatenate, ray_dir_input=ray_dir_input)
             # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
@@ -349,7 +362,25 @@ class uorfNoGanModel(BaseModel):
         else:
             raws_slot = None
 
-        rgb_map, _, _ = raw2outputs(raws, z_vals, ray_dir, weigh_pixelfeat=self.opt.weigh_pixelfeat, raws_slot=raws_slot, wuv=wuv, KNDHW=(K, N, D, H, W), div_by_max=self.opt.div_by_max)
+        if self.opt.weight_pixelfeat:
+            if self.opt.silhouette_loss:
+                rgb_map, _, _, mask_not_slotted_so_cannot_use, transmittance_cam0, full_image_weights = raw2outputs(raws, z_vals, ray_dir,
+                                                                                                render_mask=True,
+                                                                                                weight_pixelfeat=self.opt.weight_pixelfeat,
+                                                                                                raws_slot=raws_slot,
+                                                                                                wuv=wuv,
+                                                                                                KNDHW=(K, N, D, H, W),
+                                                                                                div_by_max=self.opt.div_by_max,
+                                                                                                return_transmittance=True,
+                                                                                                input_transmittance=None,
+                                                                                                silhouette_loss=True)
+                self.transmittance_cam0 = transmittance_cam0
+                self.full_image_weights = full_image_weights
+            else:
+                rgb_map, _, _, mask_not_slotted_so_cannot_use, transmittance_cam0 = raw2outputs(raws, z_vals, ray_dir, render_mask=True, weight_pixelfeat=self.opt.weight_pixelfeat, raws_slot=raws_slot, wuv=wuv, KNDHW=(K, N, D, H, W), div_by_max=self.opt.div_by_max,  return_transmittance=True, input_transmittance=None)
+                self.transmittance_cam0 = transmittance_cam0
+        else:
+            rgb_map, _, _ = raw2outputs(raws, z_vals, ray_dir, weight_pixelfeat=self.opt.weight_pixelfeat, raws_slot=raws_slot, wuv=wuv, KNDHW=(K, N, D, H, W), div_by_max=self.opt.div_by_max,  return_transmittance=False, input_transmittance=None)
         # (NxHxW)x3, (NxHxW)
         rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
         x_recon = rendered * 2 - 1
@@ -371,10 +402,10 @@ class uorfNoGanModel(BaseModel):
                     self.loss_perc = 0.
                     self.loss_recon = 0.
 
-            if epoch <= 10000:
+            if epoch <= 300:
                 setattr(self, 'masked_raws', masked_raws)
                 self.silhouette_list = []
-                self.compute_visuals(only_masked=True)
+                self.compute_visuals_silhouette()
                 silhouette = torch.stack(self.silhouette_list, dim=0) # KxNx3xHxW, self.masks: KxNx(HxW)
                 silhouette = silhouette.flatten(2, 3)
                 # try to determine whether want to divide by max value (now silhouette has very small values, compared to 1. (ex. 0.07 for max)).
@@ -382,9 +413,10 @@ class uorfNoGanModel(BaseModel):
                 ## silhouette = (silhouette.flatten(2, 3) > 0.5) * 1. # this threshold is currently hyperparameter
                 # print(silhouette.max(), silhouette.min(), silhouette.median(), 'silhouette.max(), silhouette.min(), silhouette.median()')
                 # self.silhouette_masks: NxKx(HxW)
-                silhouette_masks = self.silhouette_masks.transpose(0, 1)
+                self.silhouette_masks = self.silhouette_masks.flatten(2, 3)
+                silhouette_masks = self.silhouette_masks.transpose(0, 1) # KxNx(HxW)
                 # print(silhouette_masks.max(), silhouette_masks.min(), silhouette_masks.median(), 'silhouette_masks.max(), silhouette_masks.min(), silhouette_masks.median()')
-                self.loss_silhouette = self.L2_loss(silhouette, silhouette_masks)
+                self.loss_silhouette = self.L2_loss(silhouette[:, ...], silhouette_masks[:, ...])
 
             else:
                 with torch.no_grad():
@@ -402,66 +434,66 @@ class uorfNoGanModel(BaseModel):
             setattr(self, 'masked_raws', masked_raws.detach())
             setattr(self, 'unmasked_raws', unmasked_raws.detach())
             setattr(self, 'attn', attn)
-            if self.opt.weigh_pixelfeat:
+            if self.opt.weight_pixelfeat:
                 self.masked_raws_slot = masked_raws_slot.detach()
                 self.unmasked_raws_slot = unmasked_raws_slot.detach()
                 self.wuv = wuv.detach()
                 self.KNDHW = (K, N, D, H, W)
 
-    def compute_visuals(self, only_masked=False):
-        if only_masked:
-            # this is for silhouette loss
+    def compute_visuals(self):
+        with torch.no_grad():
             _, N, D, H, W, _ = self.masked_raws.shape
             masked_raws = self.masked_raws  # KxNxDxHxWx4
+            unmasked_raws = self.unmasked_raws  # KxNxDxHxWx4
             for k in range(self.num_slots):
-                raws = masked_raws[k]  # (NxDxHxW)x4
+                raws = masked_raws[k]  # NxDxHxWx4
+                z_vals, ray_dir = self.z_vals, self.ray_dir
                 raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                if self.opt.weigh_pixelfeat:
+                if self.opt.weight_pixelfeat:
                     raws_slot = self.masked_raws_slot[k]
                     raws_slot = raws_slot.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                    rgb_map, depth_map, _, mask_map = raw2outputs(raws, self.z_vals, self.ray_dir, render_mask=True, weigh_pixelfeat=self.opt.weigh_pixelfeat,
-                                                        raws_slot=raws_slot, wuv=self.wuv, KNDHW=self.KNDHW, div_by_max=self.opt.div_by_max)
+                    rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir, weight_pixelfeat=self.opt.weight_pixelfeat, raws_slot=raws_slot, wuv=self.wuv, KNDHW=self.KNDHW, div_by_max=self.opt.div_by_max, input_transmittance=self.transmittance_cam0)
                 else:
-                    rgb_map, depth_map, _, mask_map = raw2outputs(raws, self.z_vals, self.ray_dir, render_mask=True)
-                # rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                # x_recon = rendered * 2 - 1
-                self.silhouette_list.append(mask_map.view(N, H, W))
-                # for i in range(self.opt.n_img_each_scene):
-                    # setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i])
-        else:
-            with torch.no_grad():
-                _, N, D, H, W, _ = self.masked_raws.shape
-                masked_raws = self.masked_raws  # KxNxDxHxWx4
-                unmasked_raws = self.unmasked_raws  # KxNxDxHxWx4
-                for k in range(self.num_slots):
-                    raws = masked_raws[k]  # NxDxHxWx4
-                    z_vals, ray_dir = self.z_vals, self.ray_dir
-                    raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                    if self.opt.weigh_pixelfeat:
-                        raws_slot = self.masked_raws_slot[k]
-                        raws_slot = raws_slot.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                        rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir, weigh_pixelfeat=self.opt.weigh_pixelfeat, raws_slot=raws_slot, wuv=self.wuv, KNDHW=self.KNDHW, div_by_max=self.opt.div_by_max)
-                    else:
-                        rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
-                    rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                    x_recon = rendered * 2 - 1
-                    for i in range(self.opt.n_img_each_scene):
-                        setattr(self, 'slot{}_view{}'.format(k, i), x_recon[i])
+                    rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
+                rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+                x_recon = rendered * 2 - 1
+                for i in range(self.opt.n_img_each_scene):
+                    setattr(self, 'slot{}_view{}'.format(k, i), x_recon[i])
 
-                    raws = unmasked_raws[k]  # (NxDxHxW)x4
-                    raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                    if self.opt.weigh_pixelfeat:
-                        raws_slot = self.unmasked_raws_slot[k]
-                        raws_slot = raws_slot.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                        rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir, weigh_pixelfeat=self.opt.weigh_pixelfeat, raws_slot=raws_slot, wuv=self.wuv, KNDHW=self.KNDHW, div_by_max=self.opt.div_by_max)
-                    else:
-                        rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
-                    rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                    x_recon = rendered * 2 - 1
-                    for i in range(self.opt.n_img_each_scene):
-                        setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i])
+                raws = unmasked_raws[k]  # (NxDxHxW)x4
+                raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
+                if self.opt.weight_pixelfeat:
+                    raws_slot = self.unmasked_raws_slot[k]
+                    raws_slot = raws_slot.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
+                    rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir, weight_pixelfeat=self.opt.weight_pixelfeat, raws_slot=raws_slot, wuv=self.wuv, KNDHW=self.KNDHW, div_by_max=self.opt.div_by_max, input_transmittance=self.transmittance_cam0)
+                else:
+                    rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
+                rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+                x_recon = rendered * 2 - 1
+                for i in range(self.opt.n_img_each_scene):
+                    setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i])
 
-                    setattr(self, 'slot{}_attn'.format(k), self.attn[k] * 2 - 1)
+                setattr(self, 'slot{}_attn'.format(k), self.attn[k] * 2 - 1)
+
+    def compute_visuals_silhouette(self):
+        # this is for silhouette loss
+        _, N, D, H, W, _ = self.masked_raws.shape
+        masked_raws = self.masked_raws  # KxNxDxHxWx4
+        for k in range(self.num_slots):
+            raws = masked_raws[k]  # (NxDxHxW)x4
+            raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
+            if self.opt.weight_pixelfeat:
+                raws_slot = self.masked_raws_slot[k]
+                raws_slot = raws_slot.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
+                rgb_map, depth_map, _, mask_map = raw2outputs(raws, self.z_vals, self.ray_dir, render_mask=True, weight_pixelfeat=self.opt.weight_pixelfeat,
+                                                    raws_slot=raws_slot, wuv=self.wuv, KNDHW=self.KNDHW, div_by_max=self.opt.div_by_max, input_transmittance=self.transmittance_cam0, silhouette_loss=True, full_image_weights=self.full_image_weights)
+            else:
+                rgb_map, depth_map, _, mask_map = raw2outputs(raws, self.z_vals, self.ray_dir, render_mask=True, silhouette_loss=True)
+            # rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+            # x_recon = rendered * 2 - 1
+            self.silhouette_list.append(mask_map.view(N, H, W))
+            # for i in range(self.opt.n_img_each_scene):
+                # setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i])
 
     def backward(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""

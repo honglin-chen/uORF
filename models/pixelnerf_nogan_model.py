@@ -213,6 +213,7 @@ class pixelnerfNoGanModel(BaseModel):
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(0, 3), z_vals_.flatten(0, 2), ray_dir_.flatten(0, 2)
             x = self.x[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.z_vals, self.ray_dir = z_vals, ray_dir
+            W, H, D = self.opt.render_size, self.opt.render_size, self.opt.n_samp
             ray_dir_input = ray_dir.view([N, H, W, 3])
             ray_dir_input = ray_dir_input[:, None, ...].expand(-1, D, -1, -1, -1).flatten(0, 3)
 

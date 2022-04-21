@@ -1,13 +1,13 @@
 import math
-from .op import conv2d_gradfix
+from models.op import conv2d_gradfix
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn import init
 from torchvision.models import vgg16
 from torch import autograd
-from .networks import get_norm_layer
-from .resnetfc import ResnetFC
+from models.networks import get_norm_layer
+from models.resnetfc import ResnetFC
 
 
 class Encoder(nn.Module):

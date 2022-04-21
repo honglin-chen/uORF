@@ -367,6 +367,8 @@ class Decoder(nn.Module):
             latent_dim = z_dim // 2
         else:
             latent_dim = z_dim
+        # print(input_dim, "input_dim")
+        # print(latent_dim, 'latent_dim')
         before_skip = [nn.Linear(input_dim, latent_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(latent_dim+input_dim, latent_dim), nn.ReLU(True)]
         for i in range(n_layers-1):
@@ -751,7 +753,7 @@ def sin_emb(x, n_freq=5, keep_ori=True):
     embedded_ = torch.cat(embedded, dim=1)
     return embedded_
 
-def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, raws_slot=None, wuv=None, KNDHW=None, div_by_max=None):
+def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, wuv=None, KNDHW=None, div_by_max=None, return_transmittance=False, input_transmittance=None, silhouette_loss=False, full_image_weights=None):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -768,45 +770,42 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, ra
     device = raw.device
 
     dists = z_vals[..., 1:] - z_vals[..., :-1]
-    dists = torch.cat([dists, torch.tensor([1e-2], device=device).expand(dists[..., :1].shape)], -1)  # [N_rays, N_samples]
+    dists = torch.cat([dists, torch.tensor([1e-2], device=device).expand(dists[..., :1].shape)], -1)  # [N_rays, N_samples] # add dist 0 in the end
 
     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
     alpha = raw2alpha(raw[..., 3], dists)  # [N_rays, N_samples]
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=device), 1. - alpha + 1e-10], -1), -1)[:,:-1] # [N_rays, N_samples]
+    transmittance = torch.cumprod(
+        torch.cat([torch.ones((alpha.shape[0], 1), device=device), 1. - alpha + 1e-10], dim=-1)
+        , dim=-1)[:,:-1]
+    weights = alpha * transmittance # [N_rays, N_samples]
 
-    if weigh_pixelfeat:
-
+    if weight_pixelfeat:
         K, N, D, H, W = KNDHW
-
-        weights_norm = weights.clone() + 1e-5
-        weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
-
-        weights_cam0 = weights_norm.view(N, H, W, D)[0]  # H, W, D
-        weights_cam0 = weights_cam0.permute([2, 0, 1]).unsqueeze(0).unsqueeze(0)
+        if input_transmittance is not None:
+            transmittance_cam0 = input_transmittance
+        else:
+            transmittance_cam0 = transmittance.view(N, H, W, D)[0] #HxWxD
+            transmittance_cam0 = transmittance_cam0.permute([2, 0, 1]).unsqueeze(0).unsqueeze(0) # 1x1xDxHxW
 
         wuv = wuv.unsqueeze(2).unsqueeze(3)  # (1, (NxDxHxW), 1, 1, 3)
         # self.latent(B, L, H, W)
-        weights_samples = F.grid_sample(
-            weights_cam0,
+        transmittance_samples = F.grid_sample(
+            transmittance_cam0,
             wuv,
             align_corners=True,
             mode='bilinear',
             padding_mode='zeros',
         ) # 1x1x(NxDxHxW)x1x1
 
-        weights_samples = weights_samples[0, 0, :, 0, 0] # (NxDxHxW)
+        transmittance_samples = transmittance_samples[0, 0, :, 0, 0] # (NxDxHxW)
         if div_by_max:
-            weights_samples = weights_samples.view(N, D, H, W)
-            # with torch.no_grad():
-            max, _ = torch.max(weights_samples, dim=1, keepdim=True)
-            weights_samples = weights_samples/(max+1e-5)
-            weights_samples = weights_samples.permute([0, 2, 3, 1]).flatten(0, 2)
+            raise NotImplementedError('We do not think that this option is necessary right now.')
         else:
-            weights_samples = weights_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2)
+            transmittance_samples = transmittance_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2) # Nx(HxWxD)
         # print(weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean(), 'weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean()')
-        weights_pixel = weights * weights_samples
-        weights_slot = weights * (1.- weights_samples)
+        weights_pixel = weights * transmittance_samples
+        weights_slot = weights * (1.- transmittance_samples)
         rgb_pixel = raw[..., :3]
         rgb_slot = raws_slot[..., :3]
         rgb_map = torch.sum(weights_pixel[..., None] * rgb_pixel + weights_slot[..., None] * rgb_slot, -2)
@@ -819,13 +818,20 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weigh_pixelfeat=None, ra
     weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
     depth_map = torch.sum(weights_norm * z_vals, -1)
 
+    results = [rgb_map, depth_map, weights_norm]
     if render_mask:
         density = raw[..., 3]  # [N_rays, N_samples]
-        mask_map = torch.sum(weights * density, dim=1)  # [N_rays,]
-        return rgb_map, depth_map, weights_norm, mask_map
+        if silhouette_loss and full_image_weights is not None:
+            mask_map = torch.sum(full_image_weights * density, dim=1)
+        else:
+            mask_map = torch.sum(weights * density, dim=1)  # [N_rays,]
+        results.append(mask_map)
+    if return_transmittance:
+        results.append(transmittance_cam0)
+        if silhouette_loss:
+            results.append(weights)
 
-    return rgb_map, depth_map, weights_norm
-
+    return tuple(results)
 
 def get_perceptual_net(layer=4):
     assert layer > 0
