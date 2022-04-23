@@ -119,6 +119,12 @@ class uorfTrainModel(BaseModel):
         self.nets.append(self.netEncoder)
         self.model_names.append('Encoder')
 
+        # [Image Encoder]
+        # self.netImageEncoder = networks.init_net(ImageEncoder(backbone="resnet34", pretrained=True, latent_size=64), gpu_ids=self.gpu_ids, init_type='None')
+        # self.parameters.append(self.netImageEncoder.parameters())
+        # self.nets.append(self.netImageEncoder)
+        # self.model_names.append('ImageEncoder')
+
         # [Slot attention]
         self.num_slots = opt.num_slots
         self.netSlotAttention = networks.init_net(
@@ -126,6 +132,7 @@ class uorfTrainModel(BaseModel):
         self.nets.append(self.netSlotAttention)
         self.parameters.append(self.netSlotAttention.parameters())
         self.model_names.append('SlotAttention')
+
 
         # [Pixel Encoder]
         self.netPixelEncoder = networks.init_net(PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature), gpu_ids=self.gpu_ids, init_type='None')
@@ -136,16 +143,16 @@ class uorfTrainModel(BaseModel):
 
         # [Density Decoder]
         self.netDensityDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                    locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, bg_no_pixel=self.opt.bg_no_pixel,
-                                                    use_ray_dir=False, small_latent=self.opt.small_latent, decoder_type='density'), gpu_ids=self.gpu_ids, init_type='xavier')
+                    locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, no_concatenate=self.opt.no_concatenate, bg_no_pixel=self.opt.bg_no_pixel,
+                                                    use_ray_dir=self.opt.use_ray_dir, small_latent=self.opt.small_latent), gpu_ids=self.gpu_ids, init_type='xavier')
         self.parameters.append(self.netDensityDecoder.parameters())
         self.nets.append(self.netDensityDecoder)
         self.model_names.append('DensityDecoder')
 
         # [Color Decoder]
         self.netColorDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                    locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, bg_no_pixel=self.opt.bg_no_pixel,
-                                                    use_ray_dir=self.opt.use_ray_dir, small_latent=self.opt.small_latent, decoder_type='color'), gpu_ids=self.gpu_ids, init_type='xavier')
+                    locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, no_concatenate=self.opt.no_concatenate, bg_no_pixel=self.opt.bg_no_pixel,
+                                                    use_ray_dir=self.opt.use_ray_dir, small_latent=self.opt.small_latent), gpu_ids=self.gpu_ids, init_type='xavier')
         self.parameters.append(self.netColorDecoder.parameters())
         self.nets.append(self.netColorDecoder)
         self.model_names.append('ColorDecoder')
@@ -313,14 +320,14 @@ class uorfTrainModel(BaseModel):
 
         weights, transmittance_samples, silhouettes =\
             raw2transmittances(raws_density, z_vals, ray_dir, uvw=uvw, KNDHW=(K, N, D, H, W), masks=masks_for_silhouette_density)
-        self.silhouettes = silhouettes # NxKxHxW
+        self.silhouettes = silhouettes
         self.transmittance_samples = transmittance_samples
 
         # transmittance_samples Nx(HxWxD) # pixel_feat Kx(NxDxHxW)xC
         transmittance_samples = transmittance_samples.view([N, H, W, D]).permute([0, 3, 1, 2]).flatten(0, 3)[None, ..., None] # 1x(NxDxHxW)x1
         raws_color, masked_raws_color, unmasked_raws_color, masks_for_silhouette_color = \
             self.netColorDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat=pixel_feat,
-                            ray_dir_input=ray_dir_input, transmittance_samples=transmittance_samples, raw_masks_density=raw_masks_density, silhouettes=silhouettes.unsqueeze(1).expand(-1, D, -1, -1, -1), decoder_type='color')
+                            ray_dir_input=ray_dir_input, transmittance_samples=transmittance_samples, raw_masks_density=raw_masks_density, decoder_type='color')
 
         raws = raws_color.view([N, D, H, W, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
         masked_raws = masked_raws_color.view([K, N, D, H, W, 4])

@@ -28,7 +28,7 @@ if __name__ == '__main__':
         meters_trn = {stat: AverageMeter() for stat in model.loss_names}
         model.opt.stage = 'coarse' if epoch < opt.coarse_epoch else 'fine'
         if opt.silhouette_loss:
-            model.opt.silhouette_loss = True if epoch < 300 else False
+            model.opt.silhouette_loss = True if epoch < 10000 else False
         model.netDensityDecoder.locality = True if epoch < opt.no_locality_epoch else False
         for i, data in enumerate(dataset):  # inner loop within one epoch
             iter_start_time = time.time()  # timer for computation per iteration

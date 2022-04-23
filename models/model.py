@@ -336,7 +336,7 @@ class ImageEncoder(nn.Module):
 
 class Decoder(nn.Module):
     def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7,
-                 fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False):
+                 fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False, decoder_type=None):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -361,6 +361,8 @@ class Decoder(nn.Module):
 
         if use_ray_dir:
             input_dim += 3
+        if decoder_type=='color':
+            input_dim += 2
         if pixel_dim is not None:
             if self.no_concatenate:
                 pass
@@ -413,7 +415,7 @@ class Decoder(nn.Module):
             self.substitute_pixel_feat = torch.nn.Parameter(torch.zeros(pixel_dim))
 
     def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None,
-                ray_dir_input=None, transmittance_samples=None, raw_masks_density=None, decoder_type=None):
+                ray_dir_input=None, transmittance_samples=None, raw_masks_density=None, decoder_type=None, silhouettes=None):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -429,9 +431,9 @@ class Decoder(nn.Module):
         if self.pixel_dim and pixel_feat is None:
             pixel_feat = self.substitute_pixel_feat[None, None, ...].expand(K, P, -1)
 
-        if transmittance_samples is not None:
-            pixel_feat *= transmittance_samples
-            pixel_feat += self.substitute_pixel_feat[None, None, ...].expand(K, P, -1) * (1. - transmittance_samples)
+        # if transmittance_samples is not None:
+        #     pixel_feat *= transmittance_samples
+        #     pixel_feat += self.substitute_pixel_feat[None, None, ...].expand(K, P, -1) * (1. - transmittance_samples) # this option was previous behavior, I thought that it is quite hard coding
 
         if self.fixed_locality:
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
@@ -474,6 +476,17 @@ class Decoder(nn.Module):
             if pixel_feat is not None:
                 input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
                 # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape in tdw
+
+        if decoder_type == 'color':
+            '''
+            transmittance_samples: 1x(NxDxHxW)x1
+            silhouettes: # NxDxKxHxW
+            '''
+            silhouettes = silhouettes.permute([2, 0, 1, 3, 4]).flatten(1, 4).unsqueeze(-1) # Kx(NxDxHxW)x1
+            input_bg = torch.cat([input_bg, silhouettes[0]], dim=1)
+            input_fg = torch.cat([input_fg, silhouettes[1:].flatten(0, 1)], dim=1)
+            input_bg = torch.cat([input_bg, transmittance_samples.flatten(0, 1)], dim=1)
+            input_fg = torch.cat([input_fg, transmittance_samples.expand(K-1, -1, -1).flatten(0, 1)], dim=1)
 
         # print(input_bg.shape, 'input_bg.shape')
         # print(input_fg.shape, 'input_fg.shape')
@@ -775,7 +788,7 @@ def sin_emb(x, n_freq=5, keep_ori=True):
     embedded_ = torch.cat(embedded, dim=1)
     return embedded_
 
-def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, wuv=None, KNDHW=None, return_transmittance_cam0=False, input_transmittance_cam0=None, return_silhouettes=None, transmittance_samples=None):
+def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, uvw=None, KNDHW=None, return_transmittance_cam0=False, input_transmittance_cam0=None, return_silhouettes=None, transmittance_samples=None):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -810,18 +823,18 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, r
             transmittance_cam0 = transmittance.view(N, H, W, D)[0] #HxWxD
             transmittance_cam0 = transmittance_cam0.permute([2, 0, 1]).unsqueeze(0).unsqueeze(0) # 1x1xDxHxW
 
-        wuv = wuv.unsqueeze(2).unsqueeze(3)  # (1, (NxDxHxW), 1, 1, 3)
+        uvw = uvw.unsqueeze(2).unsqueeze(3)  # (1, (NxDxHxW), 1, 1, 3)
         # self.latent(B, L, H, W)
         transmittance_samples = F.grid_sample(
             transmittance_cam0,
-            wuv,
+            uvw,
             # align_corners=True,
             mode='bilinear',
             padding_mode='zeros',
         ) # 1x1x(NxDxHxW)x1x1
 
         transmittance_samples = transmittance_samples[0, 0, :, 0, 0] # (NxDxHxW)
-        transmittance_samples = transmittance_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2) # Nx(HxWxD)
+        transmittance_samples = transmittance_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2) # (NxHxW)xD
 
         # print(weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean(), 'weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean()')
         weights_pixel = weights * transmittance_samples
@@ -859,7 +872,7 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, r
 
     return rgb_map, depth_map, weights_norm, mask_map, transmittance_cam0, silhouettes
 
-def raw2transmittances(raw, z_vals, rays_d, wuv, KNDHW, masks):
+def raw2transmittances(raw, z_vals, rays_d, uvw, KNDHW, masks):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -891,11 +904,11 @@ def raw2transmittances(raw, z_vals, rays_d, wuv, KNDHW, masks):
     transmittance_cam0 = transmittance.view(N, H, W, D)[0] #HxWxD
     transmittance_cam0 = transmittance_cam0.permute([2, 0, 1]).unsqueeze(0).unsqueeze(0) # 1x1xDxHxW
 
-    wuv = wuv.unsqueeze(2).unsqueeze(3)  # (1, (NxDxHxW), 1, 1, 3)
+    uvw = uvw.unsqueeze(2).unsqueeze(3)  # (1, (NxDxHxW), 1, 1, 3)
     # self.latent(B, L, H, W)
     transmittance_samples = F.grid_sample(
         transmittance_cam0,
-        wuv,
+        uvw,
         # align_corners=True,
         mode='bilinear',
         padding_mode='zeros',
