@@ -175,7 +175,7 @@ class PixelEncoder(nn.Module):
             samples = F.grid_sample(
                 self.latent,
                 uv,
-                align_corners=True,
+                # align_corners=True,
                 mode=self.index_interp,
                 padding_mode=self.index_padding,
             )
@@ -201,11 +201,13 @@ class PixelEncoder(nn.Module):
             x = F.interpolate(
                 x,
                 scale_factor=self.feature_scale,
-                mode="bilinear" if self.feature_scale > 1.0 else "area",
-                align_corners=True if self.feature_scale > 1.0 else None,
-                recompute_scale_factor=True,
+                # mode="bilinear" if self.feature_scale > 1.0 else "area",
+                # align_corners=True if self.feature_scale > 1.0 else None,
+                # recompute_scale_factor=True,
             )
         x = x.to(device=self.latent.device)
+
+        # print(x.shape, 'x.shape') # 5x3x64x64
 
         if self.use_custom_resnet:
             self.latent = self.model(x)
@@ -231,14 +233,14 @@ class PixelEncoder(nn.Module):
                 latents.append(x)
 
             self.latents = latents
-            align_corners = None if self.index_interp == "nearest " else True
+            # align_corners = None if self.index_interp == "nearest " else True
             latent_sz = latents[0].shape[-2:]
             for i in range(len(latents)):
                 latents[i] = F.interpolate(
                     latents[i],
                     latent_sz,
                     mode=self.upsample_interp,
-                    align_corners=align_corners,
+                    # align_corners=align_corners,
                 )
             self.latent = torch.cat(latents, dim=1)
         self.latent_scaling[0] = self.latent.shape[-1]
@@ -333,7 +335,8 @@ class ImageEncoder(nn.Module):
         )
 
 class Decoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False):
+    def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7,
+                 fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -354,6 +357,7 @@ class Decoder(nn.Module):
         self.out_ch = 4
         self.small_latent = small_latent
         self.no_concatenate = no_concatenate
+        self.pixel_dim = pixel_dim
 
         if use_ray_dir:
             input_dim += 3
@@ -405,8 +409,11 @@ class Decoder(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(z_dim, z_dim)
             )
+        if pixel_dim:
+            self.substitute_pixel_feat = torch.nn.Parameter(torch.zeros(pixel_dim))
 
-    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None, ray_dir_input=None):
+    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None,
+                ray_dir_input=None, transmittance_samples=None, raw_masks_density=None, decoder_type=None):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -418,6 +425,13 @@ class Decoder(nn.Module):
         """
         K, C = z_slots.shape
         P = sampling_coor_bg.shape[0]
+
+        if self.pixel_dim and pixel_feat is None:
+            pixel_feat = self.substitute_pixel_feat[None, None, ...].expand(K, P, -1)
+
+        if transmittance_samples is not None:
+            pixel_feat *= transmittance_samples
+            pixel_feat += self.substitute_pixel_feat[None, None, ...].expand(K, P, -1) * (1. - transmittance_samples)
 
         if self.fixed_locality:
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
@@ -476,13 +490,21 @@ class Decoder(nn.Module):
 
         all_raws = torch.cat([bg_raws, fg_raws], dim=0)  # KxPx4
         raw_masks = F.relu(all_raws[:, :, -1:], True)  # KxPx1
+        if decoder_type=='color':
+            raw_masks = raw_masks_density
         masks = raw_masks / (raw_masks.sum(dim=0) + 1e-5)  # KxPx1
         raw_rgb = (all_raws[:, :, :3].tanh() + 1) / 2
         raw_sigma = raw_masks
 
+        masked_rgb = raw_rgb * masks
         unmasked_raws = torch.cat([raw_rgb, raw_sigma], dim=2)  # KxPx4
-        masked_raws = unmasked_raws * masks
+        masked_raws = torch.cat([masked_rgb, raw_sigma], dim=2)
+        # at_home
+        # masked_raws = unmasked_raws * masks
         raws = masked_raws.sum(dim=0)
+
+        if decoder_type=='density':
+            return raws, masked_raws, unmasked_raws, masks, raw_masks
 
         return raws, masked_raws, unmasked_raws, masks
 
@@ -753,7 +775,7 @@ def sin_emb(x, n_freq=5, keep_ori=True):
     embedded_ = torch.cat(embedded, dim=1)
     return embedded_
 
-def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, wuv=None, KNDHW=None, div_by_max=None, return_transmittance=False, input_transmittance=None, silhouette_loss=False, full_image_weights=None):
+def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, wuv=None, KNDHW=None, return_transmittance_cam0=False, input_transmittance_cam0=None, return_silhouettes=None, transmittance_samples=None):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -782,8 +804,8 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, r
 
     if weight_pixelfeat:
         K, N, D, H, W = KNDHW
-        if input_transmittance is not None:
-            transmittance_cam0 = input_transmittance
+        if input_transmittance_cam0 is not None:
+            transmittance_cam0 = input_transmittance_cam0
         else:
             transmittance_cam0 = transmittance.view(N, H, W, D)[0] #HxWxD
             transmittance_cam0 = transmittance_cam0.permute([2, 0, 1]).unsqueeze(0).unsqueeze(0) # 1x1xDxHxW
@@ -793,16 +815,14 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, r
         transmittance_samples = F.grid_sample(
             transmittance_cam0,
             wuv,
-            align_corners=True,
+            # align_corners=True,
             mode='bilinear',
             padding_mode='zeros',
         ) # 1x1x(NxDxHxW)x1x1
 
         transmittance_samples = transmittance_samples[0, 0, :, 0, 0] # (NxDxHxW)
-        if div_by_max:
-            raise NotImplementedError('We do not think that this option is necessary right now.')
-        else:
-            transmittance_samples = transmittance_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2) # Nx(HxWxD)
+        transmittance_samples = transmittance_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2) # Nx(HxWxD)
+
         # print(weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean(), 'weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean()')
         weights_pixel = weights * transmittance_samples
         weights_slot = weights * (1.- transmittance_samples)
@@ -813,25 +833,98 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, r
     else:
         rgb = raw[..., :3]
         rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+        transmittance_cam0 = None
+        transmittance_samples = None
 
-    weights_norm = weights.detach() + 1e-5
+    # at_home
+    # weights_norm = weights.detach() + 1e-5
+    weights_norm = weights + 1e-5
     weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
     depth_map = torch.sum(weights_norm * z_vals, -1)
 
-    results = [rgb_map, depth_map, weights_norm]
     if render_mask:
         density = raw[..., 3]  # [N_rays, N_samples]
-        if silhouette_loss and full_image_weights is not None:
-            mask_map = torch.sum(full_image_weights * density, dim=1)
-        else:
-            mask_map = torch.sum(weights * density, dim=1)  # [N_rays,]
-        results.append(mask_map)
-    if return_transmittance:
-        results.append(transmittance_cam0)
-        if silhouette_loss:
-            results.append(weights)
+        mask_map = torch.sum(weights * density, dim=1)  # [N_rays,]
+    else:
+        mask_map = None
 
-    return tuple(results)
+    if return_silhouettes is not None:
+        masks = return_silhouettes # [K, N, D, H, W]
+        masks = masks.permute([1, 3, 4, 2, 0]) # [N, H, W, D, K]
+        weights_silhouettes = weights.view([masks.shape[0], masks.shape[1], masks.shape[2], masks.shape[3]]).unsqueeze(-1) # (NxHxW)xD -> NxHxWxDx1
+        silhouettes = torch.sum(weights_silhouettes * masks, dim=-2) # NxHxWxK
+        silhouettes = silhouettes.permute([0, 3, 1, 2]) # NxKxHxW
+    else:
+        silhouettes = None
+
+    return rgb_map, depth_map, weights_norm, mask_map, transmittance_cam0, silhouettes
+
+def raw2transmittances(raw, z_vals, rays_d, wuv, KNDHW, masks):
+    """Transforms model's predictions to semantically meaningful values.
+    Args:
+        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+        z_vals: [num_rays, num_samples along ray]. Integration time.
+        rays_d: [num_rays, 3]. Direction of each ray in cam coor.
+    Returns:
+        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
+        depth_map: [num_rays]. Estimated distance to object.
+    """
+    # uvw: 1x(NxDxHxW)x3
+    # raw: (NxHxW)xDx4
+
+    raw2alpha = lambda x, y: 1. - torch.exp(-x * y)
+    device = raw.device
+
+    dists = z_vals[..., 1:] - z_vals[..., :-1]
+    dists = torch.cat([dists, torch.tensor([1e-2], device=device).expand(dists[..., :1].shape)], -1)  # [N_rays, N_samples] # add dist 0 in the end
+
+    dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
+
+    alpha = raw2alpha(raw[..., 3], dists)  # [N_rays, N_samples]
+    transmittance = torch.cumprod(
+        torch.cat([torch.ones((alpha.shape[0], 1), device=device), 1. - alpha + 1e-10], dim=-1)
+        , dim=-1)[:,:-1]
+    weights = alpha * transmittance # [N_rays, N_samples]
+
+
+    K, N, D, H, W = KNDHW
+    transmittance_cam0 = transmittance.view(N, H, W, D)[0] #HxWxD
+    transmittance_cam0 = transmittance_cam0.permute([2, 0, 1]).unsqueeze(0).unsqueeze(0) # 1x1xDxHxW
+
+    wuv = wuv.unsqueeze(2).unsqueeze(3)  # (1, (NxDxHxW), 1, 1, 3)
+    # self.latent(B, L, H, W)
+    transmittance_samples = F.grid_sample(
+        transmittance_cam0,
+        wuv,
+        # align_corners=True,
+        mode='bilinear',
+        padding_mode='zeros',
+    ) # 1x1x(NxDxHxW)x1x1
+
+    transmittance_samples = transmittance_samples[0, 0, :, 0, 0] # (NxDxHxW)
+    transmittance_samples = transmittance_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2) # Nx(HxWxD)
+
+    masks = masks.permute([1, 3, 4, 2, 0])  # [N, H, W, D, K]
+    weights_silhouettes = weights.view([masks.shape[0], masks.shape[1], masks.shape[2], masks.shape[3]]).unsqueeze(
+        -1)  # (NxHxW)xD -> NxHxWxDx1
+    silhouettes = torch.sum(weights_silhouettes * masks, dim=-2)  # NxHxWxK
+    silhouettes = silhouettes.permute([0, 3, 1, 2])  # NxKxHxW
+
+    return weights, transmittance_samples, silhouettes
+
+def raw2colors(raw, weights, z_vals):
+    rgb = raw[..., :3]
+    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+
+    weights_norm = weights + 1e-5
+    weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
+    depth_map = torch.sum(weights_norm * z_vals, -1)
+
+    density = raw[..., 3]  # [N_rays, N_samples]
+    mask_map = torch.sum(weights * density, dim=1)  # [N_rays,] # render_mask
+
+    return rgb_map, depth_map, weights_norm, mask_map
+
 
 def get_perceptual_net(layer=4):
     assert layer > 0

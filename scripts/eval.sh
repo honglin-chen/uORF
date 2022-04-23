@@ -10,7 +10,7 @@ python test.py --dataroot $DATAROOT --n_scenes 1 --n_img_each_scene 4 \
     --n_samp 256 --z_dim 64 --num_slots 5 \
     --model 'uorf_eval' \
     --focal_ratio 0.9605 0.9605 \
-    --near_plane 1 --far_plane 15 \
+    --near_plane 1 --far_plane 20 \
     --gt_seg --pixel_encoder --mask_image_feature --mask_image --bg_no_pixel --use_ray_dir \
 
 echo "Done"
