@@ -254,18 +254,18 @@ class uorfNoGanModel(BaseModel):
 
                 self.segment_centers = torch.stack([center_x, center_y], dim=-1) # NxKx2
 
-                # fig, axs = plt.subplots(masks.shape[0], masks.shape[1]-1, figsize=(10, 5))
+                # fig, axs = plt.subplots(_masks.shape[0], _masks.shape[1]-1, figsize=(10, 5))
                 #
-                # for i in range(masks.shape[0]):
-                #     for j in range(1, masks.shape[1]):
-                #         axs[i, j-1].imshow(masks[i, j].cpu().reshape(frustum_size[0], frustum_size[1]))
+                # for i in range(_masks.shape[0]):
+                #     for j in range(1, _masks.shape[1]):
+                #         axs[i, j-1].imshow(_masks[i, j].cpu().reshape(frustum_size[0], frustum_size[1]))
                 #         center = [center_y[i, j], center_x[i, j]]
                 #         axs[i, j-1].add_patch(plt.Circle(center, 2.0, color='g'))
                 #         axs[i, j-1].set_axis_off()
                 # plt.show()
                 # plt.savefig('tmp.png')
                 # plt.close()
-                # breakpoint()
+
 
             else:
                 _masks = F.interpolate(masks.float(), size=[64, 64], mode='nearest')
@@ -377,13 +377,13 @@ class uorfNoGanModel(BaseModel):
             '''
 
             if self.opt.mask_image or self.opt.mask_image_feature:
-                uv = uv.expand(K, -1, -1).clone() # 1x(NxDxWxH)x2 -> Kx(NxDxWxH)x2
-                pixel_feat = self.netPixelEncoder.index(uv)  # Kx(NxDxWxH)x2 -> KxCx(NxDxWxH)
+                uv = uv.expand(K, -1, -1).clone() # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
+                pixel_feat = self.netPixelEncoder.index(uv)  # Kx(NxDxHxW)x2 -> KxCx(NxDxHxW)
                 pixel_feat = pixel_feat.transpose(1, 2)
             else:
-                pixel_feat = self.netPixelEncoder.index(uv)  # 1x(NxDxWxH)x2 -> 1xCx(NxDxWxH)
-                pixel_feat = pixel_feat.transpose(1, 2)  # 1x(NxDxWxH)xC
-                pixel_feat = pixel_feat.expand(K, -1, -1).clone() # Kx(NxDxWxH)xC
+                pixel_feat = self.netPixelEncoder.index(uv)  # 1x(NxDxHxW)x2 -> 1xCx(NxDxHxW)
+                pixel_feat = pixel_feat.transpose(1, 2)  # 1x(NxDxHxW)xC
+                pixel_feat = pixel_feat.expand(K, -1, -1).clone() # Kx(NxDxHxW)xC
         else:
             pixel_feat = None
             wuv = None
@@ -464,48 +464,46 @@ class uorfNoGanModel(BaseModel):
         if self.opt.predict_centroid:
             assert fg_pos is not None
 
-            # fg_pos is predicted in the input camera frame [K-1, 3]
-            #
-            # cam02world = cam2world[0:1][None]  # 1x1x4x4
-            # world2cam = self.cam2world.inverse().unsqueeze(1) # Nx1x4x4
-            # cam2pixel = self.cam2spixel[None, ...] # 1x1x4x4
-            # fg_cam0_coor = torch.cat([fg_pos, torch.ones_like(fg_pos[:, 0:1])], dim=-1)[None,...,None]  # 1x(K-1)x4x1
-            # fg_world_coor = torch.matmul(cam02world, fg_cam0_coor)  # 1x(K-1)x4x1
-            # fg_cam_coor = torch.matmul(world2cam, fg_world_coor) # Nx(K-1)x4x1
-            # # pixel_cam_coor = torch.matmul(cam2pixel, fg_cam_coor).squeeze(-1)  # Nx(K-1)x4
-            # # uv = pixel_cam_coor[:, :, 0:2] / pixel_cam_coor[:, :, 2:3]  # Nx(K-1)x2
-            #
-            # uv = fg_cam_coor[:, 0:3, 0:2].squeeze(-1)
-            # uv = uv[:, 0:3] / 64
-
             fg_pos = fg_pos.sigmoid() # (K-1)x3
-            z_cam = fg_pos[..., -1] * (self.projection.far - self.projection.near) + self.projection.near
-            fg_pos = fg_pos * (frustum_size[0] - 1)
-            new_fg_pos = torch.zeros_like(fg_pos)
+            save_fg_pos = fg_pos.clone()
 
-            new_fg_pos[...,0:2] = fg_pos[...,0:2] * z_cam.unsqueeze(-1)
-            new_fg_pos[...,2] = z_cam
 
             cam02world = cam2world[0]  # 4x4
             world2cam = self.cam2world.inverse()  # Nx4x4
             cam2pixel = self.cam2spixel[None] # 1x4x4
             pixel2cam = self.projection.spixel2cam
 
-            fg_pixel0_pos = torch.cat([new_fg_pos, torch.ones_like(fg_pos[:, 0:1])], dim=-1) # (K-1)x4
-            fg_pixel0_pos = fg_pixel0_pos.permute(1, 0) # 4x(K-1)
-            fg_cam0_pos = torch.matmul(pixel2cam, fg_pixel0_pos) # 4x4, 4x(K-1) -> 4x(K-1)
-            fg_world_pos = torch.matmul(cam02world, fg_cam0_pos) # 4x4, 4x(K-1) -> 4x(K-1)
-            fg_cam_pos = torch.matmul(world2cam, fg_world_pos)  # Nx4x4,4x(K-1) -> Nx4x(K-1)
-            fg_pixel_pos = torch.matmul(cam2pixel, fg_cam_pos)  # 1x4x4, Nx4x(K-1) -> Nx4x(K-1)
-            fg_pixel_pos = fg_pixel_pos.permute(0, 2, 1) # Nx(K-1)x4
+            def project_pos(fg_pos):
+                z_cam = fg_pos[..., -1] * (self.projection.far - self.projection.near) + self.projection.near
+                fg_pos = fg_pos * (frustum_size[0] - 1)
+                new_fg_pos = torch.zeros_like(fg_pos)
 
-            uv = fg_pixel_pos[:, 0:3, 0:2] / fg_pixel_pos[:, 0:3, 2:3] # Nx(K-2)x4
-            fg_segment_center = self.segment_centers[:, 1:4] # Nx(K-2)x2
+                new_fg_pos[..., 0:2] = fg_pos[..., 0:2] * z_cam.unsqueeze(-1)
+                new_fg_pos[..., 2] = z_cam
+
+                fg_pixel0_pos = torch.cat([new_fg_pos, torch.ones_like(fg_pos[:, 0:1])], dim=-1) # (K-1)x4
+                fg_pixel0_pos = fg_pixel0_pos.permute(1, 0) # 4x(K-1)
+                fg_cam0_pos = torch.matmul(pixel2cam, fg_pixel0_pos) # 4x4, 4x(K-1) -> 4x(K-1)
+                fg_world_pos = torch.matmul(cam02world, fg_cam0_pos) # 4x4, 4x(K-1) -> 4x(K-1)
+
+                fg_cam_pos = torch.matmul(world2cam, fg_world_pos)  # Nx4x4,4x(K-1) -> Nx4x(K-1)
+                fg_pixel_pos = torch.matmul(cam2pixel, fg_cam_pos)  # 1x4x4, Nx4x(K-1) -> Nx4x(K-1)
+                fg_pixel_pos = fg_pixel_pos.permute(0, 2, 1) # Nx(K-1)x4
+
+                uv = fg_pixel_pos[:, 0:4, 0:2] / fg_pixel_pos[:, 0:4, 2:3] # Nx(K-2)x4
+                return fg_world_pos, uv
+
+            world_pos, uv = project_pos(fg_pos)
+
+            uv = torch.flip(uv, dims=(-1,))
+
+
+            fg_segment_center = self.segment_centers[:, 1:5] # Nx(K-2)x2
 
             distance = ((uv / 64. - fg_segment_center / 64.) ** 2).sum(-1) ** 0.5
 
             margin = 0.05
-            distance = distance[0:1]
+            # distance = distance[0:1]
             self.loss_centroid = (distance - margin).clamp(min=0.).sum()
 
             if self.opt.learn_only_centroid:
@@ -513,27 +511,58 @@ class uorfNoGanModel(BaseModel):
 
             if not os.path.exists('tmp/%d.png' % epoch):
 
-                seg_masks = self.segment_masks # NxKx(HXW)
-                fig, axs = plt.subplots(seg_masks.shape[0], seg_masks.shape[1]-2, figsize=(5, 5)) # Nx3
+                def plot(nuv, savedir=None):
+                    seg_masks = self.segment_masks # NxKx(HXW)
 
-                center_x = fg_segment_center[..., 0] # Nx3
-                center_y = fg_segment_center[..., 1] # Nx3
+                    fig, axs = plt.subplots(seg_masks.shape[0], seg_masks.shape[1], figsize=(5, 5)) # Nx3
 
-                pred_x = uv[..., 0]  # Nx3
-                pred_y = uv[..., 1]  # Nx3
+                    center_x = fg_segment_center[..., 0] # Nx3
+                    center_y = fg_segment_center[..., 1] # Nx3
 
-                for i in range(seg_masks.shape[0]):
-                    for j in range(1, seg_masks.shape[1]-1):
-                        axs[i, j-1].imshow(seg_masks[i, j].cpu().reshape(64, 64))
-                        center = [center_y[i, j-1], center_x[i, j-1]]
-                        pred = [pred_y[i, j-1], pred_x[i, j-1]]
-                        axs[i, j-1].add_patch(plt.Circle(center, 2.0, color='g'))
-                        axs[i, j-1].add_patch(plt.Circle(pred, 2.0, color='r'))
-                        axs[i, j-1].set_axis_off()
-                plt.show()
-                fig.suptitle('Centroid loss: %.3f' % self.loss_centroid)
-                plt.savefig('tmp/%d.png' % epoch)
-                plt.close()
+                    pred_x = nuv[..., 0]  # Nx3
+                    pred_y = nuv[..., 1]  # Nx3
+
+                    for i in range(seg_masks.shape[0]):
+                        _x = ((self.x[i] + 1) / 2).clone()
+
+                        axs[i, 0].imshow(_x.permute(1, 2, 0).cpu())
+                        axs[i, 0].set_axis_off()
+                        for j in range(1, seg_masks.shape[1]):
+                            axs[i, j].imshow(seg_masks[i, j].cpu().reshape(64, 64))
+                            center = [center_y[i, j-1], center_x[i, j-1]]
+                            pred = [pred_y[i, j-1], pred_x[i, j-1]]
+                            axs[i, j].add_patch(plt.Circle(center, 2.0, color='g'))
+                            axs[i, j].add_patch(plt.Circle(pred, 2.0, color='r'))
+                            axs[i, j].set_axis_off()
+                    plt.show()
+                    fig.suptitle('Centroid loss: %.3f' % self.loss_centroid)
+                    if savedir is None:
+                        plt.savefig('tmp/%d.png' % epoch, bbox_inches='tight')
+                    else:
+                        plt.savefig('tmp/%s.png' % savedir, bbox_inches='tight')
+
+                    plt.close()
+
+                    data = {
+                        'img': (self.x + 1) / 2,
+                        'world_pos': world_pos,
+                        'segment': seg_masks
+                    }
+                    print('Save data to ', './save_tensor/%d.pt' % epoch)
+                    torch.save(data, './save_tensor/%d.pt' % epoch)
+
+                plot(uv)
+                if epoch > 100000:
+
+                    num = 20
+                    interval = 1.0 / num
+                    temp_pos = save_fg_pos.clone()
+
+                    for i in range(num):
+                        temp_pos[:, -1] = i * interval
+                        temp_uv = project_pos(temp_pos)
+                        plot(temp_uv, savedir='%d-%d' % (epoch, i))
+                    breakpoint()
 
 
 

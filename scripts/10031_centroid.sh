@@ -1,5 +1,5 @@
 #!/bin/bash
-DATAROOT=${1:-'tdw_multiview_texture'}
+DATAROOT=${1:-'room_chair_train'}
 PORT=${2:-10031}
 NSCENES=${3:-100}
 python -m visdom.server -p $PORT &>/dev/null &
@@ -10,7 +10,7 @@ python train_without_gan.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_eac
     --model 'uorf_nogan' \
     --focal_ratio 0.9605 0.9605 \
     --near_plane 1 --far_plane 15 \
-    --gt_seg --pixel_encoder --mask_image_feature --mask_image --bg_no_pixel --use_ray_dir --predict_centroid --learn_only_centroid \
+    --gt_seg --pixel_encoder --mask_image_feature --mask_image --bg_no_pixel --use_ray_dir --predict_centroid --learn_only_centroid --save_latest_freq 500 \
 # done
 echo "Done"
 # node 5 cuda 1
