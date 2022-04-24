@@ -265,7 +265,7 @@ class uorfTrainModel(BaseModel):
         # Get pixel feature if using [pixel Encoder]
         if self.opt.pixel_encoder:
             # get cam matrices
-            W, H, D = self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp
+            # W, H, D = self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp # what is this?
             self.cam2spixel = self.projection.cam2spixel
             self.world2nss = self.projection.world2nss
             frustum_size = torch.Tensor(self.projection.frustum_size).to(self.device)
@@ -280,7 +280,7 @@ class uorfTrainModel(BaseModel):
             pixel_cam0_coor = torch.matmul(self.cam2spixel[None, ...], frus_cam0_coor) # 1x1x4x4, 1x(NxDxHxW)x4x1
             pixel_cam0_coor = pixel_cam0_coor.squeeze(-1) # 1x(NxDxHxW)x4
             uv = pixel_cam0_coor[:, :, 0:2]/pixel_cam0_coor[:, :, 2].unsqueeze(-1) # 1x(NxDxHxW)x2
-            uv = ((uv + 0.5)/frustum_size[0:2][None, None, :] - 0.5) * 2 # nomalize to fit in with [-1, 1] grid # TODO: check this
+            uv = (uv + 0.)/frustum_size[0:2][None, None, :] * 2 - 1 # nomalize to fit in with [-1, 1] grid # TODO: check this
             # 0 -> 0.5/frustum_size, 1 -> 1.5/frustum_size, ..., frustum_size-1 -> (frustum_size-0.5/frustum_size)
             # then, change [0, 1] -> [-1, 1]
             # if self.opt.debug:
@@ -290,7 +290,7 @@ class uorfTrainModel(BaseModel):
                 w = pixel_cam0_coor[:, :, 2:3]
                 w = (w - self.opt.near_plane) / (self.opt.far_plane - self.opt.near_plane)  # [0, 1] torch linspace is inclusive (include final value)
                 w = w * frustum_size[2:3][None, None, :]  # [0, 63]
-                w = (w + 0.5) / frustum_size[2] * 2 - 1  # [-1, 1]
+                w = (w + 0.) / frustum_size[2] * 2 - 1  # [-1, 1]
 
                 # uvw = torch.cat([w, uv], dim=-1)  # 1x(NxDxHxW)x3 # this is wrong. think about the x y z coordinate system! (H, W, D)
                 uvw = torch.cat([uv, w], dim=-1)  # 1x(NxDxHxW)x3

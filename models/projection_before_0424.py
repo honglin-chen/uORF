@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class Projection(object):
-    def __init__(self, focal_ratio=(350. / 320., 350. / 240.),
+    def __init__(self,focal_ratio=(350. / 320., 350. / 240.),
                  near=5, far=16, frustum_size=[128, 128, 128], device='cpu',
                  nss_scale=7, render_size=(64, 64)):
 
@@ -24,8 +24,8 @@ class Projection(object):
                                         [0, 0, 0, 1]]).unsqueeze(0).to(device)
         focal_x = self.focal_ratio[0] * self.frustum_size[0]
         focal_y = self.focal_ratio[1] * self.frustum_size[1]
-        bias_x = (self.frustum_size[0] - 0.) / 2.
-        bias_y = (self.frustum_size[1] - 0.) / 2.
+        bias_x = (self.frustum_size[0] - 1.) / 2.
+        bias_y = (self.frustum_size[1] - 1.) / 2.
         intrinsic_mat = torch.tensor([[focal_x, 0, bias_x, 0],
                                       [0, focal_y, bias_y, 0],
                                       [0, 0, 1, 0],
@@ -34,18 +34,18 @@ class Projection(object):
         self.spixel2cam = intrinsic_mat.inverse().to(self.device)
 
     def construct_frus_coor(self):
-        x = torch.arange(self.frustum_size[0]) + 0.5
-        y = torch.arange(self.frustum_size[1]) + 0.5
-        z = torch.arange(self.frustum_size[2]) + 0.5
+        x = torch.arange(self.frustum_size[0])
+        y = torch.arange(self.frustum_size[1])
+        z = torch.arange(self.frustum_size[2])
+        x = torch.linspace(0, self.frustum_size[0], self.frustum_size[0])
+        y = torch.linspace(0, self.frustum_size[1], self.frustum_size[1])
         x, y, z = torch.meshgrid([x, y, z])
         x_frus = x.flatten().to(self.device)
         y_frus = y.flatten().to(self.device)
         z_frus = z.flatten().to(self.device)
         # project frustum points to vol coord
-        # depth_range = torch.linspace(self.near, self.far, self.frustum_size[2])
-        # z_cam = depth_range[z_frus].to(self.device)
-        z_cam = (self.far - self.near) * (z_frus / self.frustum_size[2]) + self.near
-        z_cam = z_cam.to(self.device)
+        depth_range = torch.linspace(self.near, self.far, self.frustum_size[2])
+        z_cam = depth_range[z_frus].to(self.device)
 
         x_unnorm_pix = x_frus * z_cam
         y_unnorm_pix = y_frus * z_cam

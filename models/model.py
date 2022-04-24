@@ -411,8 +411,8 @@ class Decoder(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(z_dim, z_dim)
             )
-        if pixel_dim:
-            self.substitute_pixel_feat = torch.nn.Parameter(torch.zeros(pixel_dim))
+        # if pixel_dim:
+        #     self.substitute_pixel_feat = torch.nn.Parameter(torch.zeros(pixel_dim))
 
     def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None,
                 ray_dir_input=None, transmittance_samples=None, raw_masks_density=None, decoder_type=None, silhouettes=None):
@@ -428,8 +428,8 @@ class Decoder(nn.Module):
         K, C = z_slots.shape
         P = sampling_coor_bg.shape[0]
 
-        if self.pixel_dim and pixel_feat is None:
-            pixel_feat = self.substitute_pixel_feat[None, None, ...].expand(K, P, -1)
+        # if self.pixel_dim and pixel_feat is None:
+        #     pixel_feat = self.substitute_pixel_feat[None, None, ...].expand(K, P, -1)
 
         # if transmittance_samples is not None:
         #     pixel_feat *= transmittance_samples
