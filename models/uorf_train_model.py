@@ -356,7 +356,7 @@ class uorfTrainModel(BaseModel):
             H_, W_ = feature_map.shape[2], feature_map.shape[3]
             attn = attn.view(self.opt.num_slots, 1, H_, W_)
             if H_ != H:
-                attn = F.interpolate(attn, size=[H, W], mode='bilinear')
+                attn = F.interpolate(attn, size=[H, W], mode='nearest')
             for i in range(self.opt.n_img_each_scene):
                 setattr(self, 'x_rec{}'.format(i), x_recon[i])
                 setattr(self, 'x{}'.format(i), x[i])
