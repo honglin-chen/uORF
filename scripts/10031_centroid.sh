@@ -1,5 +1,5 @@
 #!/bin/bash
-DATAROOT=${1:-'room_chair_train'}
+DATAROOT=${1:-'tdw_multiview_texture'}
 PORT=${2:-10031}
 NSCENES=${3:-100}
 python -m visdom.server -p $PORT &>/dev/null &

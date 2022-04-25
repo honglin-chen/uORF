@@ -36,21 +36,6 @@ def position_encoding_image(size, num_pos_feats=64, temperature=10000, normalize
 
     return pos
 
-
-def position_encoding_learned(size, num_pos_feats):
-    H, W = size
-    row_embed = nn.Embedding(H, num_pos_feats)
-    col_embed = nn.Embedding(W, num_pos_feats)
-    nn.init.uniform_(row_embed.weight)
-    nn.init.uniform_(col_embed.weight)
-
-    pos = torch.cat([
-        row_embed.weight.unsqueeze(1).repeat(1, W, 1),
-        col_embed.weight.unsqueeze(0).repeat(H, 1, 1),
-    ], dim=-1).flatten(0, 1).unsqueeze(0)
-
-    return pos, row_embed, col_embed
-
 class PositionEmbeddingLearned(nn.Module):
     """
     Absolute pos embedding, learned.
@@ -58,11 +43,9 @@ class PositionEmbeddingLearned(nn.Module):
     def __init__(self, size, num_pos_feats=32):
         super().__init__()
         self.size = size
-        self.row_embed = nn.Embedding(64, num_pos_feats)
-        self.col_embed = nn.Embedding(64, num_pos_feats)
+        self.row_embed = nn.Embedding(size[0], num_pos_feats)
+        self.col_embed = nn.Embedding(size[1], num_pos_feats)
         self.reset_parameters()
-
-
 
     def reset_parameters(self):
         nn.init.uniform_(self.row_embed.weight)

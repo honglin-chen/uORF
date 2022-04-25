@@ -41,7 +41,6 @@ class Projection(object):
         x_frus = x.flatten().to(self.device)
         y_frus = y.flatten().to(self.device)
         z_frus = z.flatten().to(self.device)
-
         # project frustum points to vol coord
         depth_range = torch.linspace(self.near, self.far, self.frustum_size[2])
         z_cam = depth_range[z_frus].to(self.device)

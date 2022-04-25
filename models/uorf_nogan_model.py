@@ -15,7 +15,6 @@ import pdb
 from util import util
 import matplotlib.pyplot as plt
 
-
 class uorfNoGanModel(BaseModel):
 
     @staticmethod
@@ -73,6 +72,7 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--learn_only_centroid', action='store_true', help='loss function contains only centroid loss')
         parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
         parser.add_argument('--predict_centroid', action='store_true', help='predict the 3D centroid of the foreground objects')
+        parser.add_argument('--loss_centroid_margin', type=float, default=0.05, help='max margin for the centroid loss')
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
 
@@ -91,7 +91,7 @@ class uorfNoGanModel(BaseModel):
         - define loss function, visualization images, model names, and optimizers
         """
         BaseModel.__init__(self, opt)  # call the initialization method of BaseModel
-        self.loss_names = ['recon', 'perc']
+        self.loss_names = ['recon', 'perc', 'centroid']
         n = opt.n_img_each_scene
         self.visual_names = ['x{}'.format(i) for i in range(n)] + \
                             ['x_rec{}'.format(i) for i in range(n)] + \
@@ -162,23 +162,26 @@ class uorfNoGanModel(BaseModel):
                             no_concatenate=self.opt.no_concatenate, bg_no_pixel=self.opt.bg_no_pixel,
                             use_ray_dir=self.opt.use_ray_dir, predict_centroid=self.opt.predict_centroid),
                     gpu_ids=self.gpu_ids, init_type='xavier')
+
+
             self.parameters.append(self.netDecoder.parameters())
             self.nets.append(self.netDecoder)
             self.model_names.append('Decoder')
 
+
         # [Position encoding]
         p_dim = z_dim
-        # self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size], num_pos_feats=p_dim // 2).to(self.device)
-        self.netPositionEmbedding = networks.init_net(
-            PositionEmbeddingLearned(size=[opt.input_size, opt.input_size], num_pos_feats=p_dim // 2),
-            gpu_ids=self.gpu_ids, init_type='normal')
-
-        self.nets.append(self.netPositionEmbedding)
-        self.parameters.append(self.netPositionEmbedding.parameters())
-        self.model_names.append('PositionEmbedding')
+        self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size], num_pos_feats=p_dim // 2).to(self.device)
+        # self.netPositionEmbedding = networks.init_net(
+        #     PositionEmbeddingLearned(size=[opt.input_size, opt.input_size], num_pos_feats=p_dim // 2),
+        #     gpu_ids=self.gpu_ids, init_type='normal')
+        #
+        # self.nets.append(self.netPositionEmbedding)
+        # self.parameters.append(self.netPositionEmbedding.parameters())
+        # self.model_names.append('PositionEmbedding')
 
         self.netSlotAttention_pos = networks.init_net(
-            SlotAttention(num_slots=opt.num_slots, in_dim=p_dim, slot_dim=p_dim, iters=opt.attn_iter,
+            SlotAttention(num_slots=opt.num_slots, in_dim=p_dim * 2, slot_dim=p_dim, iters=opt.attn_iter,
                           gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
         self.nets.append(self.netSlotAttention_pos)
         self.parameters.append(self.netSlotAttention_pos.parameters())
@@ -226,6 +229,13 @@ class uorfNoGanModel(BaseModel):
         if not self.opt.fixed_locality:
             self.cam2world_azi = input['azi_rot'].to(self.device)
 
+        self.netDecoder.cam2world = self.cam2world
+        self.netDecoder.cam2pixel = self.projection.cam2spixel
+        self.netDecoder.pixel2cam = self.projection.spixel2cam  # 1x4x4
+        self.netDecoder.world2nss = self.projection.world2nss # 1x4x4
+        self.netDecoder.far = self.projection.far
+        self.netDecoder.near = self.projection.near
+
         if 'masks' in input.keys():
             bg_masks = input['bg_mask'][0:1].to(self.device)
             obj_masks = input['obj_masks'][0:1].to(self.device)
@@ -251,9 +261,9 @@ class uorfNoGanModel(BaseModel):
                 center_x = (_masks * x).sum(-1) / (_masks.sum(-1) + 1e-12) # NxK
                 center_y = (_masks * y).sum(-1) / (_masks.sum(-1) + 1e-12) # NxK
                 self.segment_masks = _masks
-
                 self.segment_centers = torch.stack([center_x, center_y], dim=-1) # NxKx2
 
+                # # [Visualization]
                 # fig, axs = plt.subplots(_masks.shape[0], _masks.shape[1]-1, figsize=(10, 5))
                 #
                 # for i in range(_masks.shape[0]):
@@ -299,7 +309,9 @@ class uorfNoGanModel(BaseModel):
 
         # Slot Attention on position encoding
         if self.opt.predict_centroid:
-            pos_embed = self.netPositionEmbedding()
+            # pos_embed = self.netPositionEmbedding()
+            pos_embed = self.pos_emb
+            pos_embed = torch.cat([pos_embed, feat], dim=-1)
             # print('position embedding: ', pos_embed.sum(), pos_embed.device)
             p_slots, _ = self.netSlotAttention_pos(pos_embed, masks=self.masks, norm_feat=False) # 1xKxC
             p_slots = p_slots.squeeze(0) # KxC
@@ -322,6 +334,7 @@ class uorfNoGanModel(BaseModel):
             self.cam2spixel = self.projection.cam2spixel
             self.world2nss = self.projection.world2nss
             frustum_size = torch.Tensor(self.projection.frustum_size).to(self.device)
+            self.netDecoder.frustum_size = frustum_size
             x = F.interpolate(self.x, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
             self.z_vals, self.ray_dir = z_vals, ray_dir
         else:
@@ -333,6 +346,7 @@ class uorfNoGanModel(BaseModel):
             self.cam2spixel = self.projection_fine.cam2spixel
             self.world2nss = self.projection_fine.world2nss
             frustum_size = torch.Tensor(self.projection_fine.frustum_size).to(self.device)
+            self.netDecoder.frustum_size = frustum_size
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor.view([N, D, H, W, 3]), z_vals.view([N, H, W, D]), ray_dir.view([N, H, W, 3])
             H_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             W_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
@@ -396,7 +410,7 @@ class uorfNoGanModel(BaseModel):
             # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
 
         else:
-            raws, masked_raws, unmasked_raws, masks, fg_pos  = \
+            raws, masked_raws, unmasked_raws, masks, pixel_pos  = \
                 self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, no_concatenate=self.opt.no_concatenate, ray_dir_input=ray_dir_input, p_slots=p_slots)
             # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1, Kx(NxDxHxW)xC
 
@@ -462,109 +476,29 @@ class uorfNoGanModel(BaseModel):
                     self.loss_silhouette = 0.
 
         if self.opt.predict_centroid:
-            assert fg_pos is not None
+            assert pixel_pos is not None
+            # Target centroid positions
+            target_pos = self.segment_centers[:, 1:] # Nx(K-1)x2
+            segment_area = self.segment_masks[:, 1:].sum(-1) # Nx(K-1)x1
+            loss_mask = (segment_area > 0).float().detach()
 
-            fg_pos = fg_pos.sigmoid() # (K-1)x3
-            save_fg_pos = fg_pos.clone()
+            # Normalize coordinates:
+            pixel_pos = pixel_pos / frustum_size[0:2].view(1, 1, 2)
+            target_pos = target_pos / frustum_size[0:2].view(1, 1, 2)
 
-
-            cam02world = cam2world[0]  # 4x4
-            world2cam = self.cam2world.inverse()  # Nx4x4
-            cam2pixel = self.cam2spixel[None] # 1x4x4
-            pixel2cam = self.projection.spixel2cam
-
-            def project_pos(fg_pos):
-                z_cam = fg_pos[..., -1] * (self.projection.far - self.projection.near) + self.projection.near
-                fg_pos = fg_pos * (frustum_size[0] - 1)
-                new_fg_pos = torch.zeros_like(fg_pos)
-
-                new_fg_pos[..., 0:2] = fg_pos[..., 0:2] * z_cam.unsqueeze(-1)
-                new_fg_pos[..., 2] = z_cam
-
-                fg_pixel0_pos = torch.cat([new_fg_pos, torch.ones_like(fg_pos[:, 0:1])], dim=-1) # (K-1)x4
-                fg_pixel0_pos = fg_pixel0_pos.permute(1, 0) # 4x(K-1)
-                fg_cam0_pos = torch.matmul(pixel2cam, fg_pixel0_pos) # 4x4, 4x(K-1) -> 4x(K-1)
-                fg_world_pos = torch.matmul(cam02world, fg_cam0_pos) # 4x4, 4x(K-1) -> 4x(K-1)
-
-                fg_cam_pos = torch.matmul(world2cam, fg_world_pos)  # Nx4x4,4x(K-1) -> Nx4x(K-1)
-                fg_pixel_pos = torch.matmul(cam2pixel, fg_cam_pos)  # 1x4x4, Nx4x(K-1) -> Nx4x(K-1)
-                fg_pixel_pos = fg_pixel_pos.permute(0, 2, 1) # Nx(K-1)x4
-
-                uv = fg_pixel_pos[:, 0:4, 0:2] / fg_pixel_pos[:, 0:4, 2:3] # Nx(K-2)x4
-                return fg_world_pos, uv
-
-            world_pos, uv = project_pos(fg_pos)
-
-            uv = torch.flip(uv, dims=(-1,))
-
-
-            fg_segment_center = self.segment_centers[:, 1:5] # Nx(K-2)x2
-
-            distance = ((uv / 64. - fg_segment_center / 64.) ** 2).sum(-1) ** 0.5
-
-            margin = 0.05
-            # distance = distance[0:1]
-            self.loss_centroid = (distance - margin).clamp(min=0.).sum()
+            # Loss as the euclidean distance between the predicted and target centroid positions
+            distance = ((pixel_pos - target_pos) ** 2).sum(-1) ** 0.5
+            # distance = torch.nn.L1Loss(pixel_pos, target_pos)
+            margin = self.opt.loss_centroid_margin
+            self.loss_centroid_raw = (distance - margin).clamp(min=0.) * loss_mask
+            self.loss_centroid = ((distance - margin).clamp(min=0.) * loss_mask).sum()
 
             if self.opt.learn_only_centroid:
                 self.loss_perc = self.loss_recon = self.loss_silhouette = 0.0
 
+            # [Visualization]
             if not os.path.exists('tmp/%d.png' % epoch):
-
-                def plot(nuv, savedir=None):
-                    seg_masks = self.segment_masks # NxKx(HXW)
-
-                    fig, axs = plt.subplots(seg_masks.shape[0], seg_masks.shape[1], figsize=(5, 5)) # Nx3
-
-                    center_x = fg_segment_center[..., 0] # Nx3
-                    center_y = fg_segment_center[..., 1] # Nx3
-
-                    pred_x = nuv[..., 0]  # Nx3
-                    pred_y = nuv[..., 1]  # Nx3
-
-                    for i in range(seg_masks.shape[0]):
-                        _x = ((self.x[i] + 1) / 2).clone()
-
-                        axs[i, 0].imshow(_x.permute(1, 2, 0).cpu())
-                        axs[i, 0].set_axis_off()
-                        for j in range(1, seg_masks.shape[1]):
-                            axs[i, j].imshow(seg_masks[i, j].cpu().reshape(64, 64))
-                            center = [center_y[i, j-1], center_x[i, j-1]]
-                            pred = [pred_y[i, j-1], pred_x[i, j-1]]
-                            axs[i, j].add_patch(plt.Circle(center, 2.0, color='g'))
-                            axs[i, j].add_patch(plt.Circle(pred, 2.0, color='r'))
-                            axs[i, j].set_axis_off()
-                    plt.show()
-                    fig.suptitle('Centroid loss: %.3f' % self.loss_centroid)
-                    if savedir is None:
-                        plt.savefig('tmp/%d.png' % epoch, bbox_inches='tight')
-                    else:
-                        plt.savefig('tmp/%s.png' % savedir, bbox_inches='tight')
-
-                    plt.close()
-
-                    data = {
-                        'img': (self.x + 1) / 2,
-                        'world_pos': world_pos,
-                        'segment': seg_masks
-                    }
-                    print('Save data to ', './save_tensor/%d.pt' % epoch)
-                    torch.save(data, './save_tensor/%d.pt' % epoch)
-
-                plot(uv)
-                if epoch > 100000:
-
-                    num = 20
-                    interval = 1.0 / num
-                    temp_pos = save_fg_pos.clone()
-
-                    for i in range(num):
-                        temp_pos[:, -1] = i * interval
-                        temp_uv = project_pos(temp_pos)
-                        plot(temp_uv, savedir='%d-%d' % (epoch, i))
-                    breakpoint()
-
-
+                self.visualize_centroid(pixel_pos, target_pos, self.segment_masks, epoch=epoch)
 
 
 
@@ -640,6 +574,59 @@ class uorfNoGanModel(BaseModel):
                         setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i])
 
                     setattr(self, 'slot{}_attn'.format(k), self.attn[k] * 2 - 1)
+
+    def visualize_centroid(self, pred_center, target_center, segment_masks, epoch, savedir=None):
+        fig, axs = plt.subplots(segment_masks.shape[0], segment_masks.shape[1], figsize=(5, 5))  # Nx3
+
+        center_x = target_center[..., 0] * self.projection.frustum_size[0]  # Nx3
+        center_y = target_center[..., 1] * self.projection.frustum_size[1]  # Nx3
+
+        pred_x = pred_center[..., 0] * self.projection.frustum_size[0]  # Nx3
+        pred_y = pred_center[..., 1] * self.projection.frustum_size[1]  # Nx3
+
+        for i in range(segment_masks.shape[0]):
+            _x = ((self.x[i] + 1) / 2).clone()
+
+            axs[i, 0].imshow(_x.permute(1, 2, 0).cpu())
+            axs[i, 0].set_axis_off()
+            for j in range(1, segment_masks.shape[1]):
+                axs[i, j].imshow(segment_masks[i, j].cpu().reshape(64, 64))
+                center = [center_y[i, j - 1], center_x[i, j - 1]]
+                pred = [pred_y[i, j - 1], pred_x[i, j - 1]]
+                axs[i, j].add_patch(plt.Circle(center, 2.0, color='g'))
+                axs[i, j].add_patch(plt.Circle(pred, 2.0, color='r'))
+                axs[i, j].set_axis_off()
+                axs[i, j].set_title('dist: %.2f' % self.loss_centroid_raw[i, j-1], fontsize=10)
+        plt.show()
+        fig.suptitle('Centroid loss: %.3f' % self.loss_centroid)
+        if savedir is None:
+            plt.savefig('tmp/%d.png' % epoch, bbox_inches='tight')
+        else:
+            plt.savefig('tmp/%s.png' % savedir, bbox_inches='tight')
+
+        plt.close()
+
+        # Save data for visualization
+        # data = {
+        #     'img': (self.x + 1) / 2,
+        #     'world_pos': world_pos,
+        #     'segment': segment_masks
+        # }
+        # print('Save data to ', './save_tensor/%d.pt' % epoch)
+        # torch.save(data, './save_tensor/%d.pt' % epoch)
+
+        # Visualize the line of projection with varying depth
+        # if epoch > 100000:
+        #
+        #     num = 20
+        #     interval = 1.0 / num
+        #     temp_pos = save_fg_pos.clone()
+        #
+        #     for i in range(num):
+        #         temp_pos[:, -1] = i * interval
+        #         temp_uv = project_pos(temp_pos)
+        #         plot(temp_uv, savedir='%d-%d' % (epoch, i))
+        #     breakpoint()
 
     def backward(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""

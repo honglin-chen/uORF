@@ -193,6 +193,7 @@ class pixelnerfNoGanModel(BaseModel):
             self.cam2spixel = self.projection.cam2spixel
             self.world2nss = self.projection.world2nss
             frustum_size = torch.Tensor(self.projection.frustum_size).to(self.device)
+            self.netDecoder.frustum_size = frustum_size
             x = F.interpolate(self.x, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
             self.z_vals, self.ray_dir = z_vals, ray_dir
             ray_dir_input = ray_dir.view([N, H, W, 3])
@@ -206,6 +207,7 @@ class pixelnerfNoGanModel(BaseModel):
             self.cam2spixel = self.projection_fine.cam2spixel
             self.world2nss = self.projection_fine.world2nss
             frustum_size = torch.Tensor(self.projection_fine.frustum_size).to(self.device)
+            self.netDecoder.frustum_size = frustum_size
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor.view([N, D, H, W, 3]), z_vals.view([N, H, W, D]), ray_dir.view([N, H, W, 3])
             H_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             W_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)

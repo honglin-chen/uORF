@@ -436,20 +436,6 @@ class Decoder(nn.Module):
         K, C = z_slots.shape
         P = sampling_coor_bg.shape[0]
 
-        if self.fixed_locality:
-            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
-            sampling_coor_fg = torch.cat([sampling_coor_fg, torch.ones_like(sampling_coor_fg[:, :, 0:1])], dim=-1)  # (K-1)xPx4
-            sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx4x1
-            sampling_coor_fg = sampling_coor_fg.squeeze(-1)[:, :, :3]  # (K-1)xPx3
-        else:
-            sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx3x1
-            sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
-            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
-
-        query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
-        sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
-        query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
-
         if self.predict_centroid:
             assert p_slots is not None
             p_fg = p_slots[1:]  # (K-1)xC
@@ -457,8 +443,64 @@ class Decoder(nn.Module):
             tmp = self.p_after(torch.cat([p_fg, tmp], dim=1))
             latent = self.p_after_latent(tmp)
             fg_pos = self.p_pos(latent)
+            fg_pos = fg_pos.sigmoid() # (K-1)x3
+
+            cam02world = self.cam2world[0]  # 4x4
+            world2cam = self.cam2world.inverse()  # Nx4x4
+            cam2pixel = self.cam2pixel[None]  # 1x4x4
+            pixel2cam = self.pixel2cam  # 1x4x4
+            world2nss = self.world2nss # 1x4x4
+            frustum_size = self.frustum_size
+
+            def project_pos(fg_pos):
+
+                z_cam = fg_pos[..., -1] * (self.far - self.near) + self.near  # (K-1)
+                fg_pos = fg_pos * (frustum_size.unsqueeze(0) - 1)  # [0, 1] -> [0, frustum_size]
+
+                unorm_fg_pos = torch.zeros_like(fg_pos)  # (K-1)x3
+                unorm_fg_pos[..., 0:2] = fg_pos[..., 0:2] * z_cam.unsqueeze(-1)
+                unorm_fg_pos[..., 2] = z_cam
+
+                fg_pixel0_pos = torch.cat([unorm_fg_pos, torch.ones_like(fg_pos[:, 0:1])], dim=-1)  # (K-1)x4
+                fg_pixel0_pos = fg_pixel0_pos.permute(1, 0)  # 4x(K-1)
+                fg_cam0_pos = torch.matmul(pixel2cam, fg_pixel0_pos)  # 4x4, 4x(K-1) -> 4x(K-1)
+                fg_world_pos = torch.matmul(cam02world, fg_cam0_pos)  # 4x4, 4x(K-1) -> 4x(K-1)
+                fg_cam_pos = torch.matmul(world2cam, fg_world_pos)  # Nx4x4,4x(K-1) -> Nx4x(K-1)
+                fg_pixel_pos = torch.matmul(cam2pixel, fg_cam_pos)  # 1x4x4, Nx4x(K-1) -> Nx4x(K-1)
+                fg_pixel_pos = fg_pixel_pos.permute(0, 2, 1)  # Nx(K-1)x4
+
+                fg_pixel_pos = fg_pixel_pos[:, :, 0:2] / fg_pixel_pos[:, :, 2:3]  # Nx(K-1)x4
+                return fg_world_pos, fg_pixel_pos
+
+            world_pos, pixel_pos = project_pos(fg_pos)
+            pixel_pos = torch.flip(pixel_pos, dims=(-1,))
+
         else:
-            fg_pos = None
+            pixel_pos = None
+            world_pos = None
+
+        if self.fixed_locality:
+            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
+            sampling_coor_fg = torch.cat([sampling_coor_fg, torch.ones_like(sampling_coor_fg[:, :, 0:1])], dim=-1)  # (K-1)xPx4
+            sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx4x1
+            sampling_coor_fg = sampling_coor_fg.squeeze(-1)[:, :, :3]  # (K-1)xPx3
+            assert self.predict_centroid is False, 'not implemented not fixed_locaity'
+        else:
+            sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx3x1
+            sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
+
+            if self.predict_centroid:
+                world_pos_nss = torch.matmul(world2nss, world_pos)  # 1x4x4, 4x(K-1) -> 1x4x(K-1)
+                world_pos_nss = world_pos_nss[:, 0:3].permute(0, 2, 1) # 1x(K-1)x3
+                world_pos_nss = torch.matmul(fg_transform[None], world_pos_nss[..., None])  # 1x3x3, 1x(K-1)x3 -> 1x(K-1)x3x1
+                world_pos_nss = world_pos_nss.squeeze(0).permute(0, 2, 1)
+                sampling_coor_fg = sampling_coor_fg - world_pos_nss
+            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
+
+        query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
+        sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
+        query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
+
 
         if self.use_ray_dir:
             query_bg = torch.cat([query_bg, ray_dir_input], dim=1)
@@ -489,7 +531,6 @@ class Decoder(nn.Module):
                 input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
                 # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape in tdw
 
-
         # print(input_bg.shape, 'input_bg.shape')
         # print(input_fg.shape, 'input_fg.shape')
         tmp = self.b_before(input_bg)
@@ -513,7 +554,7 @@ class Decoder(nn.Module):
         masked_raws = unmasked_raws * masks
         raws = masked_raws.sum(dim=0)
 
-        return raws, masked_raws, unmasked_raws, masks, fg_pos
+        return raws, masked_raws, unmasked_raws, masks, pixel_pos
 
 class PixelDecoder(nn.Module):
     def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, pixel_positional_encoding=None, use_ray_dir=None, slot_repeat=None):
@@ -704,7 +745,6 @@ class SlotAttention(nn.Module):
             feat: visual feature with position information, BxNxC
         output: slots: BxKxC, attn: BxKxN
         """
-
         B, _, _ = feat.shape
         K = num_slots if num_slots is not None else self.num_slots
 
