@@ -73,7 +73,7 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--debug', action='store_true', help='debugging option')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
-                            dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
+                            dataset_mode='multiscenes', niter=2000, custom_lr=True, lr_policy='warmup')
 
         parser.set_defaults(exp_id='run-{}'.format(time.strftime('%Y-%m-%d-%H-%M-%S')))
 
@@ -303,6 +303,7 @@ class uorfTrainModel(BaseModel):
                 pixel_feat = self.netPixelEncoder.index(uv)  # 1x(NxDxHxW)x2 -> 1xCx(NxDxHxW)
                 pixel_feat = pixel_feat.transpose(1, 2)  # 1x(NxDxHxW)xC
                 pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxDxHxW)xC
+                uv = uv.expand(K, -1, -1)  # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
 
 
         raws_density, masked_raws_density, unmasked_raws_density, masks_for_silhouette_density, raw_masks_density = \
@@ -314,13 +315,19 @@ class uorfTrainModel(BaseModel):
         weights, transmittance_samples, silhouettes =\
             raw2transmittances(raws_density, z_vals, ray_dir, uvw=uvw, KNDHW=(K, N, D, H, W), masks=masks_for_silhouette_density)
         self.silhouettes = silhouettes # NxKxHxW
+
+        silhouette0 = silhouettes[0:1].transpose(0, 1) # Kx1xHxW
+        uv = uv.unsqueeze(1) # Kx1x(NxDxHxW)x2
+        silhouettes_for_color = F.grid_sample(silhouette0, uv, mode='bilinear', padding_mode='zeros',) # Kx1(C)x1x(NxDxHxW)
+        silhouettes_for_color = silhouettes_for_color.flatten(0, 3).view(K, N, D, H, W).permute([1, 2, 0, 3, 4]) # NxDxKxHxW
+
         self.transmittance_samples = transmittance_samples
 
         # transmittance_samples Nx(HxWxD) # pixel_feat Kx(NxDxHxW)xC
         transmittance_samples = transmittance_samples.view([N, H, W, D]).permute([0, 3, 1, 2]).flatten(0, 3)[None, ..., None] # 1x(NxDxHxW)x1
         raws_color, masked_raws_color, unmasked_raws_color, masks_for_silhouette_color = \
             self.netColorDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat=pixel_feat,
-                            ray_dir_input=ray_dir_input, transmittance_samples=transmittance_samples, raw_masks_density=raw_masks_density, silhouettes=silhouettes.unsqueeze(1).expand(-1, D, -1, -1, -1), decoder_type='color')
+                            ray_dir_input=ray_dir_input, transmittance_samples=transmittance_samples, raw_masks_density=raw_masks_density, silhouettes=silhouettes_for_color, decoder_type='color')
 
         raws = raws_color.view([N, D, H, W, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
         masked_raws = masked_raws_color.view([K, N, D, H, W, 4])

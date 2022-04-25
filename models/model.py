@@ -444,6 +444,8 @@ class Decoder(nn.Module):
             sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx3x1
             sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
+            z_out_idx_fg = torch.any(sampling_coor_fg[..., 2:3] < 0.1, dim=-1)
+            z_out_idx_bg = torch.any(sampling_coor_bg[None, ..., 2:3] < 0.1, dim=-1)
 
         query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
         sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
@@ -498,7 +500,12 @@ class Decoder(nn.Module):
         fg_raw_rgb = self.f_color(latent_fg).view([K-1, P, 3])  # ((K-1)xP)x3 -> (K-1)xPx3
         fg_raw_shape = self.f_after_shape(tmp).view([K - 1, P])  # ((K-1)xP)x1 -> (K-1)xP, density
         if self.locality:
-            fg_raw_shape[outsider_idx] *= 0
+            # fg_raw_shape[outsider_idx] *= 0
+            fg_raw_shape[z_out_idx_fg] *= 0
+            # debug
+            bg_raw_shape = bg_raws[..., 3:4]
+            bg_raw_shape[z_out_idx_bg] *= 0
+            bg_raws[..., 3:4] = bg_raw_shape
         fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # (K-1)xPx4
 
         all_raws = torch.cat([bg_raws, fg_raws], dim=0)  # KxPx4

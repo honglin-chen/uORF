@@ -2,12 +2,12 @@ from itertools import chain
 
 import torch
 import torch.nn.functional as F
-from .base_model import BaseModel
-from . import networks
+from models.base_model import BaseModel
+from models import networks
 import os
 import time
-from .projection import Projection
-from .model import Encoder, Decoder, SlotAttention, raw2outputs, PixelEncoder, PixelDecoder
+from models.projection import Projection
+from models.model import Encoder, Decoder, SlotAttention, raw2outputs, PixelEncoder, PixelDecoder
 import pdb
 from util import util
 import lpips

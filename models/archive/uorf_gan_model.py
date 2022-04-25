@@ -3,13 +3,13 @@ from itertools import chain
 import torch
 from torch import nn, optim
 import torch.nn.functional as F
-from .base_model import BaseModel
-from . import networks
+from models.base_model import BaseModel
+from models import networks
 import os
 import time
-from .projection import Projection
+from models.projection import Projection
 from torchvision.transforms import Normalize
-from .model import Encoder, Decoder, SlotAttention, Discriminator, get_perceptual_net, raw2outputs, toggle_grad, d_logistic_loss, d_r1_loss, g_nonsaturating_loss
+from models.model import Encoder, Decoder, SlotAttention, Discriminator, get_perceptual_net, raw2outputs, toggle_grad, d_logistic_loss, d_r1_loss, g_nonsaturating_loss
 
 
 class uorfGanModel(BaseModel):

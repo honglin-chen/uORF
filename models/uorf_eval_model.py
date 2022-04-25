@@ -307,6 +307,7 @@ class uorfEvalModel(BaseModel):
                     pixel_feat_ = self.netPixelEncoder.index(uv_)  # 1x(NxDxHxW)x2 -> 1xCx(NxDxHxW)
                     pixel_feat_ = pixel_feat_.transpose(1, 2)  # 1x(NxDxHxW)xC
                     pixel_feat_ = pixel_feat_.expand(K, -1, -1)  # Kx(NxDxHxW)xC
+                    uv_ = uv_.expand(K, -1, -1)
 
                 raws_density_, masked_raws_density_, unmasked_raws_density_, masks_for_silhouette_density_, raw_masks_density_ = \
                     self.netDensityDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat_,
@@ -325,6 +326,7 @@ class uorfEvalModel(BaseModel):
 
         raws_density = raws_density.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
         uvw = uvw.view([1, N, D, H, W, 3]).flatten(1, 4)
+        uv = uvw[..., 0:2].expand(K, -1, -1)
 
         z_vals_not_partitioned = z_vals_not_partitioned.flatten(0, 2)
         ray_dir_not_partitioned = ray_dir_not_partitioned.flatten(0, 2)
@@ -335,6 +337,13 @@ class uorfEvalModel(BaseModel):
 
         transmittance_samples = transmittance_samples.view([N, H, W, D]).permute([0, 3, 1, 2]).flatten(0, 3)[
             None, ..., None]  # 1x(NxDxHxW)x1
+
+        silhouette0 = silhouettes[0:1].transpose(0, 1)  # Kx1xHxW
+        uv = uv.unsqueeze(1)  # Kx1x(NxDxHxW)x2
+        silhouettes_for_color = F.grid_sample(silhouette0, uv, mode='bilinear',
+                                              padding_mode='zeros', )  # Kx1(C)x1x(NxDxHxW)
+        silhouettes_for_color = silhouettes_for_color.flatten(0, 3).view(K, N, D, H, W).permute(
+            [1, 2, 0, 3, 4])  # NxDxKxHxW
 
         for (j, (frus_nss_coor_, z_vals_, ray_dir_)) in enumerate(zip(frus_nss_coor, z_vals, ray_dir)):
             h, w = divmod(j, scale)
@@ -350,7 +359,7 @@ class uorfEvalModel(BaseModel):
 
             pixel_feat_ = pixel_feat_list[j]
             raw_masks_density_ = raw_masks_density_list[j]
-            silhouettes_ = silhouettes[:, :, h::scale, w::scale] # NxKxHxW
+            silhouettes_for_color_ = silhouettes_for_color[:, :, :, h::scale, w::scale] # NxDxKxHxW
             transmittance_samples_ = transmittance_samples.view([N, D, H, W])[:, :, h::scale, w::scale].flatten(0, 3)[
             None, ..., None]
 
@@ -358,7 +367,7 @@ class uorfEvalModel(BaseModel):
                 self.netColorDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat=pixel_feat_,
                                      ray_dir_input=ray_dir_input_, transmittance_samples=transmittance_samples_,
                                      raw_masks_density=raw_masks_density_,
-                                     silhouettes=silhouettes_.unsqueeze(1).expand(-1, D, -1, -1, -1),
+                                     silhouettes=silhouettes_for_color_,
                                      decoder_type='color')
 
             raws_ = raws_color_.view([N, D, H_, W_, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0,
