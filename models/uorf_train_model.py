@@ -13,6 +13,8 @@ from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outp
 from .position_encoding import PositionEmbeddingLearned, position_encoding_image
 import pdb
 from util import util
+torch.cuda.manual_seed(0)
+torch.cuda.manual_seed_all(0)
 
 class uorfTrainModel(BaseModel):
 
@@ -122,6 +124,41 @@ class uorfTrainModel(BaseModel):
         self.nets.append(self.netEncoder)
         self.model_names.append('Encoder')
 
+        # [Position encoding]
+        p_dim = z_dim
+        self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size], num_pos_feats=p_dim // 2).to(
+            self.device)
+
+        # self.netPositionEmbedding = networks.init_net(
+        #     PositionEmbeddingLearned(size=[opt.input_size, opt.input_size], num_pos_feats=p_dim // 2),
+        #     gpu_ids=self.gpu_ids, init_type='normal')
+        #
+        # self.nets.append(self.netPositionEmbedding)
+        # self.parameters.append(self.netPositionEmbedding.parameters())
+        # self.model_names.append('PositionEmbedding')
+
+        self.netSlotAttention_pos = networks.init_net(
+            SlotAttention(num_slots=opt.num_slots, in_dim=p_dim + z_dim, slot_dim=p_dim, iters=opt.attn_iter,
+                          gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
+        self.nets.append(self.netSlotAttention_pos)
+        self.parameters.append(self.netSlotAttention_pos.parameters())
+        self.model_names.append('SlotAttention_pos')
+
+        # [Centroid decoder]
+        self.netCentroidDecoder = networks.init_net(
+            CentroidDecoder(input_dim=p_dim,
+                            z_dim=p_dim,
+                            cam2pixel=self.projection.cam2spixel,
+                            world2nss=self.projection.world2nss,
+                            near=self.projection.near,
+                            far=self.projection.far,
+                            small_latent=self.opt.small_latent,
+                            n_layers=opt.n_layer),
+            gpu_ids=self.gpu_ids, init_type='xavier')
+        self.parameters.append(self.netCentroidDecoder.parameters())
+        self.nets.append(self.netCentroidDecoder)
+        self.model_names.append('CentroidDecoder')
+
         # [Slot attention]
         self.num_slots = opt.num_slots
         self.netSlotAttention = networks.init_net(
@@ -160,39 +197,7 @@ class uorfTrainModel(BaseModel):
         self.L2_loss = nn.MSELoss()
         self.L1_loss = nn.L1Loss()
 
-        # [Position encoding]
-        p_dim = z_dim
-        self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size], num_pos_feats=p_dim // 2).to(self.device)
-        # self.netPositionEmbedding = networks.init_net(
-        #     PositionEmbeddingLearned(size=[opt.input_size, opt.input_size], num_pos_feats=p_dim // 2),
-        #     gpu_ids=self.gpu_ids, init_type='normal')
-        #
-        # self.nets.append(self.netPositionEmbedding)
-        # self.parameters.append(self.netPositionEmbedding.parameters())
-        # self.model_names.append('PositionEmbedding')
 
-        self.netSlotAttention_pos = networks.init_net(
-            SlotAttention(num_slots=opt.num_slots, in_dim=p_dim + z_dim, slot_dim=p_dim, iters=opt.attn_iter,
-                          gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
-        self.nets.append(self.netSlotAttention_pos)
-        self.parameters.append(self.netSlotAttention_pos.parameters())
-        self.model_names.append('SlotAttention_pos')
-
-        # [Centroid decoder]
-        self.netCentroidDecoder = networks.init_net(
-            CentroidDecoder(input_dim=p_dim,
-                            z_dim=p_dim,
-                            cam2pixel=self.projection.cam2spixel,
-                            world2nss=self.projection.world2nss,
-                            near=self.projection.near,
-                            far=self.projection.far,
-                            small_latent=self.opt.small_latent,
-                            input_size=torch.tensor(self.opt.input_size).reshape(1).expand(3).cuda(),
-                            n_layers=opt.n_layer),
-            gpu_ids=self.gpu_ids, init_type='xavier')
-        self.parameters.append(self.netCentroidDecoder.parameters())
-        self.nets.append(self.netCentroidDecoder)
-        self.model_names.append('CentroidDecoder')
 
     def setup(self, opt):
         """Load and print networks; create schedulers
@@ -232,10 +237,10 @@ class uorfTrainModel(BaseModel):
 
             # [Compute GT segment centroid]
             if self.opt.predict_centroid:
-                input_size = [self.opt.input_size, self.opt.input_size]
-                _masks = F.interpolate(masks.float(), size=input_size, mode='nearest').flatten(2, 3) # NxKx(HxW)
-                x = torch.arange(input_size[0]).to(self.device) # frustum_size
-                y = torch.arange(input_size[1]).to(self.device) # frustum_size
+                frustum_size = self.projection.frustum_size
+                _masks = F.interpolate(masks.float(), size=frustum_size[0:2], mode='nearest').flatten(2, 3) # NxKx(HxW)
+                x = torch.arange(frustum_size[0]).to(self.device) # frustum_size
+                y = torch.arange(frustum_size[1]).to(self.device) # frustum_size
                 x, y = torch.meshgrid([x, y]) # frustum_sizexfrustum_size
                 x = x.flatten()[None, None] # NxKx(frustum_size)^2
                 y = y.flatten()[None, None] # NxKx(frustum_size)^2
@@ -382,6 +387,7 @@ class uorfTrainModel(BaseModel):
             p_slots, _ = self.netSlotAttention_pos(pos_feat, masks=self.masks, norm_feat=False)  # 1xKxC
 
             # Predict centroid
+            self.netCentroidDecoder.frustum_size = frustum_size
             self.netCentroidDecoder.cam2world = self.cam2world
             _, centroid_nss, centroid_pixel = self.netCentroidDecoder(p_slots.squeeze(0))
 
@@ -393,6 +399,9 @@ class uorfTrainModel(BaseModel):
             self.loss_centroid = self.netCentroidDecoder.centroid_loss(
                 centroid_pixel=centroid_pixel, margin=self.opt.loss_centroid_margin,
                 segment_centers=self.segment_centers, segment_masks=self.segment_masks, epoch=epoch)
+
+            if self.opt.learn_only_centroid:
+                return
 
         raws_density, masked_raws_density, unmasked_raws_density, masks_for_silhouette_density, raw_masks_density = \
             self.netDensityDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, ray_dir_input=ray_dir_input, decoder_type='density')

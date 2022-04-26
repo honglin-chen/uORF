@@ -531,7 +531,7 @@ class Decoder(nn.Module):
 
 
 class CentroidDecoder(nn.Module):
-    def __init__(self, input_dim, z_dim, cam2pixel, world2nss, near, far, input_size, small_latent=False, n_layers=3):
+    def __init__(self, input_dim, z_dim, cam2pixel, world2nss, near, far, small_latent=False, n_layers=3):
         """
         input_dim: pos emb dim + slot dim
         z_dim: network latent dim
@@ -562,7 +562,7 @@ class CentroidDecoder(nn.Module):
         self.world2nss = world2nss
         self.near = near
         self.far = far
-        self.input_size = input_size
+        self.frustum_size = None
         self.cam2world = None
 
     def forward(self, p_slots):
@@ -580,11 +580,11 @@ class CentroidDecoder(nn.Module):
         cam2pixel = self.cam2pixel[None]  # 1x4x4
         pixel2cam = self.cam2pixel.inverse()  # 1x4x4
 
-        input_size = self.input_size
+        frustum_size = self.frustum_size
 
         # [Project predicted centroid]
         z_cam = fg_pos[..., -1] * (self.far - self.near) + self.near  # (K-1)
-        fg_pos = fg_pos * (input_size.unsqueeze(0) - 1)  # [0, 1] -> [0, input_size]
+        fg_pos = fg_pos * (frustum_size.unsqueeze(0) - 1)  # [0, 1] -> [0, frustum_size]
 
         unorm_fg_pos = torch.zeros_like(fg_pos)  # (K-1)x3
         unorm_fg_pos[..., 0:2] = fg_pos[..., 0:2] * z_cam.unsqueeze(-1)
@@ -620,8 +620,8 @@ class CentroidDecoder(nn.Module):
         loss_mask = (segment_area > 0).float().detach()
 
         # Normalize coordinates:
-        pixel_pos = centroid_pixel / self.input_size[0:2].view(1, 1, 2)
-        target_pos = target_pos / self.input_size[0:2].view(1, 1, 2)
+        pixel_pos = centroid_pixel / self.frustum_size[0:2].view(1, 1, 2)
+        target_pos = target_pos / self.frustum_size[0:2].view(1, 1, 2)
 
         # Loss as the euclidean distance between the predicted and target centroid positions
         distance = ((pixel_pos - target_pos) ** 2).sum(-1) ** 0.5
@@ -637,11 +637,11 @@ class CentroidDecoder(nn.Module):
     def visualize_centroid(self, pred_center, target_center, segment_masks, epoch, savedir=None):
         fig, axs = plt.subplots(segment_masks.shape[0], segment_masks.shape[1], figsize=(5, 5))  # Nx3
 
-        center_x = target_center[..., 0] * self.input_size[0]  # Nx3
-        center_y = target_center[..., 1] * self.input_size[1]  # Nx3
+        center_x = target_center[..., 0] * self.frustum_size[0]  # Nx3
+        center_y = target_center[..., 1] * self.frustum_size[1]  # Nx3
 
-        pred_x = pred_center[..., 0] * self.input_size[0]  # Nx3
-        pred_y = pred_center[..., 1] * self.input_size[1]  # Nx3
+        pred_x = pred_center[..., 0] * self.frustum_size[0]  # Nx3
+        pred_y = pred_center[..., 1] * self.frustum_size[1]  # Nx3
 
         for i in range(segment_masks.shape[0]):
             _x = ((self.x[i] + 1) / 2).clone()
@@ -649,7 +649,7 @@ class CentroidDecoder(nn.Module):
             axs[i, 0].imshow(_x.permute(1, 2, 0).cpu())
             axs[i, 0].set_axis_off()
             for j in range(1, segment_masks.shape[1]):
-                axs[i, j].imshow(segment_masks[i, j].cpu().reshape([int(self.input_size[0]), int(self.input_size[1])]))
+                axs[i, j].imshow(segment_masks[i, j].cpu().reshape([int(self.frustum_size[0]), int(self.frustum_size[1])]))
                 center = [center_y[i, j - 1], center_x[i, j - 1]]
                 pred = [pred_y[i, j - 1], pred_x[i, j - 1]]
                 axs[i, j].add_patch(plt.Circle(center, 2.0, color='g'))
