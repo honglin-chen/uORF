@@ -24,8 +24,8 @@ class Projection(object):
                                         [0, 0, 0, 1]]).unsqueeze(0).to(device)
         focal_x = self.focal_ratio[0] * self.frustum_size[0]
         focal_y = self.focal_ratio[1] * self.frustum_size[1]
-        bias_x = (self.frustum_size[0] - 1.) / 2.
-        bias_y = (self.frustum_size[1] - 1.) / 2.
+        bias_x = (self.frustum_size[0] - 0.) / 2.
+        bias_y = (self.frustum_size[1] - 0.) / 2.
         intrinsic_mat = torch.tensor([[focal_x, 0, bias_x, 0],
                                       [0, focal_y, bias_y, 0],
                                       [0, 0, 1, 0],

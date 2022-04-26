@@ -197,8 +197,6 @@ class uorfTrainModel(BaseModel):
         self.L2_loss = nn.MSELoss()
         self.L1_loss = nn.L1Loss()
 
-
-
     def setup(self, opt):
         """Load and print networks; create schedulers
         Parameters:
