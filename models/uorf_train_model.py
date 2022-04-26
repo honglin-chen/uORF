@@ -9,7 +9,8 @@ import os
 import time
 from .projection import Projection
 from torchvision.transforms import Normalize
-from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder, raw2transmittances, raw2colors
+from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder, CentroidDecoder, raw2transmittances, raw2colors
+from .position_encoding import PositionEmbeddingLearned, position_encoding_image
 import pdb
 from util import util
 
@@ -71,7 +72,9 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
         parser.add_argument('--density_n_color', action='store_true', help='separate density encoder and color encoder')
         parser.add_argument('--debug', action='store_true', help='debugging option')
-
+        parser.add_argument('--learn_only_centroid', action='store_true', help='loss function contains only centroid loss')
+        parser.add_argument('--predict_centroid', action='store_true', default=False, help='predict the 3D centroid of the foreground objects')
+        parser.add_argument('--loss_centroid_margin', type=float, default=0.05, help='max margin for the centroid loss')
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=2000, custom_lr=True, lr_policy='warmup')
 
@@ -91,7 +94,7 @@ class uorfTrainModel(BaseModel):
         """
         BaseModel.__init__(self, opt)  # call the initialization method of BaseModel
         print(self.isTrain, 'self.isTrain')
-        self.loss_names = ['recon', 'perc', 'silhouette']
+        self.loss_names = ['recon', 'perc', 'silhouette', 'centroid']
         n = opt.n_img_each_scene
         self.visual_names = ['x{}'.format(i) for i in range(n)] + \
                             ['x_rec{}'.format(i) for i in range(n)] + \
@@ -157,6 +160,40 @@ class uorfTrainModel(BaseModel):
         self.L2_loss = nn.MSELoss()
         self.L1_loss = nn.L1Loss()
 
+        # [Position encoding]
+        p_dim = z_dim
+        self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size], num_pos_feats=p_dim // 2).to(self.device)
+        # self.netPositionEmbedding = networks.init_net(
+        #     PositionEmbeddingLearned(size=[opt.input_size, opt.input_size], num_pos_feats=p_dim // 2),
+        #     gpu_ids=self.gpu_ids, init_type='normal')
+        #
+        # self.nets.append(self.netPositionEmbedding)
+        # self.parameters.append(self.netPositionEmbedding.parameters())
+        # self.model_names.append('PositionEmbedding')
+
+        self.netSlotAttention_pos = networks.init_net(
+            SlotAttention(num_slots=opt.num_slots, in_dim=p_dim + z_dim, slot_dim=p_dim, iters=opt.attn_iter,
+                          gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
+        self.nets.append(self.netSlotAttention_pos)
+        self.parameters.append(self.netSlotAttention_pos.parameters())
+        self.model_names.append('SlotAttention_pos')
+
+        # [Centroid decoder]
+        self.netCentroidDecoder = networks.init_net(
+            CentroidDecoder(input_dim=p_dim,
+                            z_dim=p_dim,
+                            cam2pixel=self.projection.cam2spixel,
+                            world2nss=self.projection.world2nss,
+                            near=self.projection.near,
+                            far=self.projection.far,
+                            small_latent=self.opt.small_latent,
+                            input_size=torch.tensor(self.opt.input_size).reshape(1).expand(3).cuda(),
+                            n_layers=opt.n_layer),
+            gpu_ids=self.gpu_ids, init_type='xavier')
+        self.parameters.append(self.netCentroidDecoder.parameters())
+        self.nets.append(self.netCentroidDecoder)
+        self.model_names.append('CentroidDecoder')
+
     def setup(self, opt):
         """Load and print networks; create schedulers
         Parameters:
@@ -192,6 +229,34 @@ class uorfTrainModel(BaseModel):
             obj_masks = input['obj_masks'].to(self.device)
             masks = torch.cat([bg_masks, obj_masks], dim=1)
             masks = masks[:, :self.opt.num_slots, ...]
+
+            # [Compute GT segment centroid]
+            if self.opt.predict_centroid:
+                input_size = [self.opt.input_size, self.opt.input_size]
+                _masks = F.interpolate(masks.float(), size=input_size, mode='nearest').flatten(2, 3) # NxKx(HxW)
+                x = torch.arange(input_size[0]).to(self.device) # frustum_size
+                y = torch.arange(input_size[1]).to(self.device) # frustum_size
+                x, y = torch.meshgrid([x, y]) # frustum_sizexfrustum_size
+                x = x.flatten()[None, None] # NxKx(frustum_size)^2
+                y = y.flatten()[None, None] # NxKx(frustum_size)^2
+                center_x = (_masks * x).sum(-1) / (_masks.sum(-1) + 1e-12) # NxK
+                center_y = (_masks * y).sum(-1) / (_masks.sum(-1) + 1e-12) # NxK
+                self.segment_masks = _masks
+                self.segment_centers = torch.stack([center_x, center_y], dim=-1) # NxKx2
+
+                # # [Visualization]
+                # fig, axs = plt.subplots(_masks.shape[0], _masks.shape[1]-1, figsize=(10, 5))
+                #
+                # for i in range(_masks.shape[0]):
+                #     for j in range(1, _masks.shape[1]):
+                #         axs[i, j-1].imshow(_masks[i, j].cpu().reshape(frustum_size[0], frustum_size[1]))
+                #         center = [center_y[i, j], center_x[i, j]]
+                #         axs[i, j-1].add_patch(plt.Circle(center, 2.0, color='g'))
+                #         axs[i, j-1].set_axis_off()
+                # plt.show()
+                # plt.savefig('tmp.png')
+                # plt.close()
+
             masks = F.interpolate(masks.float(), size=[128, 128], mode='nearest')
             self.silhouette_masks_fine = masks
             masks = F.interpolate(masks.float(), size=[64, 64], mode='nearest')
@@ -204,6 +269,7 @@ class uorfTrainModel(BaseModel):
         self.loss_recon = 0
         self.loss_perc = 0
         self.loss_silhouette = 0
+        self.loss_centroid = 0
         dev = self.x[0:1].device
         nss2cam0 = self.cam2world[0:1].inverse() if self.opt.fixed_locality else self.cam2world_azi[0:1].inverse()
 
@@ -234,6 +300,7 @@ class uorfTrainModel(BaseModel):
             W, H, D = self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp
             frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
+            frustum_size = torch.Tensor(self.projection.frustum_size).to(self.device)
             x = F.interpolate(self.x, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
             self.z_vals, self.ray_dir = z_vals, ray_dir
         else:
@@ -242,6 +309,7 @@ class uorfTrainModel(BaseModel):
             rs = self.opt.render_size
             frus_nss_coor, z_vals, ray_dir = self.projection_fine.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
+            frustum_size = torch.Tensor(self.projection_fine.frustum_size).to(self.device)
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor.view([N, D, H, W, 3]), z_vals.view([N, H, W, D]), ray_dir.view([N, H, W, 3])
             H_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             W_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
@@ -305,6 +373,26 @@ class uorfTrainModel(BaseModel):
                 pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxDxHxW)xC
                 uv = uv.expand(K, -1, -1)  # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
 
+        # Decoder centroid
+        if self.opt.predict_centroid:
+            pos_embed = self.pos_emb  # self.netPositionEmbedding()
+            pos_feat = torch.cat([pos_embed, feat], dim=-1)
+
+            # Get slot features
+            p_slots, _ = self.netSlotAttention_pos(pos_feat, masks=self.masks, norm_feat=False)  # 1xKxC
+
+            # Predict centroid
+            self.netCentroidDecoder.cam2world = self.cam2world
+            _, centroid_nss, centroid_pixel = self.netCentroidDecoder(p_slots.squeeze(0))
+
+            # Transform sampling coordinates
+            sampling_coor_fg = self.netCentroidDecoder.transform_coords(coords=sampling_coor_fg, centroids=centroid_nss)
+
+            # Compute centroid loss
+            self.netCentroidDecoder.x = self.x
+            self.loss_centroid = self.netCentroidDecoder.centroid_loss(
+                centroid_pixel=centroid_pixel, margin=self.opt.loss_centroid_margin,
+                segment_centers=self.segment_centers, segment_masks=self.segment_masks, epoch=epoch)
 
         raws_density, masked_raws_density, unmasked_raws_density, masks_for_silhouette_density, raw_masks_density = \
             self.netDensityDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, ray_dir_input=ray_dir_input, decoder_type='density')
@@ -351,6 +439,9 @@ class uorfTrainModel(BaseModel):
         if self.opt.silhouette_loss:
             self.loss_silhouette = self.L1_loss(self.silhouette_masks, self.silhouettes) # NxKxHxW
 
+        if self.opt.learn_only_centroid:
+            self.loss_perc = self.loss_recon = self.loss_silhouette = 0.0
+
         with torch.no_grad():
             attn = attn.detach().cpu()  # KxN
             H_, W_ = feature_map.shape[2], feature_map.shape[3]
@@ -394,7 +485,10 @@ class uorfTrainModel(BaseModel):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
         loss = self.loss_recon + self.loss_perc
         if self.opt.silhouette_loss:
-            loss += self.loss_silhouette
+            loss = loss + self.loss_silhouette
+
+        if self.opt.predict_centroid:
+            loss = loss + self.loss_centroid
         loss.backward()
         self.loss_perc = self.loss_perc / self.weight_percept if self.weight_percept > 0 else self.loss_perc
 

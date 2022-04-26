@@ -8,7 +8,8 @@ from torchvision.models import vgg16
 from torch import autograd
 from .networks import get_norm_layer
 from .resnetfc import ResnetFC
-
+import os
+import matplotlib.pyplot as plt
 
 class Encoder(nn.Module):
     def __init__(self, input_nc=3, z_dim=64, bottom=False):
@@ -336,7 +337,7 @@ class ImageEncoder(nn.Module):
 
 class Decoder(nn.Module):
     def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7,
-                 fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False, decoder_type=None, predict_centroid=False):
+                 fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False, decoder_type=None):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -358,7 +359,6 @@ class Decoder(nn.Module):
         self.small_latent = small_latent
         self.no_concatenate = no_concatenate
         self.pixel_dim = pixel_dim
-        self.predict_centroid = predict_centroid
 
         if use_ray_dir:
             input_dim += 3
@@ -390,23 +390,6 @@ class Decoder(nn.Module):
         self.f_color = nn.Sequential(nn.Linear(latent_dim, latent_dim//4),
                                      nn.ReLU(True),
                                      nn.Linear(latent_dim//4, 3))
-
-        if self.predict_centroid:
-            before_skip = [nn.Linear(z_dim, latent_dim), nn.ReLU(True)]
-            after_skip = [nn.Linear(latent_dim + z_dim, latent_dim), nn.ReLU(True)]
-            for i in range(n_layers - 1):
-                before_skip.append(nn.Linear(latent_dim, latent_dim))
-                before_skip.append(nn.ReLU(True))
-                after_skip.append(nn.Linear(latent_dim, latent_dim))
-                after_skip.append(nn.ReLU(True))
-
-            self.p_before = nn.Sequential(*before_skip)
-            self.p_after = nn.Sequential(*after_skip)
-            self.p_after_latent = nn.Linear(latent_dim, latent_dim)
-            self.p_pos = nn.Sequential(nn.Linear(latent_dim, latent_dim // 4),
-                                         nn.ReLU(True),
-                                         nn.Linear(latent_dim // 4, 3))
-
         if pixel_dim is not None and bg_no_pixel and not no_concatenate:
             input_dim += -pixel_dim
         before_skip = [nn.Linear(input_dim, latent_dim), nn.ReLU(True)]
@@ -433,7 +416,7 @@ class Decoder(nn.Module):
         #     self.substitute_pixel_feat = torch.nn.Parameter(torch.zeros(pixel_dim))
 
     def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None,
-                ray_dir_input=None, transmittance_samples=None, raw_masks_density=None, decoder_type=None, silhouettes=None, p_slots=None):
+                ray_dir_input=None, transmittance_samples=None, raw_masks_density=None, decoder_type=None, silhouettes=None):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -453,65 +436,14 @@ class Decoder(nn.Module):
         #     pixel_feat *= transmittance_samples
         #     pixel_feat += self.substitute_pixel_feat[None, None, ...].expand(K, P, -1) * (1. - transmittance_samples) # this option was previous behavior, I thought that it is quite hard coding
 
-        if self.predict_centroid:
-            assert p_slots is not None
-            p_fg = p_slots[1:]  # (K-1)xC
-            tmp = self.p_before(p_fg)
-            tmp = self.p_after(torch.cat([p_fg, tmp], dim=1))
-            latent = self.p_after_latent(tmp)
-            fg_pos = self.p_pos(latent)
-            fg_pos = fg_pos.sigmoid() # (K-1)x3
-
-            cam02world = self.cam2world[0]  # 4x4
-            world2cam = self.cam2world.inverse()  # Nx4x4
-            cam2pixel = self.cam2pixel[None]  # 1x4x4
-            pixel2cam = self.pixel2cam  # 1x4x4
-            world2nss = self.world2nss # 1x4x4
-            frustum_size = self.frustum_size
-
-            def project_pos(fg_pos):
-
-                z_cam = fg_pos[..., -1] * (self.far - self.near) + self.near  # (K-1)
-                fg_pos = fg_pos * (frustum_size.unsqueeze(0) - 1)  # [0, 1] -> [0, frustum_size]
-
-                unorm_fg_pos = torch.zeros_like(fg_pos)  # (K-1)x3
-                unorm_fg_pos[..., 0:2] = fg_pos[..., 0:2] * z_cam.unsqueeze(-1)
-                unorm_fg_pos[..., 2] = z_cam
-
-                fg_pixel0_pos = torch.cat([unorm_fg_pos, torch.ones_like(fg_pos[:, 0:1])], dim=-1)  # (K-1)x4
-                fg_pixel0_pos = fg_pixel0_pos.permute(1, 0)  # 4x(K-1)
-                fg_cam0_pos = torch.matmul(pixel2cam, fg_pixel0_pos)  # 4x4, 4x(K-1) -> 4x(K-1)
-                fg_world_pos = torch.matmul(cam02world, fg_cam0_pos)  # 4x4, 4x(K-1) -> 4x(K-1)
-                fg_cam_pos = torch.matmul(world2cam, fg_world_pos)  # Nx4x4,4x(K-1) -> Nx4x(K-1)
-                fg_pixel_pos = torch.matmul(cam2pixel, fg_cam_pos)  # 1x4x4, Nx4x(K-1) -> Nx4x(K-1)
-                fg_pixel_pos = fg_pixel_pos.permute(0, 2, 1)  # Nx(K-1)x4
-
-                fg_pixel_pos = fg_pixel_pos[:, :, 0:2] / fg_pixel_pos[:, :, 2:3]  # Nx(K-1)x4
-                return fg_world_pos, fg_pixel_pos
-
-            world_pos, pixel_pos = project_pos(fg_pos)
-            pixel_pos = torch.flip(pixel_pos, dims=(-1,))
-
-        else:
-            pixel_pos = None
-            world_pos = None
-
         if self.fixed_locality:
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
             sampling_coor_fg = torch.cat([sampling_coor_fg, torch.ones_like(sampling_coor_fg[:, :, 0:1])], dim=-1)  # (K-1)xPx4
             sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx4x1
             sampling_coor_fg = sampling_coor_fg.squeeze(-1)[:, :, :3]  # (K-1)xPx3
-            assert self.predict_centroid is False, 'not implemented not fixed_locaity'
         else:
             sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx3x1
             sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
-
-            if self.predict_centroid:
-                world_pos_nss = torch.matmul(world2nss, world_pos)  # 1x4x4, 4x(K-1) -> 1x4x(K-1)
-                world_pos_nss = world_pos_nss[:, 0:3].permute(0, 2, 1) # 1x(K-1)x3
-                world_pos_nss = torch.matmul(fg_transform[None], world_pos_nss[..., None])  # 1x3x3, 1x(K-1)x3 -> 1x(K-1)x3x1
-                world_pos_nss = world_pos_nss.squeeze(0).permute(0, 2, 1)
-                sampling_coor_fg = sampling_coor_fg - world_pos_nss
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
             z_out_idx_fg = torch.any(sampling_coor_fg[..., 2:3] < 0.1, dim=-1)
             z_out_idx_bg = torch.any(sampling_coor_bg[None, ..., 2:3] < 0.1, dim=-1)
@@ -519,8 +451,6 @@ class Decoder(nn.Module):
         query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
         sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
         query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
-
-
         if self.use_ray_dir:
             query_bg = torch.cat([query_bg, ray_dir_input], dim=1)
             query_fg_ex = torch.cat([query_fg_ex, ray_dir_input[None, ...].expand(K-1, -1, -1).flatten(0, 1)], dim=1)
@@ -597,7 +527,165 @@ class Decoder(nn.Module):
         if decoder_type=='density':
             return raws, masked_raws, unmasked_raws, masks, raw_masks
 
-        return raws, masked_raws, unmasked_raws, masks, pixel_pos
+        return raws, masked_raws, unmasked_raws, masks
+
+
+class CentroidDecoder(nn.Module):
+    def __init__(self, input_dim, z_dim, cam2pixel, world2nss, near, far, input_size, small_latent=False, n_layers=3):
+        """
+        input_dim: pos emb dim + slot dim
+        z_dim: network latent dim
+        n_layers: #layers before/after skip connection.
+        """
+        super().__init__()
+
+        latent_dim = z_dim // 2 if small_latent else z_dim
+
+        # [Create centroid decoder]
+        before_skip = [nn.Linear(input_dim, latent_dim), nn.ReLU(True)]
+        after_skip = [nn.Linear(latent_dim + input_dim, latent_dim), nn.ReLU(True)]
+        for i in range(n_layers - 1):
+            before_skip.append(nn.Linear(latent_dim, latent_dim))
+            before_skip.append(nn.ReLU(True))
+            after_skip.append(nn.Linear(latent_dim, latent_dim))
+            after_skip.append(nn.ReLU(True))
+
+        self.p_before = nn.Sequential(*before_skip)
+        self.p_after = nn.Sequential(*after_skip)
+        self.p_after_latent = nn.Linear(latent_dim, latent_dim)
+        self.p_pos = nn.Sequential(nn.Linear(latent_dim, latent_dim // 4),
+                                     nn.ReLU(True),
+                                     nn.Linear(latent_dim // 4, 3))
+
+        # [Set attributes]
+        self.cam2pixel = cam2pixel
+        self.world2nss = world2nss
+        self.near = near
+        self.far = far
+        self.input_size = input_size
+        self.cam2world = None
+
+    def forward(self, p_slots):
+
+        assert p_slots is not None
+        p_fg = p_slots[1:]  # (K-1)xC
+        tmp = self.p_before(p_fg)
+        tmp = self.p_after(torch.cat([p_fg, tmp], dim=1))
+        latent = self.p_after_latent(tmp)
+        fg_pos = self.p_pos(latent)
+        fg_pos = fg_pos.sigmoid() # (K-1)x3
+
+        cam02world = self.cam2world[0]  # 4x4
+        world2cam = self.cam2world.inverse()  # Nx4x4
+        cam2pixel = self.cam2pixel[None]  # 1x4x4
+        pixel2cam = self.cam2pixel.inverse()  # 1x4x4
+
+        input_size = self.input_size
+
+        # [Project predicted centroid]
+        z_cam = fg_pos[..., -1] * (self.far - self.near) + self.near  # (K-1)
+        fg_pos = fg_pos * (input_size.unsqueeze(0) - 1)  # [0, 1] -> [0, input_size]
+
+        unorm_fg_pos = torch.zeros_like(fg_pos)  # (K-1)x3
+        unorm_fg_pos[..., 0:2] = fg_pos[..., 0:2] * z_cam.unsqueeze(-1)
+        unorm_fg_pos[..., 2] = z_cam
+
+        fg_pixel0_pos = torch.cat([unorm_fg_pos, torch.ones_like(fg_pos[:, 0:1])], dim=-1)  # (K-1)x4
+        fg_pixel0_pos = fg_pixel0_pos.permute(1, 0)  # 4x(K-1)
+        fg_cam0_pos = torch.matmul(pixel2cam, fg_pixel0_pos)  # 4x4, 4x(K-1) -> 4x(K-1)
+        fg_centroid_world = torch.matmul(cam02world, fg_cam0_pos)  # 4x4, 4x(K-1) -> 4x(K-1)
+        fg_centroid_cam = torch.matmul(world2cam, fg_centroid_world)  # Nx4x4,4x(K-1) -> Nx4x(K-1)
+        fg_centroid_pixel = torch.matmul(cam2pixel, fg_centroid_cam)  # 1x4x4, Nx4x(K-1) -> Nx4x(K-1)
+        fg_centroid_pixel = fg_centroid_pixel.permute(0, 2, 1)  # Nx(K-1)x4
+
+        fg_centroid_pixel = fg_centroid_pixel[:, :, 0:2] / fg_centroid_pixel[:, :, 2:3]  # Nx(K-1)x2
+        fg_centroid_pixel = torch.flip(fg_centroid_pixel, dims=(-1,))
+
+        fg_centroid_nss = torch.matmul(self.world2nss, fg_centroid_world)  # 1x4x4, 4x(K-1) -> 1x4x(K-1)
+
+        fg_centroid_world = fg_centroid_world.permute(1, 0) # (K-1)x4
+        fg_centroid_nss = fg_centroid_nss[0].permute(1, 0)  # (K-1)x4
+
+        return fg_centroid_world, fg_centroid_nss, fg_centroid_pixel
+
+    def transform_coords(self, coords, centroids):
+        # coords: (K-1)xPx3,  cenroids: (K-1)x4
+        centroids = centroids[:, 0:3].unsqueeze(1)  # (K-1)x1x3
+        return coords - centroids  # (K-1)xPx3
+
+    def centroid_loss(self, centroid_pixel, margin, segment_centers, segment_masks, epoch):
+        # Target centroid positions
+        target_pos = segment_centers[:, 1:]  # Nx(K-1)x2
+        segment_area = segment_masks[:, 1:].sum(-1)  # Nx(K-1)x1
+        loss_mask = (segment_area > 0).float().detach()
+
+        # Normalize coordinates:
+        pixel_pos = centroid_pixel / self.input_size[0:2].view(1, 1, 2)
+        target_pos = target_pos / self.input_size[0:2].view(1, 1, 2)
+
+        # Loss as the euclidean distance between the predicted and target centroid positions
+        distance = ((pixel_pos - target_pos) ** 2).sum(-1) ** 0.5
+        self.loss_centroid_raw = (distance - margin).clamp(min=0.) * loss_mask
+        self.loss_centroid = ((distance - margin).clamp(min=0.) * loss_mask).sum()
+
+        # [Visualization]
+        if not os.path.exists('tmp/%d.png' % epoch):
+            self.visualize_centroid(pixel_pos, target_pos, segment_masks, epoch=epoch)
+
+        return self.loss_centroid
+
+    def visualize_centroid(self, pred_center, target_center, segment_masks, epoch, savedir=None):
+        fig, axs = plt.subplots(segment_masks.shape[0], segment_masks.shape[1], figsize=(5, 5))  # Nx3
+
+        center_x = target_center[..., 0] * self.input_size[0]  # Nx3
+        center_y = target_center[..., 1] * self.input_size[1]  # Nx3
+
+        pred_x = pred_center[..., 0] * self.input_size[0]  # Nx3
+        pred_y = pred_center[..., 1] * self.input_size[1]  # Nx3
+
+        for i in range(segment_masks.shape[0]):
+            _x = ((self.x[i] + 1) / 2).clone()
+
+            axs[i, 0].imshow(_x.permute(1, 2, 0).cpu())
+            axs[i, 0].set_axis_off()
+            for j in range(1, segment_masks.shape[1]):
+                axs[i, j].imshow(segment_masks[i, j].cpu().reshape([int(self.input_size[0]), int(self.input_size[1])]))
+                center = [center_y[i, j - 1], center_x[i, j - 1]]
+                pred = [pred_y[i, j - 1], pred_x[i, j - 1]]
+                axs[i, j].add_patch(plt.Circle(center, 2.0, color='g'))
+                axs[i, j].add_patch(plt.Circle(pred, 2.0, color='r'))
+                axs[i, j].set_axis_off()
+                axs[i, j].set_title('dist: %.2f' % self.loss_centroid_raw[i, j-1], fontsize=10)
+        plt.show()
+        fig.suptitle('Centroid loss: %.3f' % self.loss_centroid)
+        if savedir is None:
+            plt.savefig('tmp/%d.png' % epoch, bbox_inches='tight')
+        else:
+            plt.savefig('tmp/%s.png' % savedir, bbox_inches='tight')
+
+        plt.close()
+
+        # Save data for visualization
+        # data = {
+        #     'img': (self.x + 1) / 2,
+        #     'world_pos': world_pos,
+        #     'segment': segment_masks
+        # }
+        # print('Save data to ', './save_tensor/%d.pt' % epoch)
+        # torch.save(data, './save_tensor/%d.pt' % epoch)
+
+        # Visualize the line of projection with varying depth
+        # if epoch > 100000:
+        #
+        #     num = 20
+        #     interval = 1.0 / num
+        #     temp_pos = save_fg_pos.clone()
+        #
+        #     for i in range(num):
+        #         temp_pos[:, -1] = i * interval
+        #         temp_uv = project_pos(temp_pos)
+        #         plot(temp_uv, savedir='%d-%d' % (epoch, i))
+        #     breakpoint()
 
 class PixelDecoder(nn.Module):
     def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, pixel_positional_encoding=None, use_ray_dir=None, slot_repeat=None):
