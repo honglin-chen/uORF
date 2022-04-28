@@ -14,8 +14,8 @@ class MultiscenesDataset(BaseDataset):
     @staticmethod
     def modify_commandline_options(parser, is_train):
         parser.set_defaults(input_nc=3, output_nc=3)
-        parser.add_argument('--n_scenes', type=int, default=100, help='dataset length is #scenes')
-        parser.add_argument('--n_img_each_scene', type=int, default=2, help='for each scene, how many images to load in a batch')
+        parser.add_argument('--n_scenes', type=int, default=1000, help='dataset length is #scenes')
+        parser.add_argument('--n_img_each_scene', type=int, default=10, help='for each scene, how many images to load in a batch')
         parser.add_argument('--no_shuffle', action='store_true')
         parser.add_argument('--mask_size', type=int, default=128)
         return parser

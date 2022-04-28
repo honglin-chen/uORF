@@ -18,7 +18,7 @@ from piq import ssim as compute_ssim
 from piq import psnr as compute_psnr
 
 
-class uorfEvalModel(BaseModel):
+class uorfExtractMeshModel(BaseModel):
 
     @staticmethod
     def modify_commandline_options(parser, is_train=True):
@@ -35,14 +35,14 @@ class uorfEvalModel(BaseModel):
         parser.add_argument('--z_dim', type=int, default=64, help='Dimension of individual z latent per slot')
         parser.add_argument('--attn_iter', type=int, default=3, help='Number of refine iteration in slot attention')
         parser.add_argument('--nss_scale', type=float, default=7, help='Scale of the scene, related to camera matrix')
-        parser.add_argument('--render_size', type=int, default=64, help='Shape of patch to render each forward process. Must be Frustum_size/(2^N) where N=0,1,..., Smaller values cost longer time but require less GPU memory.')
+        parser.add_argument('--render_size', type=int, default=8, help='Shape of patch to render each forward process. Must be Frustum_size/(2^N) where N=0,1,..., Smaller values cost longer time but require less GPU memory.')
         parser.add_argument('--obj_scale', type=float, default=4.5, help='Scale for locality on foreground objects')
         parser.add_argument('--n_freq', type=int, default=5, help='how many increased freq?')
-        parser.add_argument('--n_samp', type=int, default=64, help='num of samp per ray')
+        parser.add_argument('--n_samp', type=int, default=256, help='num of samp per ray')
         parser.add_argument('--n_layer', type=int, default=3, help='num of layers bef/aft skip link in decoder')
         parser.add_argument('--bottom', action='store_true', help='one more encoder layer on bottom')
         parser.add_argument('--input_size', type=int, default=128)
-        parser.add_argument('--frustum_size', type=int, default=64, help='Size of rendered images')
+        parser.add_argument('--frustum_size', type=int, default=256, help='Size of rendered images')
         parser.add_argument('--near_plane', type=float, default=1)
         parser.add_argument('--far_plane', type=float, default=15)
         parser.add_argument('--fixed_locality', action='store_true', help='enforce locality in world space instead of transformed view space')
@@ -248,6 +248,7 @@ class uorfEvalModel(BaseModel):
         W, H, D = self.projection.frustum_size
         scale = H // self.opt.render_size
         if self.opt.extract_mesh:
+            print('extract mesh mode: use projection_mesh')
             frus_nss_coor, z_vals, ray_dir = self.projection_mesh.construct_sampling_coor(cam2world, partitioned=True)
         else:
             frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world, partitioned=True)

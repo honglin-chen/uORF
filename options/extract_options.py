@@ -6,7 +6,7 @@ import models
 import data
 
 
-class BaseOptions():
+class ExtractOptions():
     """This class defines options used during both training and test time.
 
     It also implements several helper functions such as parsing, printing, and saving the options.
@@ -20,14 +20,16 @@ class BaseOptions():
     def initialize(self, parser):
         """Define the common options that are used in both training and test."""
         # basic parameters
+        # 13000, run-2022-04-24-16-41-21
+        # 13020, run-2022-04-26-01-04-16
         parser.add_argument('--dataroot', default='tdw_multiview_texture', help='path to images (should have subfolders trainA, trainB, valA, valB, etc)') # required=True,
-        parser.add_argument('--name', type=str, default='experiment_name', help='name of the experiment. It decides where to store samples and models')
-        parser.add_argument('--exp_id', type=str, help='id of the experiment for distinguishing different experiment settings. It decides where to store.')
+        parser.add_argument('--name', type=str, default='13020', help='name of the experiment. It decides where to store samples and models')
+        parser.add_argument('--exp_id', type=str, default='run-2022-04-26-01-04-16', help='id of the experiment for distinguishing different experiment settings. It decides where to store.')
         parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
-        parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints', help='models are saved here')
+        parser.add_argument('--checkpoints_dir', type=str, default='/data2/wanhee/uORF/checkpoints', help='models are saved here')
         parser.add_argument('--seed', type=int, default=2021, help='Random seed for the experiment')
         # model parameters
-        parser.add_argument('--model', type=str, default='uorf_eval', help='chooses which model to use. [cycle_gan | pix2pix | test | colorization]')
+        parser.add_argument('--model', type=str, default='uorf_extract_mesh', help='chooses which model to use. [cycle_gan | pix2pix | test | colorization]')
         parser.add_argument('--input_nc', type=int, default=3, help='# of input image channels: 3 for RGB and 1 for grayscale')
         parser.add_argument('--output_nc', type=int, default=3, help='# of output image channels: 3 for RGB and 1 for grayscale')
         # dataset parameters
@@ -35,7 +37,7 @@ class BaseOptions():
         parser.add_argument('--serial_batches', action='store_true', help='if true, takes images in order to make batches, otherwise takes them randomly')
         parser.add_argument('--num_threads', default=0, type=int, help='# threads for loading data')
         parser.add_argument('--batch_size', type=int, default=1, help='input batch size')
-        parser.add_argument('--load_size', type=int, default=128, help='scale images to this size')
+        # parser.add_argument('--load_size', type=int, default=128, help='scale images to this size')
         parser.add_argument('--max_dataset_size', type=int, default=float("inf"), help='Maximum number of samples allowed per dataset. If the dataset directory contains more than max_dataset_size, only a subset is loaded.')
         # additional parameters
         parser.add_argument('--epoch', type=str, default='latest', help='which epoch to load? set to latest to use latest cached model')
@@ -52,6 +54,41 @@ class BaseOptions():
         parser.add_argument('--display_env', type=str, default='main',
                             help='visdom display environment name (default is "main")')
         parser.add_argument('--display_port', type=int, default=8097, help='visdom port of the web display')
+
+        # test param
+        parser.add_argument('--results_dir', type=str, default='./extract_mesh/', help='saves results here.')
+        parser.add_argument('--aspect_ratio', type=float, default=1.0, help='aspect ratio of result images')
+        parser.add_argument('--phase', type=str, default='test', help='train, val, test, etc')
+        # Dropout and Batchnorm has different behavioir during training and test.
+        parser.add_argument('--eval', action='store_true', help='use eval mode during test time.')
+        parser.add_argument('--testset_name', type=str, default='testset')
+        parser.add_argument('-f', type=str, default=None, help='just for compatibility with jupyter notebook') # TODO: handle this
+        self.isTrain = False
+
+        # ETC.
+        # parser.add_argument('--n_scenes', default=1)
+        # parser.add_argument('--n_img_each_scene', default=4)
+        # parser.add_argument('--load_size', default=128)
+        # parser.add_argument('--input_size', default=128)
+        # parser.add_argument('--render_size', default=8)
+        # parser.add_argument('--frustum_size', default=128)
+        # parser.add_argument('--n_samp', default=128)
+        # parser.add_argument('--z_dim', default=64)
+        # parser.add_argument('--num_slots', default=4)
+        # parser.add_argument('--model', default=64)
+        # parser.add_argument('--focal_ratio', default=(0.9605, 0.9605))
+        # parser.add_argument('--near_plane', default=1)
+        # parser.add_argument('--far_plane', default=15)
+
+        # parser.add_argument('--gt_seg', default=True)
+        # parser.add_argument('--pixel_encoder', default=True)
+        # parser.add_argument('--mask_image_feature', default=True)
+        # parser.add_argument('--mask_image', default=True)
+        # parser.add_argument('--use_ray_dir', default=False)
+        # parser.add_argument('--silhouette_loss', default=True)
+        # parser.add_argument('--weight_pixelfeat', default=True)
+        # parser.add_argument('--bg_no_pixel', default=True)
+        # parser.add_argument('--extract_mesh', default=True)
 
         self.initialized = True
         return parser
