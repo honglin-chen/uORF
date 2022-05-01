@@ -337,7 +337,8 @@ class ImageEncoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7,
                  fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False, decoder_type=None,
-                 restrict_world=False, reduce_color_decoder=False, density_as_color_input=False, mask_as_decoder_input=False):
+                 restrict_world=False, reduce_color_decoder=False, density_as_color_input=False, mask_as_decoder_input=False,
+                 ray_after_density=False, multiply_mask_pixelfeat=False, same_bg_fg_decoder=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -363,17 +364,27 @@ class Decoder(nn.Module):
         self.reduce_color_decoder = reduce_color_decoder
         self.density_as_color_input = density_as_color_input
         self.mask_as_decoder_input = mask_as_decoder_input
+        self.ray_after_density = ray_after_density
+        self.multiply_mask_pixelfeat = multiply_mask_pixelfeat
+        self.same_bg_fg_decoder = same_bg_fg_decoder
+        if ray_after_density:
+            assert use_ray_dir
+            ray_dir_dim = 3
+        else:
+            ray_dir_dim = 0
+        if multiply_mask_pixelfeat:
+            assert mask_as_decoder_input
 
         if density_as_color_input:
             input_dim += 1
         if mask_as_decoder_input:
-            input_dim += 1
+            input_dim += 1 if not self.multiply_mask_pixelfeat else pixel_dim
         if use_ray_dir:
-            input_dim += 3
+            input_dim += 3 if not self.ray_after_density else 0
         if decoder_type=='color':
             input_dim += 1
             if not mask_as_decoder_input:
-                input_dim += 1
+                input_dim += 1 if not self.multiply_mask_pixelfeat else pixel_dim
         if pixel_dim is not None or 0:
             if self.no_concatenate:
                 pass
@@ -399,7 +410,7 @@ class Decoder(nn.Module):
         self.f_after = nn.Sequential(*after_skip)
         self.f_after_latent = nn.Linear(latent_dim, latent_dim)
         self.f_after_shape = nn.Linear(latent_dim, self.out_ch - 3)
-        self.f_color = nn.Sequential(nn.Linear(latent_dim, latent_dim//4),
+        self.f_color = nn.Sequential(nn.Linear(latent_dim + ray_dir_dim, latent_dim//4),
                                      nn.ReLU(True),
                                      nn.Linear(latent_dim//4, 3))
         if pixel_dim is not None and bg_no_pixel and not no_concatenate:
@@ -413,9 +424,19 @@ class Decoder(nn.Module):
             after_skip.append(nn.ReLU(True))
         if self.reduce_color_decoder:
             after_skip = []
-        after_skip.append(nn.Linear(latent_dim, self.out_ch))
+        if self.ray_after_density or self.same_bg_fg_decoder:
+            pass
+        else:
+            after_skip.append(nn.Linear(latent_dim, self.out_ch))
         self.b_before = nn.Sequential(*before_skip)
         self.b_after = nn.Sequential(*after_skip)
+        if self.ray_after_density or self.same_bg_fg_decoder:
+            assert not self.reduce_color_decoder
+            self.b_after_latent = nn.Linear(latent_dim, latent_dim)
+            self.b_after_shape = nn.Linear(latent_dim, self.out_ch - 3)
+            self.b_color = nn.Sequential(nn.Linear(latent_dim + ray_dir_dim, latent_dim // 4),
+                                         nn.ReLU(True),
+                                         nn.Linear(latent_dim // 4, 3))
 
         if self.no_concatenate:
             self.change_dim = nn.Linear(pixel_dim, z_dim)
@@ -463,9 +484,9 @@ class Decoder(nn.Module):
             z_out_idx_bg = torch.any(sampling_coor_bg[None, ..., 2:3] < 0.1, dim=-1)
             if self.restrict_world:
                 nss_scale = 7
-                outside_world_x = torch.logical_not(torch.any(-5./nss_scale < sampling_coor_bg[..., 0:1], dim=-1).unsqueeze(-1) | torch.any(sampling_coor_bg[..., 0:1] < 5./nss_scale, dim=-1).unsqueeze(-1))
-                outside_world_y = torch.logical_not(torch.any(-5./nss_scale < sampling_coor_bg[..., 1:2], dim=-1).unsqueeze(-1) | torch.any(sampling_coor_bg[..., 1:2] < 5./nss_scale, dim=-1).unsqueeze(-1))
-                outside_world_z = torch.logical_not(torch.any(-0./nss_scale < sampling_coor_bg[..., 2:3], dim=-1).unsqueeze(-1) | torch.any(sampling_coor_bg[..., 2:3] < 10./nss_scale, dim=-1).unsqueeze(-1))
+                outside_world_x = torch.logical_not(torch.any(-5.0/nss_scale < sampling_coor_bg[..., 0:1], dim=-1).unsqueeze(-1) & torch.any(sampling_coor_bg[..., 0:1] < 5.0/nss_scale, dim=-1).unsqueeze(-1))
+                outside_world_y = torch.logical_not(torch.any(-5.0/nss_scale < sampling_coor_bg[..., 1:2], dim=-1).unsqueeze(-1) & torch.any(sampling_coor_bg[..., 1:2] < 5.0/nss_scale, dim=-1).unsqueeze(-1))
+                outside_world_z = torch.logical_not(torch.any(-0./nss_scale < sampling_coor_bg[..., 2:3], dim=-1).unsqueeze(-1) & torch.any(sampling_coor_bg[..., 2:3] < 6.0/nss_scale, dim=-1).unsqueeze(-1)) # 0, 6
                 outside_world_idx = outside_world_x | outside_world_y | outside_world_z
                 outside_world_idx = outside_world_idx.unsqueeze(0)
 
@@ -473,8 +494,9 @@ class Decoder(nn.Module):
         sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
         query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
         if self.use_ray_dir:
-            query_bg = torch.cat([query_bg, ray_dir_input], dim=1)
-            query_fg_ex = torch.cat([query_fg_ex, ray_dir_input[None, ...].expand(K-1, -1, -1).flatten(0, 1)], dim=1)
+            if not self.ray_after_density:
+                query_bg = torch.cat([query_bg, ray_dir_input], dim=1)
+                query_fg_ex = torch.cat([query_fg_ex, ray_dir_input[None, ...].expand(K-1, -1, -1).flatten(0, 1)], dim=1)
 
         if no_concatenate and pixel_feat is not None:
             if pixel_feat==None:
@@ -512,9 +534,13 @@ class Decoder(nn.Module):
             '''
             silhouettes: # NxDxKxHxW
             '''
-            silhouettes = silhouettes.permute([2, 0, 1, 3, 4]).flatten(1, 4).unsqueeze(-1) # Kx(NxDxHxW)x1
-            input_bg = torch.cat([input_bg, silhouettes[0]], dim=1)
-            input_fg = torch.cat([input_fg, silhouettes[1:].flatten(0, 1)], dim=1)
+            silhouettes = silhouettes.permute([2, 0, 1, 3, 4]).flatten(1, 4).unsqueeze(-1)  # Kx(NxDxHxW)x1
+            if self.multiply_mask_pixelfeat:
+                input_bg = torch.cat([input_bg, silhouettes[0] * pixel_feat[0:1].squeeze(0)], dim=1)
+                input_fg = torch.cat([input_fg, silhouettes[1:].flatten(0, 1) * pixel_feat[1:].flatten(0, 1)], dim=1)
+            else:
+                input_bg = torch.cat([input_bg, silhouettes[0]], dim=1)
+                input_fg = torch.cat([input_fg, silhouettes[1:].flatten(0, 1)], dim=1)
 
         if self.density_as_color_input:
             assert raw_masks_density != None, 'density should not be None'
@@ -524,10 +550,18 @@ class Decoder(nn.Module):
         # print(input_bg.shape, 'input_bg.shape')
         # print(input_fg.shape, 'input_fg.shape')
         tmp = self.b_before(input_bg)
-        if self.reduce_color_decoder:
-            bg_raws = self.b_after(tmp).view([1, P, self.out_ch])
+        if (self.use_ray_dir and self.ray_after_density) or self.same_bg_fg_decoder:
+            tmp = self.b_after(torch.cat([input_bg, tmp], dim=1))
+            latent_bg = self.b_after_latent(tmp)
+            latent_bg = torch.cat([latent_bg, ray_dir_input], dim=1)
+            bg_raw_rgb = self.b_color(latent_bg).view(1, P, 3)
+            bg_raw_shape = self.b_after_shape(tmp).view(1, P, 1)
+            bg_raws = torch.cat([bg_raw_rgb, bg_raw_shape], dim=-1)
         else:
-            bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
+            if self.reduce_color_decoder:
+                bg_raws = self.b_after(tmp).view([1, P, self.out_ch])
+            else:
+                bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
 
         tmp = self.f_before(input_fg)
         if self.reduce_color_decoder:
@@ -535,6 +569,9 @@ class Decoder(nn.Module):
         else:
             tmp = self.f_after(torch.cat([input_fg, tmp], dim=1))  # ((K-1)xP)x64
         latent_fg = self.f_after_latent(tmp)  # ((K-1)xP)x64
+        if self.use_ray_dir:
+            if self.ray_after_density:
+                latent_fg = torch.cat([latent_fg, ray_dir_input[None, ...].expand(K-1, -1, -1).flatten(0, 1)], dim=1)
         fg_raw_rgb = self.f_color(latent_fg).view([K-1, P, 3])  # ((K-1)xP)x3 -> (K-1)xPx3
         fg_raw_shape = self.f_after_shape(tmp).view([K - 1, P])  # ((K-1)xP)x1 -> (K-1)xP, density
         if self.locality:
@@ -838,7 +875,9 @@ def sin_emb(x, n_freq=5, keep_ori=True):
     embedded_ = torch.cat(embedded, dim=1)
     return embedded_
 
-def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, uvw=None, KNDHW=None, return_transmittance_cam0=False, input_transmittance_cam0=None, return_silhouettes=None, transmittance_samples=None):
+def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, uvw=None, KNDHW=None,
+                return_transmittance_cam0=False, input_transmittance_cam0=None, return_silhouettes=None,
+                transmittance_samples=None, masks=None):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.

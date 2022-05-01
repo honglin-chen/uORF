@@ -45,8 +45,10 @@ class MultiscenesDataset(BaseDataset):
         filenames_set = image_filenames_set - mask_filenames_set - fg_mask_filenames_set - moved_filenames_set - changed_filenames_set - bg_in_filenames_set - bg_mask_filenames_set - bg_in_mask_filenames_set
         filenames = sorted(list(filenames_set))
         self.scenes = []
-        for i in range(self.n_scenes):
+        skip = 0
+        for i in range(skip, skip+self.n_scenes):
             scene_filenames = [x for x in filenames if 'sc{:04d}'.format(i) in x]
+            # print(scene_filenames)
             self.scenes.append(scene_filenames)
 
     def _transform(self, img):

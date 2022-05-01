@@ -14,7 +14,7 @@ python train.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_each_scene 4  \
     --gt_seg --pixel_encoder --mask_image --use_ray_dir --silhouette_loss --weight_pixelfeat --bg_no_pixel \
     --save_latest_freq 500 \
     --reduce_color_decoder --density_as_color_input --mask_as_decoder_input \
-#    --continue_train --exp_id 'run-2022-04-24-16-41-21' \
+    --continue_train --exp_id 'run-2022-04-28-11-35-39' \
 
 # done
 echo "Done"

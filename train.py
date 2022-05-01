@@ -29,7 +29,10 @@ if __name__ == '__main__':
         model.opt.stage = 'coarse' if epoch < opt.coarse_epoch else 'fine'
         if opt.silhouette_loss:
             model.opt.silhouette_loss = True if epoch < 10000 else False
-        model.netDensityDecoder.locality = True if epoch < opt.no_locality_epoch else False
+        if opt.unified_decoder:
+            model.netDecoder.locality = True if epoch < opt.no_locality_epoch else False
+        else:
+            model.netDensityDecoder.locality = True if epoch < opt.no_locality_epoch else False
         for i, data in enumerate(dataset):  # inner loop within one epoch
             iter_start_time = time.time()  # timer for computation per iteration
             if total_iters % opt.print_freq == 0:
