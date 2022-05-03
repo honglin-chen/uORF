@@ -338,7 +338,8 @@ class Decoder(nn.Module):
     def __init__(self, n_freq=5, input_dim=33+64, pixel_dim=None, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7,
                  fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False, decoder_type=None,
                  restrict_world=False, reduce_color_decoder=False, density_as_color_input=False, mask_as_decoder_input=False,
-                 ray_after_density=False, multiply_mask_pixelfeat=False, same_bg_fg_decoder=False):
+                 ray_after_density=False, multiply_mask_pixelfeat=False, same_bg_fg_decoder=False, without_slot_feature=False,
+                 color_after_density=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -367,6 +368,11 @@ class Decoder(nn.Module):
         self.ray_after_density = ray_after_density
         self.multiply_mask_pixelfeat = multiply_mask_pixelfeat
         self.same_bg_fg_decoder = same_bg_fg_decoder
+        self.without_slot_feature = without_slot_feature
+        self.color_after_density = color_after_density
+        print(self.without_slot_feature, 'self.without_slot_feature')
+        if without_slot_feature:
+            input_dim -= z_dim
         if ray_after_density:
             assert use_ray_dir
             ray_dir_dim = 3
@@ -514,11 +520,20 @@ class Decoder(nn.Module):
         else:
             z_bg = z_slots[0:1, :]  # 1xC
             z_fg = z_slots[1:, :]  # (K-1)xC
-            input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
+            if self.without_slot_feature:
+                # print(self.without_slot_feature, 'without_slot_feature')
+
+                input_bg = query_bg
+                # print(input_bg.shape, 'input_bg.shape')
+            else:
+                input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
             if pixel_feat is not None and not self.bg_no_pixel:
                 input_bg = torch.cat([pixel_feat[0:1].squeeze(0), input_bg], dim=1)
-            z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
-            input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
+            if self.without_slot_feature:
+                input_fg = query_fg_ex
+            else:
+                z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
+                input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
             if pixel_feat is not None:
                 input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
                 # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape in tdw

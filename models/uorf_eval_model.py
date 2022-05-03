@@ -100,6 +100,15 @@ class uorfEvalModel(BaseModel):
         parser.add_argument('--unified_decoder', action='store_true', help='do not divide color and density decoder.')
         parser.add_argument('--same_bg_fg_decoder', action='store_true', help='use same decoder architecture for bg and fg. currently only support unified decoder')
 
+        parser.add_argument('--resnet_encoder', action='store_true', help='use resnet encoder for slot features')
+        parser.add_argument('--without_slot_feature', action='store_true', help='remove slot features')
+
+        parser.add_argument('--ray_after_density', action='store_true', help='concatenate ray dir after getting density')
+        # ray after density require use_ray_dir
+        parser.add_argument('--multiply_mask_pixelfeat', action='store_true', help='instead of concatenating mask on decoder input, apply mask on pixelfeat and concatenate')
+        # multiply_mask_pixelfeat require mask_as_decoder_input
+        parser.add_argument('--debug2', action='store_true')
+
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
 
@@ -141,10 +150,18 @@ class uorfEvalModel(BaseModel):
         self.model_names = []
 
         # [uORF Encoder]
-        self.netEncoder = networks.init_net(Encoder(3, z_dim=z_dim, bottom=opt.bottom), gpu_ids=self.gpu_ids, init_type='normal')
-        self.parameters.append(self.netEncoder.parameters())
-        self.nets.append(self.netEncoder)
-        self.model_names.append('Encoder')
+        if self.opt.resnet_encoder:
+            self.netEncoder = networks.init_net(PixelEncoder(mask_image=False, mask_image_feature=False),
+                                                gpu_ids=self.gpu_ids, init_type='None')
+            self.parameters.append(self.netEncoder.parameters())
+            self.nets.append(self.netEncoder)
+            self.model_names.append('Encoder')
+        else:
+            self.netEncoder = networks.init_net(Encoder(3, z_dim=z_dim, bottom=opt.bottom), gpu_ids=self.gpu_ids,
+                                                init_type='normal')
+            self.parameters.append(self.netEncoder.parameters())
+            self.nets.append(self.netEncoder)
+            self.model_names.append('Encoder')
 
         # [Slot attention]
         self.num_slots = opt.num_slots
@@ -170,7 +187,9 @@ class uorfEvalModel(BaseModel):
                         bg_no_pixel=self.opt.bg_no_pixel,
                         use_ray_dir=self.opt.use_ray_dir, small_latent=self.opt.small_latent, decoder_type='unified',
                         restrict_world=self.opt.restrict_world, mask_as_decoder_input=self.opt.mask_as_decoder_input,
-                        same_bg_fg_decoder=self.opt.same_bg_fg_decoder),
+                        same_bg_fg_decoder=self.opt.same_bg_fg_decoder, ray_after_density=self.opt.ray_after_density,
+                        multiply_mask_pixelfeat=self.opt.multiply_mask_pixelfeat,
+                        without_slot_feature=self.opt.without_slot_feature),
                 gpu_ids=self.gpu_ids, init_type='xavier')
             self.parameters.append(self.netDecoder.parameters())
             self.nets.append(self.netDecoder)
@@ -200,6 +219,7 @@ class uorfEvalModel(BaseModel):
             self.model_names.append('ColorDecoder')
 
         self.L2_loss = torch.nn.MSELoss()
+        self.L1_loss = torch.nn.L1Loss()
         self.LPIPS_loss = lpips.LPIPS().cuda()
         self.dice_loss = DiceLoss()
 
@@ -273,6 +293,12 @@ class uorfEvalModel(BaseModel):
             attn_bg, attn_fg = masks[:, 0:1], masks[:, 1:]
             attn = torch.cat([attn_bg, attn_fg], dim=1)
 
+        if self.opt.resnet_encoder:
+            attn = attn.view([1, self.opt.num_slots, self.opt.input_size, self.opt.input_size])
+            attn = attn.transpose(0, 1)
+            attn = F.interpolate(attn, size=self.opt.input_size//2, mode='nearest')
+            attn = attn.transpose(0, 1).flatten(2, 3)
+
         # Encoding images
         feature_map = self.netEncoder(
             F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
@@ -282,6 +308,9 @@ class uorfEvalModel(BaseModel):
         z_slots, attn = self.netSlotAttention(feat, masks=self.masks)  # 1xKxC, 1xKxN
         z_slots, attn = z_slots.squeeze(0), attn.squeeze(0)  # KxC, KxN
         K = attn.shape[0]
+        if self.opt.debug:
+            z_slots *= 0
+            print('z_slots are zero now')
 
         # Pixel Encoder Forward (to get feature values in pixel coordinates (uv), call pixelEncoder.index(uv), not forward)
         masks = attn if self.opt.mask_image or self.opt.mask_image_feature else None
@@ -394,6 +423,8 @@ class uorfEvalModel(BaseModel):
                     silhouettes_for_density_ = None
 
                 if self.opt.unified_decoder:
+                    if self.opt.debug2:
+                        pixel_feat_ *= 0
                     raws_, masked_raws_, unmasked_raws_, masks_for_silhouette_ = \
                         self.netDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat=pixel_feat_,
                                         ray_dir_input=ray_dir_input_, decoder_type='unified',
@@ -504,7 +535,7 @@ class uorfEvalModel(BaseModel):
                 x_recon_ = rendered_ * 2 - 1
                 x_recon[..., h::scale, w::scale] = x_recon_
 
-        x_recon_novel, x_novel = x_recon[1:], x[1:]
+        x_recon_novel, x_novel = x_recon[1:], F.interpolate(x[1:], size=[self.opt.frustum_size, self.opt.frustum_size], mode='bilinear')
         self.loss_recon = self.L2_loss(x_recon_novel, x_novel)
         self.loss_lpips = self.LPIPS_loss(x_recon_novel, x_novel).mean()
         self.loss_psnr = compute_psnr(x_recon_novel / 2 + 0.5, x_novel / 2 + 0.5, data_range=1.)
@@ -523,9 +554,9 @@ class uorfEvalModel(BaseModel):
             for i in range(self.opt.n_img_each_scene):
                 setattr(self, 'x_rec{}'.format(i), x_recon[i])
                 if i == 0:
-                    setattr(self, 'input_image', x[i])
+                    setattr(self, 'input_image', F.interpolate(x[i].unsqueeze(0), size=[self.opt.frustum_size, self.opt.frustum_size], mode='bilinear').squeeze(0))
                 else:
-                    setattr(self, 'gt_novel_view{}'.format(i), x[i])
+                    setattr(self, 'gt_novel_view{}'.format(i), F.interpolate(x[i].unsqueeze(0), size=[self.opt.frustum_size, self.opt.frustum_size], mode='bilinear').squeeze(0))
             setattr(self, 'masked_raws', masked_raws.detach())
             setattr(self, 'unmasked_raws', unmasked_raws.detach())
 

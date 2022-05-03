@@ -18,6 +18,8 @@ class MultiscenesDataset(BaseDataset):
         parser.add_argument('--n_img_each_scene', type=int, default=2, help='for each scene, how many images to load in a batch')
         parser.add_argument('--no_shuffle', action='store_true')
         parser.add_argument('--mask_size', type=int, default=128)
+        parser.add_argument('--frame5', action='store_true')
+        parser.add_argument('--skip', type=int, default=0)
         return parser
 
     def __init__(self, opt):
@@ -45,9 +47,12 @@ class MultiscenesDataset(BaseDataset):
         filenames_set = image_filenames_set - mask_filenames_set - fg_mask_filenames_set - moved_filenames_set - changed_filenames_set - bg_in_filenames_set - bg_mask_filenames_set - bg_in_mask_filenames_set
         filenames = sorted(list(filenames_set))
         self.scenes = []
-        skip = 0
+        skip = self.opt.skip
         for i in range(skip, skip+self.n_scenes):
-            scene_filenames = [x for x in filenames if 'sc{:04d}'.format(i) in x]
+            if self.opt.frame5:
+                scene_filenames = [x for x in filenames if 'sc{:04d}_frame5'.format(i) in x]
+            else:
+                scene_filenames = [x for x in filenames if 'sc{:04d}'.format(i) in x]
             # print(scene_filenames)
             self.scenes.append(scene_filenames)
 
@@ -101,10 +106,13 @@ class MultiscenesDataset(BaseDataset):
             try:
                 pose = np.loadtxt(pose_path)
             except FileNotFoundError:
+            # except:
                 print('filenotfound error: {}'.format(pose_path))
+                # pass # it was not here before
                 assert False
             pose = torch.tensor(pose, dtype=torch.float32)
             azi_path = pose_path.replace('_RT.txt', '_azi_rot.txt')
+            # azi_path = pose_path
             if self.opt.fixed_locality:
                 azi_rot = np.eye(3)  # not used; placeholder
             else:
