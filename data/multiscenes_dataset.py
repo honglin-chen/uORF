@@ -46,7 +46,7 @@ class MultiscenesDataset(BaseDataset):
         filenames = sorted(list(filenames_set))
         self.scenes = []
         for i in range(self.n_scenes):
-            scene_filenames = [x for x in filenames if 'sc{:04d}'.format(i) in x]
+            scene_filenames = [x for x in filenames if 'sc{:04d}_frame5'.format(i) in x]
             self.scenes.append(scene_filenames)
 
     def _transform(self, img):
@@ -102,7 +102,7 @@ class MultiscenesDataset(BaseDataset):
                 print('filenotfound error: {}'.format(pose_path))
                 assert False
             pose = torch.tensor(pose, dtype=torch.float32)
-            azi_path = pose_path.replace('_RT.txt', '_azi_rot.txt')
+            azi_path = pose_path.replace('_RT.txt', '_azi_rot.txt').replace('_frame5', '')
             if self.opt.fixed_locality:
                 azi_rot = np.eye(3)  # not used; placeholder
             else:

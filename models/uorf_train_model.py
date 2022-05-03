@@ -77,6 +77,8 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--learn_only_centroid', action='store_true', help='loss function contains only centroid loss')
         parser.add_argument('--predict_centroid', action='store_true', default=False, help='predict the 3D centroid of the foreground objects')
         parser.add_argument('--loss_centroid_margin', type=float, default=0.05, help='max margin for the centroid loss')
+        parser.add_argument('--no_optimization', action='store_true', help='disable optimization')
+
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=2000, custom_lr=True, lr_policy='warmup')
 
@@ -504,18 +506,22 @@ class uorfTrainModel(BaseModel):
         self.forward(epoch)
         for opm in self.optimizers:
             opm.zero_grad()
-        self.backward()
+
         avg_grads = []
         layers = []
-        if ret_grad:
-            # for n, p in chain(self.netEncoder.named_parameters(), self.netSlotAttention.named_parameters(), self.netDecoder.named_parameters()):
-            for n, p in chain(*[x.named_parameters() for x in self.nets]):
-                if p.grad is not None and "bias" not in n:
-                    with torch.no_grad():
-                        layers.append(n)
-                        avg_grads.append(p.grad.abs().mean().cpu().item())
-        for opm in self.optimizers:
-            opm.step()
+        self.backward()
+        if self.opt.no_optimization:
+            print('Warning: no optimization !!!')
+        else:
+            if ret_grad:
+                # for n, p in chain(self.netEncoder.named_parameters(), self.netSlotAttention.named_parameters(), self.netDecoder.named_parameters()):
+                for n, p in chain(*[x.named_parameters() for x in self.nets]):
+                    if p.grad is not None and "bias" not in n:
+                        with torch.no_grad():
+                            layers.append(n)
+                            avg_grads.append(p.grad.abs().mean().cpu().item())
+            for opm in self.optimizers:
+                opm.step()
         return layers, avg_grads
 
     def save_networks(self, surfix):
