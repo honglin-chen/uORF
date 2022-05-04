@@ -119,6 +119,9 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--debug2', action='store_true')
         parser.add_argument('--mask_div_by_max', action='store_true')
         parser.add_argument('--kldiv_loss', action='store_true')
+        parser.add_argument('--silhouette_l2_loss', action='store_true')
+        parser.add_argument('--combine_masks', action='store_true', help='combine all the masks for pixel nerf')
+        parser.add_argument('--weight_pixel_slot_mask', action='store_true')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=2000, custom_lr=True, lr_policy='warmup')
@@ -178,11 +181,12 @@ class uorfTrainModel(BaseModel):
 
         # [Slot attention]
         self.num_slots = opt.num_slots
-        self.netSlotAttention = networks.init_net(
-            SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter, gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
-        self.nets.append(self.netSlotAttention)
-        self.parameters.append(self.netSlotAttention.parameters())
-        self.model_names.append('SlotAttention')
+        if not self.opt.without_slot_feature:
+            self.netSlotAttention = networks.init_net(
+                SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter, gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
+            self.nets.append(self.netSlotAttention)
+            self.parameters.append(self.netSlotAttention.parameters())
+            self.model_names.append('SlotAttention')
 
         # [Pixel Encoder]
         if not self.opt.uorf:
@@ -205,7 +209,8 @@ class uorfTrainModel(BaseModel):
                         restrict_world=self.opt.restrict_world, mask_as_decoder_input=self.opt.mask_as_decoder_input,
                         ray_after_density=self.opt.ray_after_density, multiply_mask_pixelfeat=self.opt.multiply_mask_pixelfeat,
                         without_slot_feature=self.opt.without_slot_feature, same_bg_fg_decoder=self.opt.same_bg_fg_decoder,
-                        color_after_density=self.opt.color_after_density),
+                        color_after_density=self.opt.color_after_density, no_concatenate=self.opt.no_concatenate,
+                        weight_pixel_slot_mask=self.opt.weight_pixel_slot_mask),
                 gpu_ids=self.gpu_ids, init_type='xavier')
             self.parameters.append(self.netDecoder.parameters())
             self.nets.append(self.netDecoder)
@@ -267,7 +272,13 @@ class uorfTrainModel(BaseModel):
             bg_masks = input['bg_mask'][0:1].to(self.device)
             obj_masks = input['obj_masks'][0:1].to(self.device)
             masks = torch.cat([bg_masks, obj_masks], dim=1)
-            masks = masks[:, :self.opt.num_slots, ...]
+            if self.opt.combine_masks:
+                obj_mask = torch.zeros_like(obj_masks[:, 0, ...])
+                for i in range(obj_masks.shape[1]):
+                    obj_mask = obj_mask | obj_masks[:, i, ...]
+                masks = torch.cat([bg_masks, obj_mask.unsqueeze(1)], dim=1)
+            else:
+                masks = masks[:, :self.opt.num_slots, ...]
             if self.opt.bilinear_mask:
                 mode_ = 'bilinear'
             else:
@@ -282,7 +293,13 @@ class uorfTrainModel(BaseModel):
             bg_masks = input['bg_mask'].to(self.device)
             obj_masks = input['obj_masks'].to(self.device)
             masks = torch.cat([bg_masks, obj_masks], dim=1)
-            masks = masks[:, :self.opt.num_slots, ...]
+            if self.opt.combine_masks:
+                obj_mask = torch.zeros_like(obj_masks[:, 0, ...])
+                for i in range(obj_masks.shape[1]):
+                    obj_mask = obj_mask | obj_masks[:, i, ...]
+                masks = torch.cat([bg_masks, obj_mask.unsqueeze(1)], dim=1)
+            else:
+                masks = masks[:, :self.opt.num_slots, ...]
             masks = F.interpolate(masks.float(), size=[128, 128], mode=mode_)
             self.silhouette_masks_fine = masks
             masks = F.interpolate(masks.float(), size=[64, 64], mode=mode_)
@@ -303,6 +320,8 @@ class uorfTrainModel(BaseModel):
             masks = self.masks
             attn_bg, attn_fg = masks[:, 0:1], masks[:, 1:]
             attn = torch.cat([attn_bg, attn_fg], dim=1)
+        else:
+            attn = None
 
         if self.opt.resnet_encoder:
             attn = attn.view([1, self.opt.num_slots, self.opt.input_size, self.opt.input_size])
@@ -316,9 +335,14 @@ class uorfTrainModel(BaseModel):
 
         # Slot Attention
         if self.opt.pixel_nerf:
-            z_slots = torch.zeros([2, 64])
-            attn = torch.zeros([2, 256*256])
-            K = 2
+            if self.opt.combine_masks:
+                K = 2
+                z_slots = torch.zeros([K, 64])
+                attn = torch.zeros([K, self.opt.input_size**2])
+            else:
+                K = self.opt.num_slots
+                z_slots = torch.zeros([K, 64])
+                attn = torch.zeros([K, self.opt.input_size**2])
         else:
             z_slots, attn = self.netSlotAttention(feat, masks=attn)  # 1xKxC, 1xKxN
             z_slots, attn = z_slots.squeeze(0), attn.squeeze(0)  # KxC, KxN (N = HxW)
@@ -415,7 +439,7 @@ class uorfTrainModel(BaseModel):
             else:
                 uv = uv.expand(K, -1, -1)
 
-        if self.opt.mask_as_decoder_input:
+        if self.opt.mask_as_decoder_input or self.opt.weight_pixel_slot_mask:
             silhouette0 = self.silhouette_masks[0:1].transpose(0, 1)  # Kx1xHxW
             # uv = uv.unsqueeze(1)  # Kx1x(NxDxHxW)x2
             silhouettes_for_density = F.grid_sample(silhouette0, uv.unsqueeze(1), mode='bilinear',
@@ -424,10 +448,16 @@ class uorfTrainModel(BaseModel):
         else:
             silhouettes_for_density = None
 
-        if self.opt.uorf:
-            pixel_feat = None
         if self.opt.debug2:
             pixel_feat *= 0
+        if self.opt.uorf:
+            pixel_feat = None
+
+        if self.opt.weight_pixel_slot_mask:
+            # pixelfeat: Kx(NxDxHxW)xC
+            # slotfeat: KxC
+            # silhouettes_for_density = None
+            pass
         if self.opt.unified_decoder:
             raws, masked_raws, unmasked_raws, masks_for_silhouette = \
                 self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat=pixel_feat,
@@ -510,8 +540,8 @@ class uorfTrainModel(BaseModel):
             elif self.opt.kldiv_loss:
                 targets = self.silhouette_masks
                 inputs = self.silhouettes
-
-
+            elif self.opt.silhouette_l2_loss:
+                self.loss_silhouette = self.L2_loss(self.silhouette_masks, self.silhouettes) # NxKxHxW
             else:
                 self.loss_silhouette = self.L1_loss(self.silhouette_masks, self.silhouettes) # NxKxHxW
 

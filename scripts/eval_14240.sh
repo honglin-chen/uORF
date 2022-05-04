@@ -1,13 +1,13 @@
 #!/bin/bash
-DATAROOT=${1:-'tdw_multiview_texture'}
+DATAROOT=${1:-'tdw_zoo_10obj'}
 CHECKPOINT=${2:-'/data2/wanhee/uORF/checkpoints/'}
 PORT=8077
 python -m visdom.server -p $PORT &>/dev/null &
 python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
-    --checkpoints_dir $CHECKPOINT --name '14071' --exp_id 'run-2022-05-01-20-32-10' \
+    --checkpoints_dir $CHECKPOINT --name '14240' --exp_id 'run-2022-05-01-21-48-38' \
     --results_dir 'results' \
     --display_port $PORT --display_ncols 4 \
-    --load_size 256 --input_size 256 --render_size 32 --frustum_size 128 \
+    --load_size 256 --input_size 256 --render_size 8 --frustum_size 128 \
     --n_samp 128 --z_dim 64 --num_slots 4 \
     --model 'uorf_eval' \
     --skip 100 \
@@ -17,9 +17,7 @@ python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
     --restrict_world \
     --unified_decoder \
     --use_ray_dir \
-    --resnet_encoder \
-    --debug \
-#    --same_bg_fg_decoder \
+#    --debug2 \
 #    --pixel_after_density \
 #    --without_slot_feature \
 
@@ -34,4 +32,3 @@ echo "Done"
 # --name '14181' --exp_id 'run-2022-05-02-00-00-26' tdw_multiview_10obj
 # --name '14140' --exp_id 'run-2022-05-01-00-45-32'
 # --name '14040' --exp_id 'run-2022-05-01-00-36-30' tdw_multiview_texture
-# --name '14071' --exp_id 'run-2022-05-01-20-32-10' tdw multiview texture

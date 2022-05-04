@@ -339,7 +339,7 @@ class Decoder(nn.Module):
                  fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False, decoder_type=None,
                  restrict_world=False, reduce_color_decoder=False, density_as_color_input=False, mask_as_decoder_input=False,
                  ray_after_density=False, multiply_mask_pixelfeat=False, same_bg_fg_decoder=False, without_slot_feature=False,
-                 color_after_density=False):
+                 color_after_density=False, weight_pixel_slot_mask=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -370,7 +370,14 @@ class Decoder(nn.Module):
         self.same_bg_fg_decoder = same_bg_fg_decoder
         self.without_slot_feature = without_slot_feature
         self.color_after_density = color_after_density
+        self.weight_pixel_slot_mask = weight_pixel_slot_mask
+        print(self.color_after_density, 'put pixel feature after density decoder')
         print(self.without_slot_feature, 'self.without_slot_feature')
+        if color_after_density:
+            input_dim -= pixel_dim
+            pixel_dim_color = pixel_dim
+        else:
+            pixel_dim_color = 0
         if without_slot_feature:
             input_dim -= z_dim
         if ray_after_density:
@@ -380,7 +387,6 @@ class Decoder(nn.Module):
             ray_dir_dim = 0
         if multiply_mask_pixelfeat:
             assert mask_as_decoder_input
-
         if density_as_color_input:
             input_dim += 1
         if mask_as_decoder_input:
@@ -416,7 +422,7 @@ class Decoder(nn.Module):
         self.f_after = nn.Sequential(*after_skip)
         self.f_after_latent = nn.Linear(latent_dim, latent_dim)
         self.f_after_shape = nn.Linear(latent_dim, self.out_ch - 3)
-        self.f_color = nn.Sequential(nn.Linear(latent_dim + ray_dir_dim, latent_dim//4),
+        self.f_color = nn.Sequential(nn.Linear(latent_dim + ray_dir_dim + pixel_dim_color, latent_dim//4),
                                      nn.ReLU(True),
                                      nn.Linear(latent_dim//4, 3))
         if pixel_dim is not None and bg_no_pixel and not no_concatenate:
@@ -440,7 +446,7 @@ class Decoder(nn.Module):
             assert not self.reduce_color_decoder
             self.b_after_latent = nn.Linear(latent_dim, latent_dim)
             self.b_after_shape = nn.Linear(latent_dim, self.out_ch - 3)
-            self.b_color = nn.Sequential(nn.Linear(latent_dim + ray_dir_dim, latent_dim // 4),
+            self.b_color = nn.Sequential(nn.Linear(latent_dim + ray_dir_dim + pixel_dim_color, latent_dim // 4),
                                          nn.ReLU(True),
                                          nn.Linear(latent_dim // 4, 3))
 
@@ -469,6 +475,7 @@ class Decoder(nn.Module):
         """
         K, C = z_slots.shape
         P = sampling_coor_bg.shape[0]
+        no_concatenate = self.no_concatenate
 
         # if self.pixel_dim and pixel_feat is None:
         #     pixel_feat = self.substitute_pixel_feat[None, None, ...].expand(K, P, -1)
@@ -512,8 +519,14 @@ class Decoder(nn.Module):
             pixel_feat = self.pixel_norm(pixel_feat)
             z_slots = self.object_norm(z_slots)
             z_slots = z_slots[:, None, :].expand(-1, P, -1)
-            feat = pixel_feat+z_slots
-            feat = self.norm2feat(feat)
+            if self.weight_pixel_slot_mask:
+                silhouettes = silhouettes.permute([2, 0, 1, 3, 4]).flatten(1, 4).unsqueeze(-1)  # Kx(NxDxHxW)x1
+                feat = pixel_feat * silhouettes + z_slots * (1-silhouettes)
+                # print('you are using weight_pixel_slot_mask')
+            else:
+                feat = pixel_feat+z_slots
+                # feat = self.norm2feat(feat)
+
             input_bg = torch.cat([feat[0:1].squeeze(0), query_bg], dim=1)
             input_fg = torch.cat([feat[1:].flatten(0, 1), query_fg_ex], dim=1)
 
@@ -527,14 +540,14 @@ class Decoder(nn.Module):
                 # print(input_bg.shape, 'input_bg.shape')
             else:
                 input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
-            if pixel_feat is not None and not self.bg_no_pixel:
+            if pixel_feat is not None and not self.bg_no_pixel and not self.color_after_density:
                 input_bg = torch.cat([pixel_feat[0:1].squeeze(0), input_bg], dim=1)
             if self.without_slot_feature:
                 input_fg = query_fg_ex
             else:
                 z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
                 input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
-            if pixel_feat is not None:
+            if pixel_feat is not None and not self.color_after_density:
                 input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
                 # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape in tdw
 
@@ -569,6 +582,8 @@ class Decoder(nn.Module):
             tmp = self.b_after(torch.cat([input_bg, tmp], dim=1))
             latent_bg = self.b_after_latent(tmp)
             latent_bg = torch.cat([latent_bg, ray_dir_input], dim=1)
+            if self.color_after_density:
+                latent_bg = torch.cat([pixel_feat[0:1].squeeze(0), latent_bg], dim=1)
             bg_raw_rgb = self.b_color(latent_bg).view(1, P, 3)
             bg_raw_shape = self.b_after_shape(tmp).view(1, P, 1)
             bg_raws = torch.cat([bg_raw_rgb, bg_raw_shape], dim=-1)
@@ -587,6 +602,8 @@ class Decoder(nn.Module):
         if self.use_ray_dir:
             if self.ray_after_density:
                 latent_fg = torch.cat([latent_fg, ray_dir_input[None, ...].expand(K-1, -1, -1).flatten(0, 1)], dim=1)
+        if self.color_after_density:
+            latent_fg = torch.cat([pixel_feat[1:].flatten(0, 1), latent_fg], dim=1)
         fg_raw_rgb = self.f_color(latent_fg).view([K-1, P, 3])  # ((K-1)xP)x3 -> (K-1)xPx3
         fg_raw_shape = self.f_after_shape(tmp).view([K - 1, P])  # ((K-1)xP)x1 -> (K-1)xP, density
         if self.locality:
@@ -890,7 +907,7 @@ def sin_emb(x, n_freq=5, keep_ori=True):
     embedded_ = torch.cat(embedded, dim=1)
     return embedded_
 
-def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, uvw=None, KNDHW=None,
+def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, uvw=None, wuv=None, KNDHW=None,
                 return_transmittance_cam0=False, input_transmittance_cam0=None, return_silhouettes=None,
                 transmittance_samples=None, masks=None):
     """Transforms model's predictions to semantically meaningful values.

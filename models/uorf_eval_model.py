@@ -89,25 +89,36 @@ class uorfEvalModel(BaseModel):
         parser.add_argument('--density_n_color', action='store_true', help='separate density encoder and color encoder')
         parser.add_argument('--debug', action='store_true', help='debugging option')
         parser.add_argument('--extract_mesh', action='store_true', help='construct mesh')
-        parser.add_argument('--dice_loss', action='store_true', help='convert silhouette loss from L1 to dice loss')
 
         parser.add_argument('--rgb_loss_density_decoder', action='store_true', help='put rgb loss twice. on color decoder and density decoder')
         parser.add_argument('--restrict_world', action='store_true', help='restrict the world. the range is hyperparam')
         parser.add_argument('--reduce_color_decoder', action='store_true', help='reduce the color decoder for memory')
         parser.add_argument('--density_as_color_input', action='store_true', help='put density as an input of color decoder. this would be diff from both mask and transmittance')
         parser.add_argument('--mask_as_decoder_input', action='store_true', help='put mask as an input of both density and color decoder.')
+        parser.add_argument('--dice_loss', action='store_true', help='convert silhouette loss from L1 to dice loss')
 
         parser.add_argument('--unified_decoder', action='store_true', help='do not divide color and density decoder.')
         parser.add_argument('--same_bg_fg_decoder', action='store_true', help='use same decoder architecture for bg and fg. currently only support unified decoder')
+        parser.add_argument('--bilinear_mask', action='store_true', help='instead of nearest interpolation, use bilinear interpolation')
+        parser.add_argument('--antialias', action='store_true', help='antialias for mask')
 
+        parser.add_argument('--fine_encoder', action='store_true', help='do not interpolate the image')
         parser.add_argument('--resnet_encoder', action='store_true', help='use resnet encoder for slot features')
-        parser.add_argument('--without_slot_feature', action='store_true', help='remove slot features')
 
         parser.add_argument('--ray_after_density', action='store_true', help='concatenate ray dir after getting density')
         # ray after density require use_ray_dir
         parser.add_argument('--multiply_mask_pixelfeat', action='store_true', help='instead of concatenating mask on decoder input, apply mask on pixelfeat and concatenate')
         # multiply_mask_pixelfeat require mask_as_decoder_input
+        parser.add_argument('--without_slot_feature', action='store_true', help='remove slot features')
+        parser.add_argument('--uorf', action='store_true', help='remove pixel features')
+        parser.add_argument('--color_after_density', action='store_true', help='unified decoder')
         parser.add_argument('--debug2', action='store_true')
+        parser.add_argument('--mask_div_by_max', action='store_true')
+        parser.add_argument('--kldiv_loss', action='store_true')
+        parser.add_argument('--silhouette_l2_loss', action='store_true')
+        parser.add_argument('--combine_masks', action='store_true', help='combine all the masks for pixel nerf')
+        parser.add_argument('--weight_pixel_slot_mask', action='store_true')
+
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -165,18 +176,25 @@ class uorfEvalModel(BaseModel):
 
         # [Slot attention]
         self.num_slots = opt.num_slots
-        self.netSlotAttention = networks.init_net(
-            SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter, gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
-        self.nets.append(self.netSlotAttention)
-        self.parameters.append(self.netSlotAttention.parameters())
-        self.model_names.append('SlotAttention')
+        if not self.opt.without_slot_feature:
+            self.netSlotAttention = networks.init_net(
+                SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter,
+                              gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
+            self.nets.append(self.netSlotAttention)
+            self.parameters.append(self.netSlotAttention.parameters())
+            self.model_names.append('SlotAttention')
 
         # [Pixel Encoder]
-        self.netPixelEncoder = networks.init_net(PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature), gpu_ids=self.gpu_ids, init_type='None')
-        self.parameters.append(self.netPixelEncoder.parameters())
-        self.nets.append(self.netPixelEncoder)
-        self.model_names.append('PixelEncoder')
-        pixel_dim = 64
+        if not self.opt.uorf:
+            self.netPixelEncoder = networks.init_net(
+                PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature),
+                gpu_ids=self.gpu_ids, init_type='None')
+            self.parameters.append(self.netPixelEncoder.parameters())
+            self.nets.append(self.netPixelEncoder)
+            self.model_names.append('PixelEncoder')
+            pixel_dim = 64
+        if self.opt.uorf:
+            pixel_dim = 0
 
         if self.opt.unified_decoder:
             # [Unified Decoder]
@@ -187,33 +205,44 @@ class uorfEvalModel(BaseModel):
                         bg_no_pixel=self.opt.bg_no_pixel,
                         use_ray_dir=self.opt.use_ray_dir, small_latent=self.opt.small_latent, decoder_type='unified',
                         restrict_world=self.opt.restrict_world, mask_as_decoder_input=self.opt.mask_as_decoder_input,
-                        same_bg_fg_decoder=self.opt.same_bg_fg_decoder, ray_after_density=self.opt.ray_after_density,
+                        ray_after_density=self.opt.ray_after_density,
                         multiply_mask_pixelfeat=self.opt.multiply_mask_pixelfeat,
-                        without_slot_feature=self.opt.without_slot_feature),
+                        without_slot_feature=self.opt.without_slot_feature,
+                        same_bg_fg_decoder=self.opt.same_bg_fg_decoder,
+                        color_after_density=self.opt.color_after_density, no_concatenate=self.opt.no_concatenate,
+                        weight_pixel_slot_mask=self.opt.weight_pixel_slot_mask),
                 gpu_ids=self.gpu_ids, init_type='xavier')
             self.parameters.append(self.netDecoder.parameters())
             self.nets.append(self.netDecoder)
             self.model_names.append('Decoder')
-        else: # not changed
+        else:
+            # [Density Decoder]
+            if self.opt.density_no_pixel:
+                pixel_dim = None
             self.netDensityDecoder = networks.init_net(
                 Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim,
                         n_layers=opt.n_layer,
                         locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality,
                         bg_no_pixel=self.opt.bg_no_pixel,
-                        use_ray_dir=False, small_latent=self.opt.small_latent, decoder_type='density', locality=False),
+                        use_ray_dir=False, small_latent=self.opt.small_latent, decoder_type='density',
+                        restrict_world=self.opt.restrict_world, mask_as_decoder_input=self.opt.mask_as_decoder_input),
                 gpu_ids=self.gpu_ids, init_type='xavier')
+
             self.parameters.append(self.netDensityDecoder.parameters())
             self.nets.append(self.netDensityDecoder)
             self.model_names.append('DensityDecoder')
 
             # [Color Decoder]
+            pixel_dim = 64
             self.netColorDecoder = networks.init_net(
                 Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim,
                         n_layers=opt.n_layer,
                         locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality,
                         bg_no_pixel=self.opt.bg_no_pixel,
-                        use_ray_dir=self.opt.use_ray_dir, small_latent=self.opt.small_latent, decoder_type='color', locality=False),
-                gpu_ids=self.gpu_ids, init_type='xavier')
+                        use_ray_dir=self.opt.use_ray_dir, small_latent=self.opt.small_latent, decoder_type='color',
+                        reduce_color_decoder=self.opt.reduce_color_decoder, restrict_world=self.opt.restrict_world,
+                        density_as_color_input=self.opt.density_as_color_input,
+                        mask_as_decoder_input=self.opt.mask_as_decoder_input), gpu_ids=self.gpu_ids, init_type='xavier')
             self.parameters.append(self.netColorDecoder.parameters())
             self.nets.append(self.netColorDecoder)
             self.model_names.append('ColorDecoder')
@@ -268,17 +297,38 @@ class uorfEvalModel(BaseModel):
             bg_masks = input['bg_mask'][0:1].to(self.device)
             obj_masks = input['obj_masks'][0:1].to(self.device)
             masks = torch.cat([bg_masks, obj_masks], dim=1)
-            masks = masks[:, :self.opt.num_slots, ...]
+            if self.opt.combine_masks:
+                obj_mask = torch.zeros_like(obj_masks[:, 0, ...])
+                for i in range(obj_masks.shape[1]):
+                    obj_mask = obj_mask | obj_masks[:, i, ...]
+                masks = torch.cat([bg_masks, obj_mask.unsqueeze(1)], dim=1)
+            else:
+                masks = masks[:, :self.opt.num_slots, ...]
+            if self.opt.bilinear_mask:
+                mode_ = 'bilinear'
+            else:
+                mode_ = 'nearest'
+            if self.opt.antialias:
+                antialias_ = True
+            else:
+                antialias_ = False
+
             masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode='nearest')
             self.masks = masks.flatten(2, 3)
 
             bg_masks = input['bg_mask'].to(self.device)
             obj_masks = input['obj_masks'].to(self.device)
             masks = torch.cat([bg_masks, obj_masks], dim=1)
-            masks = masks[:, :self.opt.num_slots, ...]
-            masks = F.interpolate(masks.float(), size=[128, 128], mode='nearest')
+            if self.opt.combine_masks:
+                obj_mask = torch.zeros_like(obj_masks[:, 0, ...])
+                for i in range(obj_masks.shape[1]):
+                    obj_mask = obj_mask | obj_masks[:, i, ...]
+                masks = torch.cat([bg_masks, obj_mask.unsqueeze(1)], dim=1)
+            else:
+                masks = masks[:, :self.opt.num_slots, ...]
+            masks = F.interpolate(masks.float(), size=[128, 128], mode=mode_)
             self.silhouette_masks_fine = masks
-            masks = F.interpolate(masks.float(), size=[64, 64], mode='nearest')
+            masks = F.interpolate(masks.float(), size=[64, 64], mode=mode_)
             self.silhouette_masks = masks
 
 
@@ -300,22 +350,32 @@ class uorfEvalModel(BaseModel):
             attn = attn.transpose(0, 1).flatten(2, 3)
 
         # Encoding images
-        feature_map = self.netEncoder(
-            F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
+        feature_map = self.netEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention
-        z_slots, attn = self.netSlotAttention(feat, masks=self.masks)  # 1xKxC, 1xKxN
-        z_slots, attn = z_slots.squeeze(0), attn.squeeze(0)  # KxC, KxN
-        K = attn.shape[0]
-        if self.opt.debug:
-            z_slots *= 0
-            print('z_slots are zero now')
+        if self.opt.pixel_nerf:
+            if self.opt.combine_masks:
+                K = 2
+                z_slots = torch.zeros([K, 64])
+                attn = torch.zeros([K, self.opt.input_size ** 2])
+            else:
+                K = self.opt.num_slots
+                z_slots = torch.zeros([K, 64])
+                attn = torch.zeros([K, self.opt.input_size ** 2])
+        else:
+            z_slots, attn = self.netSlotAttention(feat, masks=attn)  # 1xKxC, 1xKxN
+            z_slots, attn = z_slots.squeeze(0), attn.squeeze(0)  # KxC, KxN (N = HxW)
+            K = attn.shape[0]
+            if self.opt.debug:
+                z_slots *= 0
+                print('z_slots are zero now')
 
         # Pixel Encoder Forward (to get feature values in pixel coordinates (uv), call pixelEncoder.index(uv), not forward)
-        masks = attn if self.opt.mask_image or self.opt.mask_image_feature else None
-        feature_map_pixel = self.netPixelEncoder(
-            F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False), masks=masks)
+        if not self.opt.uorf:
+            masks = self.masks.squeeze(0) if self.opt.mask_image or self.opt.mask_image_feature else None
+            feature_map_pixel = self.netPixelEncoder(
+                F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False), masks=masks)
 
         # Get rays and coordinates
         cam2world = self.cam2world
@@ -365,7 +425,7 @@ class uorfEvalModel(BaseModel):
             else:
                 ray_dir_input_ = None
 
-            if self.opt.pixel_encoder:
+            if self.opt.pixel_encoder or self.opt.mask_as_decoder_input:
                 # get cam matrices
                 # W, H, D = self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp # what is this?
                 self.cam2spixel = self.projection_coarse.cam2spixel
@@ -395,7 +455,9 @@ class uorfEvalModel(BaseModel):
                     w_ = pixel_cam0_coor_[:, :, 2:3]
                     w_ = (w_ - self.opt.near_plane) / (
                                 self.opt.far_plane - self.opt.near_plane)  # [0, 1] torch linspace is inclusive (include final value)
-                    w_ = (w_ + 0.) * 2 - 1  # [-1, 1]
+                    # w_ = (w_ + 0.) * 2 - 1  # [-1, 1]
+                    w = w * frustum_size[2:3][None, None, :]  # [0, 63]
+                    w = (w + 0.) / frustum_size[2] * 2 - 1  # [-1, 1]
 
                     # uvw = torch.cat([w, uv], dim=-1)  # 1x(NxDxHxW)x3 # this is wrong. think about the x y z coordinate system! (H, W, D)
                     uvw_ = torch.cat([uv_, w_], dim=-1)  # 1x(NxDxHxW)x3
@@ -412,7 +474,7 @@ class uorfEvalModel(BaseModel):
                     pixel_feat_ = pixel_feat_.expand(K, -1, -1)  # Kx(NxDxHxW)xC
                     uv_ = uv_.expand(K, -1, -1)
 
-                if self.opt.mask_as_decoder_input:
+                if self.opt.mask_as_decoder_input or self.opt.weight_pixel_slot_mask:
                     silhouette0 = self.silhouette_masks[0:1].transpose(0, 1)  # Kx1xHxW
                     # uv = uv.unsqueeze(1)  # Kx1x(NxDxHxW)x2
                     silhouettes_for_density_ = F.grid_sample(silhouette0, uv_.unsqueeze(1), mode='bilinear',
