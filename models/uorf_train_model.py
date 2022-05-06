@@ -29,8 +29,8 @@ class DiceLoss(nn.Module):
         targets = targets.flatten(2, 3)
 
         intersection = (inputs * targets).sum(dim=-1)
-        dice = (2. * intersection + smooth) / (inputs.sum() + targets.sum() + smooth)
-        dice = dice.sum()
+        dice = (2. * intersection + smooth) / (inputs.sum(dim=-1) + targets.sum(dim=-1) + smooth)
+        dice = dice.mean()
 
         return 1 - dice
 
@@ -148,6 +148,7 @@ class uorfTrainModel(BaseModel):
                             ['x_rec{}'.format(i) for i in range(n)] + \
                             ['slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['unmasked_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
+                            ['silhoutte_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
         self.perceptual_net = get_perceptual_net().cuda()
         self.vgg_norm = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -263,13 +264,17 @@ class uorfTrainModel(BaseModel):
         Parameters:
             input: a dictionary that contains the data itself and its metadata information.
         """
+        # print("batchsize", self.opt.batch_size)
         self.x = input['img_data'].to(self.device)
         self.cam2world = input['cam2world'].to(self.device)
         if not self.opt.fixed_locality:
             self.cam2world_azi = input['azi_rot'].to(self.device)
 
         if 'masks' in input.keys():
-            bg_masks = input['bg_mask'][0:1].to(self.device)
+
+            #This is for the input view.
+            bg_masks = input['bg_mask'][0:1].to(self.device)*0
+            # print("input['bg_mask']", input['bg_mask'].shape, self.x.shape)
             obj_masks = input['obj_masks'][0:1].to(self.device)
             masks = torch.cat([bg_masks, obj_masks], dim=1)
             if self.opt.combine_masks:
@@ -291,8 +296,14 @@ class uorfTrainModel(BaseModel):
             masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode=mode_)
             self.masks = masks.flatten(2, 3)
             bg_masks = input['bg_mask'].to(self.device)
+            self.x_op = self.x * (1 - bg_masks.float())
+            bg_masks = input['bg_mask'].to(self.device)*0
             obj_masks = input['obj_masks'].to(self.device)
             masks = torch.cat([bg_masks, obj_masks], dim=1)
+            # masks = obj_masks#torch.cat([obj_masks], dim=1)
+            # print("bg_masks", bg_masks.shape, self.x.shape, bg_masks[:, :, 0, :])
+
+
             if self.opt.combine_masks:
                 obj_mask = torch.zeros_like(obj_masks[:, 0, ...])
                 for i in range(obj_masks.shape[1]):
@@ -318,6 +329,8 @@ class uorfTrainModel(BaseModel):
         # Replace slot attention with GT segmentations
         if self.opt.gt_seg:
             masks = self.masks
+
+            #TODO: why two lines??
             attn_bg, attn_fg = masks[:, 0:1], masks[:, 1:]
             attn = torch.cat([attn_bg, attn_fg], dim=1)
         else:
@@ -364,6 +377,7 @@ class uorfTrainModel(BaseModel):
             frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             x = F.interpolate(self.x, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
+            x_op = F.interpolate(self.x_op, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
             self.z_vals, self.ray_dir = z_vals, ray_dir
         else:
             W, H, D = self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp
@@ -377,6 +391,7 @@ class uorfTrainModel(BaseModel):
             frus_nss_coor_, z_vals_, ray_dir_ = frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(0, 3), z_vals_.flatten(0, 2), ray_dir_.flatten(0, 2)
             x = F.interpolate(self.x, size=128, mode='bilinear', align_corners=False)
+            x_op = F.interpolate(self.x_op, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
             x = x[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.silhouette_masks = self.silhouette_masks_fine[..., H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.z_vals, self.ray_dir = z_vals, ray_dir
@@ -453,6 +468,7 @@ class uorfTrainModel(BaseModel):
         if self.opt.uorf:
             pixel_feat = None
 
+        #TODO: this does nothing.
         if self.opt.weight_pixel_slot_mask:
             # pixelfeat: Kx(NxDxHxW)xC
             # slotfeat: KxC
@@ -525,7 +541,7 @@ class uorfTrainModel(BaseModel):
             self.loss_recon *= 0.
             self.loss_perc *= 0.
         else:
-            self.loss_recon = self.L2_loss(x_recon, x)
+            self.loss_recon = self.L2_loss(x_recon, x_op)
             x_norm, rendered_norm = self.vgg_norm((x + 1) / 2), self.vgg_norm(rendered)
             rendered_feat, x_feat = self.perceptual_net(rendered_norm), self.perceptual_net(x_norm)
             self.loss_perc = self.weight_percept * self.L2_loss(rendered_feat, x_feat)
@@ -564,6 +580,7 @@ class uorfTrainModel(BaseModel):
             _, N, D, H, W, _ = self.masked_raws.shape
             masked_raws = self.masked_raws  # KxNxDxHxWx4
             unmasked_raws = self.unmasked_raws  # KxNxDxHxWx4
+            silhouttes = self.silhouettes #NxKxHxW ??
             for k in range(self.num_slots):
                 raws = masked_raws[k]  # NxDxHxWx4
                 z_vals, ray_dir = self.z_vals, self.ray_dir
@@ -584,13 +601,20 @@ class uorfTrainModel(BaseModel):
 
                 setattr(self, 'slot{}_attn'.format(k), self.attn[k] * 2 - 1)
 
+                sil = silhouttes[:, k]  # (NxKxHxW)
+
+                for i in range(self.opt.n_img_each_scene):
+                    setattr(self, 'silhoutte_slot{}_view{}'.format(k, i), sil[i].expand(3, sil[i].shape[0], sil[i].shape[1]))
+
+                # setattr(self, 'slot{}_attn'.format(k), self.attn[k] * 2 - 1)
+
     def backward(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
-        loss = self.loss_recon + self.loss_perc
-        if self.opt.silhouette_loss:
-            loss += self.loss_silhouette
-        if self.opt.rgb_loss_density_decoder:
-            loss += self.loss_recon_density
+        loss = self.loss_silhouette + self.loss_recon #+ self.loss_perc
+        # if self.opt.silhouette_loss:
+        #     loss += self.loss_silhouette
+        # if self.opt.rgb_loss_density_decoder:
+        #     loss += self.loss_recon_density
         loss.backward()
         self.loss_perc = self.loss_perc / self.weight_percept if self.weight_percept > 0 else self.loss_perc
 
