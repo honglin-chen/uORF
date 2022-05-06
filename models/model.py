@@ -9,6 +9,8 @@ from torch import autograd
 from .networks import get_norm_layer
 from .resnetfc import ResnetFC
 
+import os
+
 
 class Encoder(nn.Module):
     def __init__(self, input_nc=3, z_dim=64, bottom=False):
@@ -35,7 +37,7 @@ class Encoder(nn.Module):
         self.enc_up_1 = nn.Sequential(nn.Conv2d(z_dim * 2, z_dim, 3, stride=1, padding=1),
                                       nn.ReLU(True))
 
-    def forward(self, x):
+    def forward(self, x, masks=None):
         """
         input:
             x: input image, Bx3xHxW
@@ -201,6 +203,7 @@ class PixelEncoder(nn.Module):
             x = F.interpolate(
                 x,
                 scale_factor=self.feature_scale,
+                # mode=self.index_interp,
                 # mode="bilinear" if self.feature_scale > 1.0 else "area",
                 # align_corners=True if self.feature_scale > 1.0 else None,
                 # recompute_scale_factor=True,
@@ -1346,3 +1349,163 @@ class PositionalEncoding(torch.nn.Module):
             conf.get_float("freq_factor", np.pi),
             conf.get_bool("include_input", True),
         )
+
+class CentroidDecoder(nn.Module):
+    def __init__(self, input_dim, z_dim, cam2pixel, world2nss, near, far, small_latent=False, n_layers=3):
+        """
+        input_dim: pos emb dim + slot dim
+        z_dim: network latent dim
+        n_layers: #layers before/after skip connection.
+        """
+        super().__init__()
+
+        latent_dim = z_dim // 2 if small_latent else z_dim
+
+        # [Create centroid decoder]
+        before_skip = [nn.Linear(input_dim, latent_dim), nn.ReLU(True)]
+        after_skip = [nn.Linear(latent_dim + input_dim, latent_dim), nn.ReLU(True)]
+        for i in range(n_layers - 1):
+            before_skip.append(nn.Linear(latent_dim, latent_dim))
+            before_skip.append(nn.ReLU(True))
+            after_skip.append(nn.Linear(latent_dim, latent_dim))
+            after_skip.append(nn.ReLU(True))
+
+        self.p_before = nn.Sequential(*before_skip)
+        self.p_after = nn.Sequential(*after_skip)
+        self.p_after_latent = nn.Linear(latent_dim, latent_dim)
+        self.p_pos = nn.Sequential(nn.Linear(latent_dim, latent_dim // 4),
+                                     nn.ReLU(True),
+                                     nn.Linear(latent_dim // 4, 3))
+
+        # [Set attributes]
+        self.cam2pixel = cam2pixel
+        self.world2nss = world2nss
+        self.near = near
+        self.far = far
+        self.frustum_size = None
+        self.cam2world = None
+
+    def forward(self, p_slots):
+
+        assert p_slots is not None
+        p_fg = p_slots[1:]  # (K-1)xC
+        tmp = self.p_before(p_fg)
+        tmp = self.p_after(torch.cat([p_fg, tmp], dim=1))
+        latent = self.p_after_latent(tmp)
+        fg_pos = self.p_pos(latent)
+        fg_pos = fg_pos.sigmoid() # (K-1)x3
+
+        cam02world = self.cam2world[0]  # 4x4
+        world2cam = self.cam2world.inverse()  # Nx4x4
+        cam2pixel = self.cam2pixel[None]  # 1x4x4
+        pixel2cam = self.cam2pixel.inverse()  # 1x4x4
+
+        frustum_size = self.frustum_size
+
+        # [Project predicted centroid]
+        z_cam = fg_pos[..., -1] * (self.far - self.near) + self.near  # (K-1)
+        fg_pos = fg_pos * (frustum_size.unsqueeze(0) - 1)  # [0, 1] -> [0, frustum_size]
+
+        unorm_fg_pos = torch.zeros_like(fg_pos)  # (K-1)x3
+        unorm_fg_pos[..., 0:2] = fg_pos[..., 0:2] * z_cam.unsqueeze(-1)
+        unorm_fg_pos[..., 2] = z_cam
+
+        fg_pixel0_pos = torch.cat([unorm_fg_pos, torch.ones_like(fg_pos[:, 0:1])], dim=-1)  # (K-1)x4
+        fg_pixel0_pos = fg_pixel0_pos.permute(1, 0)  # 4x(K-1)
+        fg_cam0_pos = torch.matmul(pixel2cam, fg_pixel0_pos)  # 4x4, 4x(K-1) -> 4x(K-1)
+        fg_centroid_world = torch.matmul(cam02world, fg_cam0_pos)  # 4x4, 4x(K-1) -> 4x(K-1)
+        fg_centroid_cam = torch.matmul(world2cam, fg_centroid_world)  # Nx4x4,4x(K-1) -> Nx4x(K-1)
+        fg_centroid_pixel = torch.matmul(cam2pixel, fg_centroid_cam)  # 1x4x4, Nx4x(K-1) -> Nx4x(K-1)
+        fg_centroid_pixel = fg_centroid_pixel.permute(0, 2, 1)  # Nx(K-1)x4
+
+        fg_centroid_pixel = fg_centroid_pixel[:, :, 0:2] / fg_centroid_pixel[:, :, 2:3]  # Nx(K-1)x2
+        fg_centroid_pixel = torch.flip(fg_centroid_pixel, dims=(-1,))
+
+        fg_centroid_nss = torch.matmul(self.world2nss, fg_centroid_world)  # 1x4x4, 4x(K-1) -> 1x4x(K-1)
+
+        fg_centroid_world = fg_centroid_world.permute(1, 0) # (K-1)x4
+        fg_centroid_nss = fg_centroid_nss[0].permute(1, 0)  # (K-1)x4
+
+        return fg_centroid_world, fg_centroid_nss, fg_centroid_pixel
+
+    def transform_coords(self, coords, centroids):
+        # coords: (K-1)xPx3,  cenroids: (K-1)x4
+        centroids = centroids[:, 0:3].unsqueeze(1)  # (K-1)x1x3
+        return coords - centroids  # (K-1)xPx3
+
+    def centroid_loss(self, centroid_pixel, margin, segment_centers, segment_masks, epoch):
+        # Target centroid positions
+        target_pos = segment_centers[:, 1:]  # Nx(K-1)x2
+        segment_area = segment_masks[:, 1:].sum(-1)  # Nx(K-1)x1
+        loss_mask = (segment_area > 0).float().detach()
+
+        # Normalize coordinates:
+        pixel_pos = centroid_pixel / self.frustum_size[0:2].view(1, 1, 2)
+        target_pos = target_pos / self.frustum_size[0:2].view(1, 1, 2)
+
+        # Loss as the euclidean distance between the predicted and target centroid positions
+        distance = ((pixel_pos - target_pos) ** 2).sum(-1) ** 0.5
+        self.loss_centroid_raw = (distance - margin).clamp(min=0.) * loss_mask
+        self.loss_centroid = ((distance - margin).clamp(min=0.) * loss_mask).sum()
+
+        # [Visualization]
+        if not os.path.exists('tmp/%d.png' % epoch):
+            self.visualize_centroid(pixel_pos, target_pos, segment_masks, epoch=epoch)
+
+        return self.loss_centroid
+
+    def visualize_centroid(self, pred_center, target_center, segment_masks, epoch, savedir=None):
+        if True:
+            pass
+        else:
+            fig, axs = plt.subplots(segment_masks.shape[0], segment_masks.shape[1], figsize=(5, 5))  # Nx3
+
+            center_x = target_center[..., 0] * self.frustum_size[0]  # Nx3
+            center_y = target_center[..., 1] * self.frustum_size[1]  # Nx3
+
+            pred_x = pred_center[..., 0] * self.frustum_size[0]  # Nx3
+            pred_y = pred_center[..., 1] * self.frustum_size[1]  # Nx3
+
+            for i in range(segment_masks.shape[0]):
+                _x = ((self.x[i] + 1) / 2).clone()
+
+                axs[i, 0].imshow(_x.permute(1, 2, 0).cpu())
+                axs[i, 0].set_axis_off()
+                for j in range(1, segment_masks.shape[1]):
+                    axs[i, j].imshow(segment_masks[i, j].cpu().reshape([int(self.frustum_size[0]), int(self.frustum_size[1])]))
+                    center = [center_y[i, j - 1], center_x[i, j - 1]]
+                    pred = [pred_y[i, j - 1], pred_x[i, j - 1]]
+                    axs[i, j].add_patch(plt.Circle(center, 2.0, color='g'))
+                    axs[i, j].add_patch(plt.Circle(pred, 2.0, color='r'))
+                    axs[i, j].set_axis_off()
+                    axs[i, j].set_title('dist: %.2f' % self.loss_centroid_raw[i, j-1], fontsize=10)
+            plt.show()
+            fig.suptitle('Centroid loss: %.3f' % self.loss_centroid)
+            if savedir is None:
+                plt.savefig('tmp/%d.png' % epoch, bbox_inches='tight')
+            else:
+                plt.savefig('tmp/%s.png' % savedir, bbox_inches='tight')
+
+            plt.close()
+
+        # Save data for visualization
+        # data = {
+        #     'img': (self.x + 1) / 2,
+        #     'world_pos': world_pos,
+        #     'segment': segment_masks
+        # }
+        # print('Save data to ', './save_tensor/%d.pt' % epoch)
+        # torch.save(data, './save_tensor/%d.pt' % epoch)
+
+        # Visualize the line of projection with varying depth
+        # if epoch > 100000:
+        #
+        #     num = 20
+        #     interval = 1.0 / num
+        #     temp_pos = save_fg_pos.clone()
+        #
+        #     for i in range(num):
+        #         temp_pos[:, -1] = i * interval
+        #         temp_uv = project_pos(temp_pos)
+        #         plot(temp_uv, savedir='%d-%d' % (epoch, i))
+        #     breakpoint()

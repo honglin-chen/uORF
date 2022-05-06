@@ -18,7 +18,6 @@ python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
     --pixel_encoder --mask_image \
     --use_ray_dir \
     --restrict_world \
-    --frame5 \
     --color_after_density \
     --frame5 \
 

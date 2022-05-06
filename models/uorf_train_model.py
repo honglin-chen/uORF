@@ -9,9 +9,37 @@ import os
 import time
 from .projection import Projection
 from torchvision.transforms import Normalize
-from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder, raw2transmittances, raw2colors, ImageEncoder
+from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder, raw2transmittances, raw2colors, ImageEncoder, CentroidDecoder
+from .position_encoding import position_encoding_image
 import pdb
 from util import util
+
+import math
+
+def positionalencoding2d(d_model, height, width):
+    """
+    :param d_model: dimension of the model
+    :param height: height of the positions
+    :param width: width of the positions
+    :return: d_model*height*width position matrix
+    """
+    if d_model % 4 != 0:
+        raise ValueError("Cannot use sin/cos positional encoding with "
+                         "odd dimension (got dim={:d})".format(d_model))
+    pe = torch.zeros(d_model, height, width)
+    # Each dimension use half of d_model
+    d_model = int(d_model / 2)
+    div_term = torch.exp(torch.arange(0., d_model, 2) *
+                         -(math.log(10000.0) / d_model))
+    pos_w = torch.arange(0., width).unsqueeze(1)
+    pos_h = torch.arange(0., height).unsqueeze(1)
+    pe[0:d_model:2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[1:d_model:2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[d_model::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+    pe[d_model + 1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+
+    return pe
+
 
 
 class DiceLoss(nn.Module):
@@ -27,10 +55,11 @@ class DiceLoss(nn.Module):
         # N, K, H, W = inputs.shape.as_list()
         inputs = inputs.flatten(2, 3)
         targets = targets.flatten(2, 3)
+        targets = 1 - F.threshold(1 - targets, 0.2, 0)
 
         intersection = (inputs * targets).sum(dim=-1)
-        dice = (2. * intersection + smooth) / (inputs.sum() + targets.sum() + smooth)
-        dice = dice.sum()
+        dice = (2. * intersection + smooth) / (inputs.sum(dim=-1) + targets.sum(dim=-1) + smooth)
+        dice = dice.mean()
 
         return 1 - dice
 
@@ -122,6 +151,21 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--silhouette_l2_loss', action='store_true')
         parser.add_argument('--combine_masks', action='store_true', help='combine all the masks for pixel nerf')
         parser.add_argument('--weight_pixel_slot_mask', action='store_true')
+        parser.add_argument('--silhouette_loss_nobackprop', action='store_true', help='only compute but do not back propagate silhouette loss')
+        parser.add_argument('--bg_no_silhouette_loss', action='store_true', help='do not include bg in the silhouette loss')
+        parser.add_argument('--silhouette_epoch', type=int, default=100)
+        parser.add_argument('--mask_div_by_mean', action='store_true')
+        parser.add_argument('--only_make_silhouette_not_delete', action='store_true')
+        parser.add_argument('--weight_silhouette_loss', action='store_true')
+        parser.add_argument('--threshold_silhouette_loss', action='store_true')
+        parser.add_argument('--mask_image_slot', action='store_true')
+        parser.add_argument('--nearest_interp', action='store_true', help='put nearest interp for pixel and so on')
+        parser.add_argument('--slot_positional_encoding', action='store_true', help='put 2d positional encoding')
+        parser.add_argument('--mask_image_feature_slot', action='store_true')
+        parser.add_argument('--predict_centroid', action='store_true')
+        parser.add_argument('--learn_only_centroid', action='store_true', help='loss function contains only centroid loss')
+
+        parser.add_argument('--loss_centroid_margin', type=float, default=0.05, help='max margin for the centroid loss')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=2000, custom_lr=True, lr_policy='warmup')
@@ -167,9 +211,11 @@ class uorfTrainModel(BaseModel):
         if self.opt.color_after_density:
             assert self.opt.unified_decoder
 
+        self.interp_mode = 'nearest' if self.opt.nearest_interp else 'bilinear'
+
         # [uORF Encoder]
         if self.opt.resnet_encoder:
-            self.netEncoder = networks.init_net(PixelEncoder(mask_image=False, mask_image_feature=False), gpu_ids=self.gpu_ids, init_type='None')
+            self.netEncoder = networks.init_net(PixelEncoder(mask_image=self.opt.mask_image_slot, mask_image_feature=self.opt.mask_image_feature_slot, index_interp=self.interp_mode), gpu_ids=self.gpu_ids, init_type='None')
             self.parameters.append(self.netEncoder.parameters())
             self.nets.append(self.netEncoder)
             self.model_names.append('Encoder')
@@ -179,18 +225,67 @@ class uorfTrainModel(BaseModel):
             self.nets.append(self.netEncoder)
             self.model_names.append('Encoder')
 
+        if self.opt.slot_positional_encoding:
+            # [Position encoding]
+            p_dim = z_dim
+            if self.opt.resnet_encoder:
+                self.pos_emb = position_encoding_image(size=[opt.input_size//2, opt.input_size//2], num_pos_feats=p_dim // 2).to(
+                self.device)
+            else:
+                self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size],
+                                                            num_pos_feats=p_dim // 2).to(self.device)
+            slot_in_dim = z_dim + p_dim
+            slot_slot_dim = p_dim
+        else:
+            slot_in_dim = z_dim
+            slot_slot_dim = z_dim
+
+        if self.opt.predict_centroid:
+            p_dim = z_dim
+            self.netSlotAttention_pos = networks.init_net(
+                SlotAttention(num_slots=opt.num_slots, in_dim=p_dim + z_dim, slot_dim=p_dim, iters=opt.attn_iter,
+                              gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
+            self.nets.append(self.netSlotAttention_pos)
+            self.parameters.append(self.netSlotAttention_pos.parameters())
+            self.model_names.append('SlotAttention_pos')
+
+            self.netCentroidDecoder = networks.init_net(
+                CentroidDecoder(input_dim=p_dim,
+                                z_dim=p_dim,
+                                cam2pixel=self.projection.cam2spixel,
+                                world2nss=self.projection.world2nss,
+                                near=self.projection.near,
+                                far=self.projection.far,
+                                small_latent=self.opt.small_latent,
+                                n_layers=opt.n_layer),
+                gpu_ids=self.gpu_ids, init_type='xavier')
+            self.parameters.append(self.netCentroidDecoder.parameters())
+            self.nets.append(self.netCentroidDecoder)
+            self.model_names.append('CentroidDecoder')
+
+            if not self.opt.slot_positional_encoding:
+
+                if self.opt.resnet_encoder:
+                    self.pos_emb = position_encoding_image(size=[opt.input_size // 2, opt.input_size // 2],
+                                                                num_pos_feats=p_dim // 2).to(self.device)
+                else:
+                    self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size],
+                                                                num_pos_feats=p_dim // 2).to(self.device)
+
+
+
         # [Slot attention]
         self.num_slots = opt.num_slots
         if not self.opt.without_slot_feature:
             self.netSlotAttention = networks.init_net(
-                SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter, gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
+                SlotAttention(num_slots=opt.num_slots, in_dim=slot_in_dim, slot_dim=slot_slot_dim, iters=opt.attn_iter, gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
             self.nets.append(self.netSlotAttention)
             self.parameters.append(self.netSlotAttention.parameters())
             self.model_names.append('SlotAttention')
 
         # [Pixel Encoder]
         if not self.opt.uorf:
-            self.netPixelEncoder = networks.init_net(PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature), gpu_ids=self.gpu_ids, init_type='None')
+            self.netPixelEncoder = networks.init_net(PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature, index_interp=self.interp_mode), gpu_ids=self.gpu_ids, init_type='None')
             self.parameters.append(self.netPixelEncoder.parameters())
             self.nets.append(self.netPixelEncoder)
             self.model_names.append('PixelEncoder')
@@ -305,6 +400,20 @@ class uorfTrainModel(BaseModel):
             masks = F.interpolate(masks.float(), size=[64, 64], mode=mode_)
             self.silhouette_masks = masks
 
+        # [Compute GT segment centroid]
+        if self.opt.predict_centroid:
+            frustum_size = self.projection.frustum_size
+            _masks = F.interpolate(masks.float(), size=frustum_size[0:2], mode='nearest').flatten(2, 3)  # NxKx(HxW)
+            x = torch.arange(frustum_size[0]).to(self.device)  # frustum_size
+            y = torch.arange(frustum_size[1]).to(self.device)  # frustum_size
+            x, y = torch.meshgrid([x, y])  # frustum_sizexfrustum_size
+            x = x.flatten()[None, None]  # NxKx(frustum_size)^2
+            y = y.flatten()[None, None]  # NxKx(frustum_size)^2
+            center_x = (_masks * x).sum(-1) / (_masks.sum(-1) + 1e-12)  # NxK
+            center_y = (_masks * y).sum(-1) / (_masks.sum(-1) + 1e-12)  # NxK
+            self.segment_masks = _masks
+            self.segment_centers = torch.stack([center_x, center_y], dim=-1)  # NxKx2
+
 
     def forward(self, epoch=0):
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
@@ -330,8 +439,22 @@ class uorfTrainModel(BaseModel):
             attn = attn.transpose(0, 1).flatten(2, 3)
 
         # Encoding images
-        feature_map = self.netEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
+        if self.opt.mask_image_slot or self.opt.mask_image_feature_slot:
+            assert self.opt.resnet_encoder
+            if self.opt.resnet_encoder:
+                masks_slot = attn
+            else:
+                masks_slot = self.masks.squeeze(0)
+        else:
+            masks_slot = None
+
+        feature_map = self.netEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode=self.interp_mode), masks=masks_slot)  # BxCxHxW # 0506
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
+
+        if self.opt.slot_positional_encoding:
+            pos_embed = self.pos_emb  # self.netPositionEmbedding()
+            pos_feat = torch.cat([pos_embed, feat], dim=-1)
+            feat = pos_feat
 
         # Slot Attention
         if self.opt.pixel_nerf:
@@ -353,7 +476,7 @@ class uorfTrainModel(BaseModel):
         # Pixel Encoder Forward (to get feature values in pixel coordinates (uv), call pixelEncoder.index(uv), not forward)
         if not self.opt.uorf:
             masks = self.masks.squeeze(0) if self.opt.mask_image or self.opt.mask_image_feature else None
-            feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False), masks = masks)
+            feature_map_pixel = self.netPixelEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode=self.interp_mode), masks = masks)
 
         # Get rays and coordinates
         cam2world = self.cam2world
@@ -363,8 +486,9 @@ class uorfTrainModel(BaseModel):
             W, H, D = self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp
             frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
-            x = F.interpolate(self.x, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
+            x = F.interpolate(self.x, size=self.opt.supervision_size, mode=self.interp_mode)
             self.z_vals, self.ray_dir = z_vals, ray_dir
+            frustum_size = torch.Tensor(self.projection.frustum_size).to(self.device)
         else:
             W, H, D = self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp
             start_range = self.opt.frustum_size_fine - self.opt.render_size
@@ -376,11 +500,12 @@ class uorfTrainModel(BaseModel):
             W_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             frus_nss_coor_, z_vals_, ray_dir_ = frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(0, 3), z_vals_.flatten(0, 2), ray_dir_.flatten(0, 2)
-            x = F.interpolate(self.x, size=128, mode='bilinear', align_corners=False)
+            x = F.interpolate(self.x, size=128, mode=self.interp_mode)
             x = x[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.silhouette_masks = self.silhouette_masks_fine[..., H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.z_vals, self.ray_dir = z_vals, ray_dir
             W, H, D = self.opt.render_size, self.opt.render_size, self.opt.n_samp
+            frustum_size = torch.Tensor(self.projection_fine.frustum_size).to(self.device)
 
         if self.opt.use_ray_dir:
             ray_dir_input = ray_dir.view([N, H, W, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
@@ -438,6 +563,34 @@ class uorfTrainModel(BaseModel):
                     uv = uv.expand(K, -1, -1)  # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
             else:
                 uv = uv.expand(K, -1, -1)
+
+        # Decoder centroid
+        if self.opt.predict_centroid:
+            if not self.opt.slot_positional_encoding:
+                pos_embed = self.pos_emb  # self.netPositionEmbedding()
+                pos_feat = torch.cat([pos_embed, feat], dim=-1)
+            else:
+                pos_feat = feat
+
+            # Get slot features
+            p_slots, _ = self.netSlotAttention_pos(pos_feat, masks=attn.unsqueeze(0))  # 1xKxC
+
+            # Predict centroid
+            self.netCentroidDecoder.frustum_size = frustum_size
+            self.netCentroidDecoder.cam2world = self.cam2world
+            _, centroid_nss, centroid_pixel = self.netCentroidDecoder(p_slots.squeeze(0))
+
+            # Transform sampling coordinates
+            sampling_coor_fg = self.netCentroidDecoder.transform_coords(coords=sampling_coor_fg, centroids=centroid_nss)
+
+            # Compute centroid loss
+            self.netCentroidDecoder.x = self.x
+            self.loss_centroid = self.netCentroidDecoder.centroid_loss(
+                centroid_pixel=centroid_pixel, margin=self.opt.loss_centroid_margin,
+                segment_centers=self.segment_centers, segment_masks=self.segment_masks, epoch=epoch)
+
+            if self.opt.learn_only_centroid:
+                return
 
         if self.opt.mask_as_decoder_input or self.opt.weight_pixel_slot_mask:
             silhouette0 = self.silhouette_masks[0:1].transpose(0, 1)  # Kx1xHxW
@@ -531,19 +684,45 @@ class uorfTrainModel(BaseModel):
             self.loss_perc = self.weight_percept * self.L2_loss(rendered_feat, x_feat)
 
         if self.opt.silhouette_loss:
+            # print(torch.sum(torch.sum(self.silhouette_masks, dim=1).flatten(1, 2), dim=1), 'mask sum') this is 4096
+
+            idx = 1 if self.opt.bg_no_silhouette_loss else 0
+            silhouette_masks_ = self.silhouette_masks[:, idx:, ...]
+            silhouettes_ = self.silhouettes[:, idx:, ...]
+            if self.opt.only_make_silhouette_not_delete:
+                silhouettes_ *= silhouette_masks_
+            if self.opt.mask_div_by_mean:
+                # silhouettes_ /= (1e-10 + silhouettes_.flatten(2, 3).mean(dim=-1).unsqueeze(-1).unsqueeze(-1))
+                # silhouettes_masks_ /= (1e-10 + silhouettes_masks_.flatten(2, 3).mean(dim=-1).unsqueeze(-1).unsqueeze(-1))
+                silhouettes_ /= (1e-10 + silhouettes_.flatten(0, 3).mean())
+                silhouette_masks_ /= (1e-10 + silhouette_masks_.flatten(0, 3).mean())
             if self.opt.mask_div_by_max:
                 # self.silhouettes /= (1e-10+self.silhouettes.flatten(2, 3).max(dim=-1)[0].unsqueeze(-1).unsqueeze(-1))
-                self.silhouettes /= (1e-10 + self.silhouettes.flatten(0, 3).max(dim=-1)[0])
+                silhouettes_ /= (1e-10 + silhouettes_.flatten(0, 3).max(dim=-1)[0])
             if self.opt.dice_loss:
-                self.loss_silhouette = self.dice_loss(self.silhouette_masks, self.silhouettes) # NxKxHxW # 128x128
+                self.loss_silhouette = self.dice_loss(silhouette_masks_, silhouettes_) # NxKxHxW # 128x128
                 # print('dice_loss', self.loss_silhouette)
             elif self.opt.kldiv_loss:
-                targets = self.silhouette_masks
-                inputs = self.silhouettes
+                targets = silhouette_masks_
+                inputs = silhouettes_
             elif self.opt.silhouette_l2_loss:
-                self.loss_silhouette = self.L2_loss(self.silhouette_masks, self.silhouettes) # NxKxHxW
+                self.loss_silhouette = self.L2_loss(silhouette_masks_, silhouettes_) # NxKxHxW
             else:
-                self.loss_silhouette = self.L1_loss(self.silhouette_masks, self.silhouettes) # NxKxHxW
+                self.loss_silhouette = self.L1_loss(silhouette_masks_, silhouettes_) # NxKxHxW
+            if self.opt.weight_silhouette_loss:
+                mask_area = torch.sum(silhouette_masks_.flatten(2, 3), dim=-1)
+                mask_area_complement = torch.sum((1-silhouette_masks_).flatten(2, 3), dim=-1)
+                silhouettes_mask = silhouettes_ * silhouette_masks_
+                silhouettes_mask_complement = (1 - silhouettes_) * (1 - silhouette_masks_)
+                loss = 0
+                for i in range(silhouettes_.shape[0]):
+                    for j in range(silhouettes_.shape[1]):
+                        loss += self.L2_loss(silhouettes_mask[i][j], silhouette_masks_[i][j]) / mask_area[i, j]
+                        loss += self.L2_loss(silhouettes_mask_complement[i][j], (1-silhouette_masks_[i][j])) / mask_area_complement[i][j]
+                self.loss_silhouette = loss
+            if (self.opt.uorf or self.opt.color_after_density) and self.opt.silhouette_epoch!=0:
+                if epoch < self.opt.silhouette_epoch:
+                    self.loss_silhouette = 0
 
         with torch.no_grad():
             attn = attn.detach().cpu()  # KxN
@@ -587,10 +766,12 @@ class uorfTrainModel(BaseModel):
     def backward(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
         loss = self.loss_recon + self.loss_perc
-        if self.opt.silhouette_loss:
-            loss += self.loss_silhouette
+        if self.opt.silhouette_loss and self.loss_silhouette != 0:
+            loss += self.loss_silhouette * 100
         if self.opt.rgb_loss_density_decoder:
             loss += self.loss_recon_density
+        if self.opt.predict_centroid:
+            loss += self.loss_centroid
         loss.backward()
         self.loss_perc = self.loss_perc / self.weight_percept if self.weight_percept > 0 else self.loss_perc
 
