@@ -21,6 +21,7 @@ class MultiscenesDataset(BaseDataset):
         parser.add_argument('--frame5', action='store_true')
         parser.add_argument('--skip', type=int, default=0)
         parser.add_argument('--dataset_nearest_interp', action='store_true')
+        parser.add_argument('--dataset_combine_masks', action='store_true')
         return parser
 
     def __init__(self, opt):
@@ -32,7 +33,7 @@ class MultiscenesDataset(BaseDataset):
         BaseDataset.__init__(self, opt)
         self.n_scenes = opt.n_scenes
         self.n_img_each_scene = opt.n_img_each_scene
-        self.min_num_masks = opt.num_slots
+        self.min_num_masks = self.opt.num_slots if not self.opt.dataset_combine_masks else 4
         image_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*.png')))  # root/00000_sc000_az00_el00.png
         mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask.png')))
         fg_mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask_for_moving.png')))

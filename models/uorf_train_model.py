@@ -46,7 +46,7 @@ class DiceLoss(nn.Module):
     def __init__(self, weight=None, size_average=True):
         super(DiceLoss, self).__init__()
 
-    def forward(self, inputs, targets, smooth=1):
+    def forward(self, inputs, targets, smooth=1, mode='dice'):
         # comment out if your model contains a sigmoid or equivalent activation layer
         # inputs = F.sigmoid(inputs)
 
@@ -55,13 +55,28 @@ class DiceLoss(nn.Module):
         # N, K, H, W = inputs.shape.as_list()
         inputs = inputs.flatten(2, 3)
         targets = targets.flatten(2, 3)
-        targets = 1 - F.threshold(1 - targets, 0.2, 0)
+        # targets = 1 - F.threshold(1 - targets, 0.1, 0)
 
-        intersection = (inputs * targets).sum(dim=-1)
-        dice = (2. * intersection + smooth) / (inputs.sum(dim=-1) + targets.sum(dim=-1) + smooth)
-        dice = dice.mean()
+        if mode =='dice':
+            intersection = (inputs * targets).sum(dim=-1)
+            dice = (2. * intersection + smooth) / (inputs.sum(dim=-1) + targets.sum(dim=-1) + smooth)
+            dice = dice.mean()
 
-        return 1 - dice
+            loss = 1 - dice
+
+        if mode=='tversky':
+            alpha = 0.2
+            beta = 0.8
+
+            TP = (inputs * targets).sum()
+            FP = ((1 - targets) * inputs).sum()
+            FN = (targets * (1 - inputs)).sum()
+
+            Tversky = (TP + smooth) / (TP + alpha * FP + beta * FN + smooth)
+
+            loss = 1 - Tversky
+
+        return loss
 
 class uorfTrainModel(BaseModel):
 
@@ -166,6 +181,8 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--learn_only_centroid', action='store_true', help='loss function contains only centroid loss')
 
         parser.add_argument('--loss_centroid_margin', type=float, default=0.05, help='max margin for the centroid loss')
+        parser.add_argument('--progressive_silhouette', action='store_true', help='epoch 0-10: learn only fg silhouette, epoch 10-20: learn silhouette and rgb, epoch 20- rgb')
+        parser.add_argument('--learn_fg_first', action='store_true')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=2000, custom_lr=True, lr_policy='warmup')
@@ -186,7 +203,11 @@ class uorfTrainModel(BaseModel):
         """
         BaseModel.__init__(self, opt)  # call the initialization method of BaseModel
         print(self.isTrain, 'self.isTrain')
-        self.loss_names = ['recon', 'perc', 'silhouette']
+        self.loss_names = ['recon', 'perc']
+        if self.opt.silhouette_loss:
+            self.loss_names.append('silhouette')
+        if self.opt.predict_centroid:
+            self.loss_names.append('centroid')
         n = opt.n_img_each_scene
         self.visual_names = ['x{}'.format(i) for i in range(n)] + \
                             ['x_rec{}'.format(i) for i in range(n)] + \
@@ -522,9 +543,18 @@ class uorfTrainModel(BaseModel):
         if self.opt.pixel_encoder or self.opt.mask_as_decoder_input:
             # get cam matrices
             # W, H, D = self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp # what is this?
-            self.cam2spixel = self.projection.cam2spixel
-            self.world2nss = self.projection.world2nss
-            frustum_size = torch.Tensor(self.projection.frustum_size).to(self.device)
+            # self.cam2spixel = self.projection.cam2spixel
+            # self.world2nss = self.projection.world2nss
+            frustum_size_ = torch.Tensor(self.projection.frustum_size).to(self.device)
+            # print(frus_nss_coor.max(), frus_nss_coor.min(), frus_nss_coor.mean(), frus_nss_coor.std(), 'frus_nss_coor max, min, mean, std')
+
+            self.cam2spixel = self.projection_fine.cam2spixel
+            self.world2nss = self.projection_fine.world2nss
+            frustum_size = torch.Tensor(self.projection_fine.frustum_size).to(self.device)
+
+            # print(self.cam2spixel, 'self.cam2spixel')
+            # print(self.world2nss, 'self.world2nss')
+            # print(frustum_size, 'frustum_size')
 
             # construct uv in the first image coordinates
             cam02world = cam2world[0:1] # 1x4x4
@@ -535,8 +565,14 @@ class uorfTrainModel(BaseModel):
             frus_cam0_coor = torch.matmul(world2cam0[None, ...], frus_world_coor) #1x1x4x4, 1x(NxDxHxW)x4x1 -> 1x(NxDxHxW)x4x1 # TODO: check this
             pixel_cam0_coor = torch.matmul(self.cam2spixel[None, ...], frus_cam0_coor) # 1x1x4x4, 1x(NxDxHxW)x4x1
             pixel_cam0_coor = pixel_cam0_coor.squeeze(-1) # 1x(NxDxHxW)x4
-            uv = pixel_cam0_coor[:, :, 0:2]/pixel_cam0_coor[:, :, 2].unsqueeze(-1) # 1x(NxDxHxW)x2
+            # print(pixel_cam0_coor[..., 2].max(), pixel_cam0_coor[..., 2].min(), pixel_cam0_coor[..., 2].mean(), pixel_cam0_coor[..., 2].std(), 'pixel_cam0_coor statistics')
+            uv = pixel_cam0_coor[:, :, 0:2]/ pixel_cam0_coor[:, :, 2].unsqueeze(-1) # 1x(NxDxHxW)x2
             uv = (uv + 0.)/frustum_size[0:2][None, None, :] * 2 - 1 # nomalize to fit in with [-1, 1] grid # TODO: check this
+            # print(uv.max(), uv.min(), uv.mean(), uv.std(), 'max, min, mean, std')
+
+            # print('----')
+            # print(uv.view([N, D, H, W, 2])[1, 32, 0, 0, :] ,'uv')
+            # print('----')
             # 0 -> 0.5/frustum_size, 1 -> 1.5/frustum_size, ..., frustum_size-1 -> (frustum_size-0.5/frustum_size)
             # then, change [0, 1] -> [-1, 1]
             # if self.opt.debug:
@@ -576,7 +612,7 @@ class uorfTrainModel(BaseModel):
             p_slots, _ = self.netSlotAttention_pos(pos_feat, masks=attn.unsqueeze(0))  # 1xKxC
 
             # Predict centroid
-            self.netCentroidDecoder.frustum_size = frustum_size
+            self.netCentroidDecoder.frustum_size = frustum_size_
             self.netCentroidDecoder.cam2world = self.cam2world
             _, centroid_nss, centroid_pixel = self.netCentroidDecoder(p_slots.squeeze(0))
 
@@ -612,10 +648,13 @@ class uorfTrainModel(BaseModel):
             # silhouettes_for_density = None
             pass
         if self.opt.unified_decoder:
+            render_bg = True
+            if self.opt.learn_fg_first:
+                render_bg = False if epoch < 60 else True
             raws, masked_raws, unmasked_raws, masks_for_silhouette = \
                 self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat=pixel_feat,
                                        ray_dir_input=ray_dir_input, decoder_type='unified',
-                                       silhouettes=silhouettes_for_density)
+                                       silhouettes=silhouettes_for_density, render_bg=render_bg)
             # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1
             raws = raws.view([N, D, H, W, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
             masked_raws = masked_raws.view([K, N, D, H, W, 4])
@@ -674,19 +713,67 @@ class uorfTrainModel(BaseModel):
         rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
         x_recon = rendered * 2 - 1
 
+        if self.opt.progressive_silhouette:
+            # print(epoch, 'epoch')
+            start = 0
+            if self.opt.predict_centroid:
+                start = 30
+                self.opt.only_make_silhouette_not_delete = True
+            else:
+                self.opt.only_make_silhouette_not_delete = False
+            if epoch < start:
+                self.opt.silhouette_loss = False
+                self.loss_silhouette = 0.
+                self.opt.learn_only_silhouette = False
+                self.opt.only_make_silhouette_not_delete = True
+                self.opt.silhouette_epoch = 0
+            # elif epoch < 10 + start:
+            #     self.opt.silhouette_loss = True
+            #     self.opt.learn_only_silhouette = True
+            #     self.opt.bg_no_silhouette_loss = True
+            #     self.opt.only_make_silhouette_not_delete = True
+            #     # self.opt.silhouette_l2_loss = True
+            #     self.opt.silhouette_epoch = 0
+            # elif epoch < 20 + start:
+            #     self.opt.silhouette_loss = True
+            #     self.opt.learn_only_silhouette = False
+            #     self.opt.bg_no_silhouette_loss = True
+            #     self.opt.only_make_silhouette_not_delete = True
+            #     # self.opt.silhouette_l2_loss = True
+            elif epoch < 30 + start:
+                self.opt.silhouette_loss = True
+                self.opt.learn_only_silhouette = False
+                self.opt.bg_no_silhouette_loss = False
+                self.opt.only_make_silhouette_not_delete = True
+            else:
+                self.opt.silhouette_loss = False
+                self.opt.silhouette_l2_loss = False
+                self.loss_silhouette = 0.
+
         if self.opt.learn_only_silhouette:
             self.loss_recon *= 0.
             self.loss_perc *= 0.
         else:
-            self.loss_recon = self.L2_loss(x_recon, x)
+            if self.opt.learn_fg_first:
+                if epoch > 60:
+                    self.opt.learn_fg_first = False
+                obj_masks = self.silhouette_masks[:, 1:, :, :] # NxKxHxW
+                obj_mask = torch.zeros_like(obj_masks[:, 0, ...])
+                for i in range(obj_masks.shape[1]):
+                    obj_mask = obj_mask + obj_masks[:, i, ...]
+                obj_mask = obj_mask.unsqueeze(1)
+                self.loss_recon = self.L2_loss(x_recon, x * obj_mask + -(1-obj_mask)*torch.ones_like(x)) #Nx3xHxW
+            else:
+                self.loss_recon = self.L2_loss(x_recon, x)
             x_norm, rendered_norm = self.vgg_norm((x + 1) / 2), self.vgg_norm(rendered)
             rendered_feat, x_feat = self.perceptual_net(rendered_norm), self.perceptual_net(x_norm)
             self.loss_perc = self.weight_percept * self.L2_loss(rendered_feat, x_feat)
 
         if self.opt.silhouette_loss:
             # print(torch.sum(torch.sum(self.silhouette_masks, dim=1).flatten(1, 2), dim=1), 'mask sum') this is 4096
-
+            # print('opt.silhouette_loss')
             idx = 1 if self.opt.bg_no_silhouette_loss else 0
+            # print(idx, 'idx')
             silhouette_masks_ = self.silhouette_masks[:, idx:, ...]
             silhouettes_ = self.silhouettes[:, idx:, ...]
             if self.opt.only_make_silhouette_not_delete:
@@ -700,12 +787,14 @@ class uorfTrainModel(BaseModel):
                 # self.silhouettes /= (1e-10+self.silhouettes.flatten(2, 3).max(dim=-1)[0].unsqueeze(-1).unsqueeze(-1))
                 silhouettes_ /= (1e-10 + silhouettes_.flatten(0, 3).max(dim=-1)[0])
             if self.opt.dice_loss:
-                self.loss_silhouette = self.dice_loss(silhouette_masks_, silhouettes_) # NxKxHxW # 128x128
+                # self.loss_silhouette = self.dice_loss(silhouette_masks_, silhouettes_, mode='tversky') # NxKxHxW # 128x128
+                self.loss_silhouette = self.dice_loss(silhouette_masks_, silhouettes_, mode='dice')
                 # print('dice_loss', self.loss_silhouette)
             elif self.opt.kldiv_loss:
                 targets = silhouette_masks_
                 inputs = silhouettes_
             elif self.opt.silhouette_l2_loss:
+                # print('silhouette_l2_loss')
                 self.loss_silhouette = self.L2_loss(silhouette_masks_, silhouettes_) # NxKxHxW
             else:
                 self.loss_silhouette = self.L1_loss(silhouette_masks_, silhouettes_) # NxKxHxW

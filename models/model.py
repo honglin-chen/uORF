@@ -428,7 +428,7 @@ class Decoder(nn.Module):
         self.f_color = nn.Sequential(nn.Linear(latent_dim + ray_dir_dim + pixel_dim_color, latent_dim//4),
                                      nn.ReLU(True),
                                      nn.Linear(latent_dim//4, 3))
-        if pixel_dim is not None and bg_no_pixel and not no_concatenate:
+        if pixel_dim is not None and bg_no_pixel and not no_concatenate and not color_after_density:
             input_dim += -pixel_dim
         before_skip = [nn.Linear(input_dim, latent_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(latent_dim + input_dim, latent_dim), nn.ReLU(True)]
@@ -466,7 +466,7 @@ class Decoder(nn.Module):
         #     self.substitute_pixel_feat = torch.nn.Parameter(torch.zeros(pixel_dim))
 
     def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat=None, no_concatenate=None,
-                ray_dir_input=None, transmittance_samples=None, raw_masks_density=None, decoder_type=None, silhouettes=None):
+                ray_dir_input=None, transmittance_samples=None, raw_masks_density=None, decoder_type=None, silhouettes=None, render_bg=True, render_fg=True):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -623,6 +623,10 @@ class Decoder(nn.Module):
             bg_raws[..., -1:] = bg_raw_shape
         fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # (K-1)xPx4
 
+        if render_bg == False:
+            bg_raws *= 0
+        if render_fg == False:
+            fg_raws *= 0
         all_raws = torch.cat([bg_raws, fg_raws], dim=0)  # KxPx4
         raw_masks = F.relu(all_raws[:, :, -1:], True)  # KxPx1
         if decoder_type=='color':
@@ -631,9 +635,10 @@ class Decoder(nn.Module):
         raw_rgb = (all_raws[:, :, :3].tanh() + 1) / 2
         raw_sigma = raw_masks
 
-        masked_rgb = raw_rgb * masks
+        # masked_rgb = raw_rgb * masks
         unmasked_raws = torch.cat([raw_rgb, raw_sigma], dim=2)  # KxPx4
-        masked_raws = torch.cat([masked_rgb, raw_sigma], dim=2)
+        # masked_raws = torch.cat([masked_rgb, raw_sigma], dim=2)
+        masked_raws = torch.cat([raw_rgb, raw_sigma], dim=2) * masks
         # at_home
         # masked_raws = unmasked_raws * masks
         raws = masked_raws.sum(dim=0)
