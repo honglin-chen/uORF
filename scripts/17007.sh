@@ -23,5 +23,6 @@ python train.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_each_scene 4  \
     --silhouette_loss --silhouette_l2_loss \
 #    --continue_train --exp_id 'latest' \
 
+
 echo "Done"
 # node5 cuda 3
