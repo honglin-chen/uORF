@@ -70,6 +70,39 @@ class uorfExtractMeshModel(BaseModel):
         parser.add_argument('--debug', action='store_true', help='debugging option')
         parser.add_argument('--extract_mesh', action='store_true', help='construct mesh')
 
+        parser.add_argument('--dice_loss', action='store_true', help='convert silhouette loss from L1 to dice loss')
+
+        parser.add_argument('--rgb_loss_density_decoder', action='store_true', help='put rgb loss twice. on color decoder and density decoder')
+        parser.add_argument('--restrict_world', action='store_true', help='restrict the world. the range is hyperparam')
+        parser.add_argument('--reduce_color_decoder', action='store_true', help='reduce the color decoder for memory')
+        parser.add_argument('--density_as_color_input', action='store_true', help='put density as an input of color decoder. this would be diff from both mask and transmittance')
+        parser.add_argument('--mask_as_decoder_input', action='store_true', help='put mask as an input of both density and color decoder.')
+        parser.add_argument('--dice_loss', action='store_true', help='convert silhouette loss from L1 to dice loss')
+
+        parser.add_argument('--unified_decoder', action='store_true', help='do not divide color and density decoder.')
+        parser.add_argument('--same_bg_fg_decoder', action='store_true', help='use same decoder architecture for bg and fg. currently only support unified decoder')
+        parser.add_argument('--bilinear_mask', action='store_true', help='instead of nearest interpolation, use bilinear interpolation')
+        parser.add_argument('--antialias', action='store_true', help='antialias for mask')
+
+        parser.add_argument('--fine_encoder', action='store_true', help='do not interpolate the image')
+        parser.add_argument('--resnet_encoder', action='store_true', help='use resnet encoder for slot features')
+        parser.add_argument('--without_slot_feature', action='store_true', help='remove slot features')
+
+        parser.add_argument('--ray_after_density', action='store_true', help='concatenate ray dir after getting density')
+        # ray after density require use_ray_dir
+        parser.add_argument('--multiply_mask_pixelfeat', action='store_true', help='instead of concatenating mask on decoder input, apply mask on pixelfeat and concatenate')
+        # multiply_mask_pixelfeat require mask_as_decoder_input
+        parser.add_argument('--without_slot_feature', action='store_true', help='remove slot features')
+        parser.add_argument('--uorf', action='store_true', help='remove pixel features')
+        parser.add_argument('--color_after_density', action='store_true', help='unified decoder')
+        parser.add_argument('--debug2', action='store_true')
+        parser.add_argument('--mask_div_by_max', action='store_true')
+        parser.add_argument('--kldiv_loss', action='store_true')
+        parser.add_argument('--silhouette_l2_loss', action='store_true')
+        parser.add_argument('--combine_masks', action='store_true', help='combine all the masks for pixel nerf')
+        parser.add_argument('--weight_pixel_slot_mask', action='store_true')
+
+
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
 

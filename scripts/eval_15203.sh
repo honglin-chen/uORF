@@ -4,7 +4,7 @@ CHECKPOINT=${2:-'/data2/wanhee/uORF/checkpoints/'}
 PORT=8077
 python -m visdom.server -p $PORT &>/dev/null &
 python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
-    --checkpoints_dir $CHECKPOINT --name '14240' --exp_id 'run-2022-05-01-21-48-38' \
+    --checkpoints_dir $CHECKPOINT --name '15203' --exp_id 'run-2022-05-03-01-14-20' \
     --results_dir 'results' \
     --display_port $PORT --display_ncols 4 \
     --load_size 256 --input_size 256 --render_size 8 --frustum_size 128 \
@@ -13,14 +13,23 @@ python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
     --skip 100 \
     --focal_ratio 0.9605 0.9605 \
     --near_plane 1 --far_plane 8 \
-    --gt_seg --pixel_encoder --mask_image \
-    --restrict_world \
     --unified_decoder \
+    --gt_seg \
+    --pixel_encoder --mask_image \
     --use_ray_dir \
+    --restrict_world \
+    --without_slot_feature \
+    --pixel_nerf \
+    --frame5 \
+
 #    --debug2 \
 #    --pixel_after_density \
 #    --without_slot_feature \
-
+# /data2/wanhee/uORF/checkpoints/15201/run-2022-05-03-01-02-10 node6
+#/data2/wanhee/uORF/checkpoints/15202/run-2022-05-03-00-28-03 node6
+#/data2/wanhee/uORF/checkpoints/15202/run-2022-05-03-01-05-51 node6
+#/data2/wanhee/uORF/checkpoints/15203/run-2022-05-03-01-14-20 node6
+#/data2/wanhee/uORF/checkpoints/15204/run-2022-05-03-01-18-38 node6
 # same bg fg decoder did not work before
 echo "Done"
 #render size was 8
