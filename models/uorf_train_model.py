@@ -166,6 +166,7 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--silhouette_l2_loss', action='store_true')
         parser.add_argument('--combine_masks', action='store_true', help='combine all the masks for pixel nerf')
         parser.add_argument('--weight_pixel_slot_mask', action='store_true')
+
         parser.add_argument('--silhouette_loss_nobackprop', action='store_true', help='only compute but do not back propagate silhouette loss')
         parser.add_argument('--bg_no_silhouette_loss', action='store_true', help='do not include bg in the silhouette loss')
         parser.add_argument('--silhouette_epoch', type=int, default=100)
