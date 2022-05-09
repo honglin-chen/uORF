@@ -75,6 +75,8 @@ def normalize_points(points):
     bound_h = np.max(points, axis=0)
     points = points - (bound_l + bound_h) / 2
     points = points / (bound_h - bound_l).max()
+
+    points = torch.tensor(points)[None]
     return points
 
 def transform_vertices(pts, rotations, trans, scale):

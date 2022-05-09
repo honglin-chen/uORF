@@ -465,7 +465,7 @@ class uorfEvalModel(BaseModel):
 
                     # uvw = torch.cat([w, uv], dim=-1)  # 1x(NxDxHxW)x3 # this is wrong. think about the x y z coordinate system! (H, W, D)
                     uvw_ = torch.cat([uv_, w_], dim=-1)  # 1x(NxDxHxW)x3
-
+                    breakpoint()
                     uvw[:, :, :, h::scale, w::scale, :] = uvw_.view([1, N, D, H_, W_, 3])
 
                 if self.opt.mask_image or self.opt.mask_image_feature:
@@ -536,7 +536,7 @@ class uorfEvalModel(BaseModel):
         if self.opt.extract_mesh:
             # evaluate mesh
             voxels = raws[1:, ..., -1].cpu().numpy()  # remove background
-            num_points = 30
+            num_points = 1024
             num_objects = voxels.shape[0]
             hdf_path = self.input_paths[0].replace('_frame5_img0.png', '.hdf5')
 
@@ -553,23 +553,19 @@ class uorfEvalModel(BaseModel):
                 pred_vtx, pred_face, gt_vtx, gt_face = data
                 pred_pts = get_surface_points_from_mesh(pred_vtx, pred_face, d=d, num=num_points)
                 gt_pts = get_surface_points_from_mesh(gt_vtx, gt_face, d=d, num=num_points)
-                pred_pts = normalize_points(pred_pts)
-                gt_pts = normalize_points(gt_pts)
                 pred_obj_pts.append(pred_pts)
                 gt_obj_pts.append(gt_pts)
-
-                distance = chamfer_distance(torch.tensor(pred_pts[None]), torch.tensor(gt_pts[None]))
+                distance = chamfer_distance(normalize_points(pred_pts), normalize_points(gt_pts))
                 total_mesh_loss += distance[0]
-            avg_mesh_loss = total_mesh_loss / num_objects
-            print('Average object mesh loss: ', avg_mesh_loss)
+            obj_mesh_loss = total_mesh_loss / num_objects
 
             # scene mesh loss
-            pred_scene_pts = get_surface_points_from_mesh(pred_scene_vtx, pred_scene_face, d=d, num=num_points)
-            gt_scene_pts = get_surface_points_from_mesh(gt_scene_vtx, gt_scene_face, d=d, num=num_points)
-            pred_scene_pts = normalize_points(pred_scene_pts)
-            gt_scene_pts = normalize_points(gt_scene_pts)
-            distance = chamfer_distance(torch.tensor(pred_scene_pts[None]), torch.tensor(gt_scene_pts[None]))[0]
+            pred_scene_pts = np.concatenate(pred_obj_pts, axis=0)
+            gt_scene_pts = np.concatenate(pred_gt_pts, axis=0)
+            scene_mesh_loss = chamfer_distance(normalize_points(pred_scene_pts), normalize_points(gt_scene_pts))[0]
 
+            print('Average object mesh loss: ', obj_mesh_loss)
+            print('Scene mesh loss: ', scene_mesh_loss)
             visualize_dict = {
                 'image': self.x[0],
                 'gt_obj_vtx': gt_obj_vtx,
