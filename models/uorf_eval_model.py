@@ -17,6 +17,9 @@ from sklearn.metrics import adjusted_rand_score
 import lpips
 from piq import ssim as compute_ssim
 from piq import psnr as compute_psnr
+from .evaluate_mesh import *
+import h5py
+from pytorch3d.loss import chamfer_distance
 
 class DiceLoss(nn.Module):
     def __init__(self, weight=None, size_average=True):
@@ -254,6 +257,7 @@ class uorfEvalModel(BaseModel):
         """
         self.x = input['img_data'].to(self.device)
         self.cam2world = input['cam2world'].to(self.device)
+        self.input_paths = input['paths']
         if not self.opt.fixed_locality:
             self.cam2world_azi = input['azi_rot'].to(self.device)
 
@@ -432,6 +436,7 @@ class uorfEvalModel(BaseModel):
                     # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1
                     raws_ = raws_.view([N, D, H_, W_, 4])#.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
                     masked_raws_ = masked_raws_.view([K, N, D, H_, W_, 4])
+                    save_masked_raws = masked_raws_.clone()
                     unmasked_raws_ = unmasked_raws_.view([K, N, D, H_, W_, 4])
                     masks_for_silhouette_ = masks_for_silhouette_.view([K, N, D, H_, W_])
 
@@ -467,6 +472,61 @@ class uorfEvalModel(BaseModel):
                     # raw_masks_density[:, :, :, h::scale, w::scale, :] = raw_masks_density_.view(K, N, D, H_, W_, 1)
 
         if self.opt.extract_mesh:
+            # evaluate mesh
+            voxels = raws[1:, ..., -1].cpu().numpy()  # remove background
+            num_points = 30
+            num_objects = voxels.shape[0]
+            hdf_path = self.input_paths[0].replace('_frame5_img0.png', '.hdf5')
+
+            d = 5e-7 / (voxels.shape[0] ** 2)
+            gt_obj_vtx, gt_obj_face, gt_scene_vtx, gt_scene_face = load_gt_mesh_from_hdf(hdf_path, frame='0005', num_objects=num_objects)
+            pred_obj_vtx, pred_obj_face, pred_scene_vtx, pred_scene_face = compute_mesh_from_voxel(voxels, threshold=1.0)
+
+            pred_obj_pts = []
+            gt_obj_pts = []
+
+            # object mesh loss
+            total_mesh_loss = 0.
+            for obj_id, data in enumerate(zip(pred_obj_vtx, pred_obj_face, gt_obj_vtx, gt_obj_face)):
+                pred_vtx, pred_face, gt_vtx, gt_face = data
+                pred_pts = get_surface_points_from_mesh(pred_vtx, pred_face, d=d, num=num_points)
+                gt_pts = get_surface_points_from_mesh(gt_vtx, gt_face, d=d, num=num_points)
+                pred_pts = normalize_points(pred_pts)
+                gt_pts = normalize_points(gt_pts)
+                pred_obj_pts.append(pred_pts)
+                gt_obj_pts.append(gt_pts)
+
+                distance = chamfer_distance(torch.tensor(pred_pts[None]), torch.tensor(gt_pts[None]))
+                total_mesh_loss += distance[0]
+            avg_mesh_loss = total_mesh_loss / num_objects
+            print('Average object mesh loss: ', avg_mesh_loss)
+
+            # scene mesh loss
+            pred_scene_pts = get_surface_points_from_mesh(pred_scene_vtx, pred_scene_face, d=d, num=num_points)
+            gt_scene_pts = get_surface_points_from_mesh(gt_scene_vtx, gt_scene_face, d=d, num=num_points)
+            pred_scene_pts = normalize_points(pred_scene_pts)
+            gt_scene_pts = normalize_points(gt_scene_pts)
+            distance = chamfer_distance(torch.tensor(pred_scene_pts[None]), torch.tensor(gt_scene_pts[None]))[0]
+
+            visualize_dict = {
+                'image': self.x[0],
+                'gt_obj_vtx': gt_obj_vtx,
+                'gt_obj_face': gt_obj_face,
+                'gt_scene_vtx': gt_scene_vtx,
+                'gt_scene_face': gt_scene_face,
+                'gt_obj_pts': gt_obj_pts,
+                'gt_scene_pts': gt_scene_pts,
+                'pred_obj_vtx': pred_obj_vtx,
+                'pred_obj_face': pred_obj_face,
+                'pred_scene_vtx': pred_scene_vtx,
+                'pred_scene_face': pred_scene_face,
+                'pred_obj_pts': pred_obj_pts,
+                'pred_scene_pts': pred_scene_pts,
+            }
+
+            np.save('test.npy', visualize_dict)
+            breakpoint()
+
             return raw_masks_density_list
         if self.opt.unified_decoder:
             pass

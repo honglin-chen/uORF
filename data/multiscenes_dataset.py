@@ -31,7 +31,7 @@ class MultiscenesDataset(BaseDataset):
         BaseDataset.__init__(self, opt)
         self.n_scenes = opt.n_scenes
         self.n_img_each_scene = opt.n_img_each_scene
-        self.min_num_masks = 4
+        self.min_num_masks = opt.num_slots
         image_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*.png')))  # root/00000_sc000_az00_el00.png
         mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask.png')))
         fg_mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask_for_moving.png')))
@@ -164,9 +164,14 @@ class MultiscenesDataset(BaseDataset):
                 if obj_masks.shape[0] < self.min_num_masks:
                     obj_masks = torch.cat([obj_masks, torch.zeros_like(obj_masks[0:(self.min_num_masks-obj_masks.shape[0])])], dim=0)
 
+                if obj_masks.shape[0] > self.min_num_masks:
+                    print('Error reading file: ', path)
+                    return self.buffer_rets
+
                 ret['obj_masks'] = obj_masks  # KxHxW
 
             rets.append(ret)
+        self.buffer_rets = rets
         return rets
 
     def __len__(self):

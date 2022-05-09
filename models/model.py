@@ -612,10 +612,9 @@ class Decoder(nn.Module):
         raw_sigma = raw_masks
 
         masked_rgb = raw_rgb * masks
+        # masked_raws = unmasked_raws * masks
         unmasked_raws = torch.cat([raw_rgb, raw_sigma], dim=2)  # KxPx4
         masked_raws = torch.cat([masked_rgb, raw_sigma], dim=2)
-        # at_home
-        # masked_raws = unmasked_raws * masks
         raws = masked_raws.sum(dim=0)
 
         if decoder_type=='density':
