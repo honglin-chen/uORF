@@ -8,7 +8,8 @@ from . import networks
 import os
 import time
 from .projection import Projection
-from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder, raw2transmittances, raw2colors
+from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder, raw2transmittances, raw2colors, CentroidDecoder
+from .position_encoding import position_encoding_image
 import pdb
 from util import util
 # from .model import Encoder, Decoder, SlotAttention, raw2outputs
@@ -17,6 +18,30 @@ from sklearn.metrics import adjusted_rand_score
 import lpips
 from piq import ssim as compute_ssim
 from piq import psnr as compute_psnr
+
+def positionalencoding2d(d_model, height, width):
+    """
+    :param d_model: dimension of the model
+    :param height: height of the positions
+    :param width: width of the positions
+    :return: d_model*height*width position matrix
+    """
+    if d_model % 4 != 0:
+        raise ValueError("Cannot use sin/cos positional encoding with "
+                         "odd dimension (got dim={:d})".format(d_model))
+    pe = torch.zeros(d_model, height, width)
+    # Each dimension use half of d_model
+    d_model = int(d_model / 2)
+    div_term = torch.exp(torch.arange(0., d_model, 2) *
+                         -(math.log(10000.0) / d_model))
+    pos_w = torch.arange(0., width).unsqueeze(1)
+    pos_h = torch.arange(0., height).unsqueeze(1)
+    pe[0:d_model:2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[1:d_model:2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[d_model::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+    pe[d_model + 1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+
+    return pe
 
 class DiceLoss(nn.Module):
     def __init__(self, weight=None, size_average=True):
@@ -119,6 +144,28 @@ class uorfEvalModel(BaseModel):
         parser.add_argument('--combine_masks', action='store_true', help='combine all the masks for pixel nerf')
         parser.add_argument('--weight_pixel_slot_mask', action='store_true')
 
+        parser.add_argument('--silhouette_loss_nobackprop', action='store_true',
+                            help='only compute but do not back propagate silhouette loss')
+        parser.add_argument('--bg_no_silhouette_loss', action='store_true',
+                            help='do not include bg in the silhouette loss')
+        parser.add_argument('--silhouette_epoch', type=int, default=100)
+        parser.add_argument('--mask_div_by_mean', action='store_true')
+        parser.add_argument('--only_make_silhouette_not_delete', action='store_true')
+        parser.add_argument('--weight_silhouette_loss', action='store_true')
+        parser.add_argument('--threshold_silhouette_loss', action='store_true')
+        parser.add_argument('--mask_image_slot', action='store_true')
+        parser.add_argument('--nearest_interp', action='store_true', help='put nearest interp for pixel and so on')
+        parser.add_argument('--slot_positional_encoding', action='store_true', help='put 2d positional encoding')
+        parser.add_argument('--mask_image_feature_slot', action='store_true')
+        parser.add_argument('--predict_centroid', action='store_true')
+        parser.add_argument('--learn_only_centroid', action='store_true',
+                            help='loss function contains only centroid loss')
+
+        parser.add_argument('--loss_centroid_margin', type=float, default=0.05, help='max margin for the centroid loss')
+        parser.add_argument('--progressive_silhouette', action='store_true',
+                            help='epoch 0-10: learn only fg silhouette, epoch 10-20: learn silhouette and rgb, epoch 20- rgb')
+        parser.add_argument('--learn_fg_first', action='store_true')
+
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -174,11 +221,59 @@ class uorfEvalModel(BaseModel):
             self.nets.append(self.netEncoder)
             self.model_names.append('Encoder')
 
+        if self.opt.slot_positional_encoding:
+            # [Position encoding]
+            p_dim = z_dim
+            if self.opt.resnet_encoder:
+                self.pos_emb = position_encoding_image(size=[opt.input_size // 2, opt.input_size // 2],
+                                                       num_pos_feats=p_dim // 2).to(
+                    self.device)
+            else:
+                self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size],
+                                                       num_pos_feats=p_dim // 2).to(self.device)
+            slot_in_dim = z_dim + p_dim
+            slot_slot_dim = p_dim
+        else:
+            slot_in_dim = z_dim
+            slot_slot_dim = z_dim
+
+        if self.opt.predict_centroid:
+            p_dim = z_dim
+            self.netSlotAttention_pos = networks.init_net(
+                SlotAttention(num_slots=opt.num_slots, in_dim=p_dim + z_dim, slot_dim=p_dim, iters=opt.attn_iter,
+                              gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
+            self.nets.append(self.netSlotAttention_pos)
+            self.parameters.append(self.netSlotAttention_pos.parameters())
+            self.model_names.append('SlotAttention_pos')
+
+            self.netCentroidDecoder = networks.init_net(
+                CentroidDecoder(input_dim=p_dim,
+                                z_dim=p_dim,
+                                cam2pixel=self.projection.cam2spixel,
+                                world2nss=self.projection.world2nss,
+                                near=self.projection.near,
+                                far=self.projection.far,
+                                small_latent=self.opt.small_latent,
+                                n_layers=opt.n_layer),
+                gpu_ids=self.gpu_ids, init_type='xavier')
+            self.parameters.append(self.netCentroidDecoder.parameters())
+            self.nets.append(self.netCentroidDecoder)
+            self.model_names.append('CentroidDecoder')
+
+            if not self.opt.slot_positional_encoding:
+
+                if self.opt.resnet_encoder:
+                    self.pos_emb = position_encoding_image(size=[opt.input_size // 2, opt.input_size // 2],
+                                                           num_pos_feats=p_dim // 2).to(self.device)
+                else:
+                    self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size],
+                                                           num_pos_feats=p_dim // 2).to(self.device)
+
         # [Slot attention]
         self.num_slots = opt.num_slots
         if not self.opt.without_slot_feature:
             self.netSlotAttention = networks.init_net(
-                SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter,
+                SlotAttention(num_slots=opt.num_slots, in_dim=slot_in_dim, slot_dim=slot_slot_dim, iters=opt.attn_iter,
                               gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
             self.nets.append(self.netSlotAttention)
             self.parameters.append(self.netSlotAttention.parameters())
@@ -331,6 +426,19 @@ class uorfEvalModel(BaseModel):
             masks = F.interpolate(masks.float(), size=[64, 64], mode=mode_)
             self.silhouette_masks = masks
 
+        # [Compute GT segment centroid]
+        if self.opt.predict_centroid:
+            frustum_size = self.projection.frustum_size
+            _masks = F.interpolate(masks.float(), size=frustum_size[0:2], mode='nearest').flatten(2, 3)  # NxKx(HxW)
+            x = torch.arange(frustum_size[0]).to(self.device)  # frustum_size
+            y = torch.arange(frustum_size[1]).to(self.device)  # frustum_size
+            x, y = torch.meshgrid([x, y])  # frustum_sizexfrustum_size
+            x = x.flatten()[None, None]  # NxKx(frustum_size)^2
+            y = y.flatten()[None, None]  # NxKx(frustum_size)^2
+            center_x = (_masks * x).sum(-1) / (_masks.sum(-1) + 1e-12)  # NxK
+            center_y = (_masks * y).sum(-1) / (_masks.sum(-1) + 1e-12)  # NxK
+            self.segment_masks = _masks
+            self.segment_centers = torch.stack([center_x, center_y], dim=-1)  # NxKx2
 
     def forward(self, epoch=0, frus_nss_coor=None):
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
@@ -342,6 +450,8 @@ class uorfEvalModel(BaseModel):
             masks = self.masks
             attn_bg, attn_fg = masks[:, 0:1], masks[:, 1:]
             attn = torch.cat([attn_bg, attn_fg], dim=1)
+        else:
+            attn = None
 
         if self.opt.resnet_encoder:
             attn = attn.view([1, self.opt.num_slots, self.opt.input_size, self.opt.input_size])
@@ -350,8 +460,22 @@ class uorfEvalModel(BaseModel):
             attn = attn.transpose(0, 1).flatten(2, 3)
 
         # Encoding images
-        feature_map = self.netEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
+        if self.opt.mask_image_slot or self.opt.mask_image_feature_slot:
+            assert self.opt.resnet_encoder
+            if self.opt.resnet_encoder:
+                masks_slot = attn
+            else:
+                masks_slot = self.masks.squeeze(0)
+        else:
+            masks_slot = None
+
+        feature_map = self.netEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False), masks=masks_slot)  # BxCxHxW
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
+
+        if self.opt.slot_positional_encoding:
+            pos_embed = self.pos_emb  # self.netPositionEmbedding()
+            pos_feat = torch.cat([pos_embed, feat], dim=-1)
+            feat = pos_feat
 
         # Slot Attention
         if self.opt.pixel_nerf:
@@ -411,6 +535,23 @@ class uorfEvalModel(BaseModel):
         raw_masks_density_list = []
         pixel_feat_list = []
 
+        # Decoder centroid
+        if self.opt.predict_centroid:
+            if not self.opt.slot_positional_encoding:
+                pos_embed = self.pos_emb  # self.netPositionEmbedding()
+                pos_feat = torch.cat([pos_embed, feat], dim=-1)
+            else:
+                pos_feat = feat
+
+            # Get slot features
+            p_slots, _ = self.netSlotAttention_pos(pos_feat, masks=attn.unsqueeze(0))  # 1xKxC
+
+            # Predict centroid
+            frustum_size_ = torch.Tensor(self.projection.frustum_size).to(self.device)
+            self.netCentroidDecoder.frustum_size = frustum_size_
+            self.netCentroidDecoder.cam2world = self.cam2world
+            _, centroid_nss, centroid_pixel = self.netCentroidDecoder(p_slots.squeeze(0))
+
 
         for (j, (frus_nss_coor_, z_vals_, ray_dir_)) in enumerate(zip(frus_nss_coor, z_vals, ray_dir)):
             # print(j, 'j')
@@ -464,15 +605,34 @@ class uorfEvalModel(BaseModel):
 
                     uvw[:, :, :, h::scale, w::scale, :] = uvw_.view([1, N, D, H_, W_, 3])
 
-                if self.opt.mask_image or self.opt.mask_image_feature:
-                    uv_ = uv_.expand(K, -1, -1)  # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
-                    pixel_feat_ = self.netPixelEncoder.index(uv_)  # Kx(NxDxHxW)x2 -> KxCx(NxDxHxW)
-                    pixel_feat_ = pixel_feat_.transpose(1, 2)
+                if self.opt.pixel_encoder:
+                    if self.opt.mask_image or self.opt.mask_image_feature:
+                        uv_ = uv_.expand(K, -1, -1)  # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
+                        pixel_feat_ = self.netPixelEncoder.index(uv_)  # Kx(NxDxHxW)x2 -> KxCx(NxDxHxW)
+                        pixel_feat_ = pixel_feat_.transpose(1, 2)
+                    else:
+                        pixel_feat_ = self.netPixelEncoder.index(uv_)  # 1x(NxDxHxW)x2 -> 1xCx(NxDxHxW)
+                        pixel_feat_ = pixel_feat_.transpose(1, 2)  # 1x(NxDxHxW)xC
+                        pixel_feat_ = pixel_feat_.expand(K, -1, -1)  # Kx(NxDxHxW)xC
+                        uv_ = uv_.expand(K, -1, -1)
                 else:
-                    pixel_feat_ = self.netPixelEncoder.index(uv_)  # 1x(NxDxHxW)x2 -> 1xCx(NxDxHxW)
-                    pixel_feat_ = pixel_feat_.transpose(1, 2)  # 1x(NxDxHxW)xC
-                    pixel_feat_ = pixel_feat_.expand(K, -1, -1)  # Kx(NxDxHxW)xC
                     uv_ = uv_.expand(K, -1, -1)
+
+                # Decoder centroid
+                if self.opt.predict_centroid:
+
+                    # Transform sampling coordinates
+                    sampling_coor_fg_ = self.netCentroidDecoder.transform_coords(coords=sampling_coor_fg_,
+                                                                                centroids=centroid_nss)
+
+                    # # Compute centroid loss
+                    # self.netCentroidDecoder.x = self.x
+                    # self.loss_centroid = self.netCentroidDecoder.centroid_loss(
+                    #     centroid_pixel=centroid_pixel, margin=self.opt.loss_centroid_margin,
+                    #     segment_centers=self.segment_centers, segment_masks=self.segment_masks, epoch=epoch)
+                    #
+                    # if self.opt.learn_only_centroid:
+                    #     return
 
                 if self.opt.mask_as_decoder_input or self.opt.weight_pixel_slot_mask:
                     silhouette0 = self.silhouette_masks[0:1].transpose(0, 1)  # Kx1xHxW
@@ -630,6 +790,8 @@ class uorfEvalModel(BaseModel):
 
 
     def compute_visuals(self):
+        if self.opt.extract_mesh:
+            return
         with torch.no_grad():
             cam2world = self.cam2world[:self.opt.n_img_each_scene]
             _, N, D, H, W, _ = self.masked_raws.shape
