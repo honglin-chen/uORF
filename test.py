@@ -31,18 +31,22 @@ if __name__ == '__main__':
         model.set_input(data)  # unpack data from data loader
         model.test()           # run inference: forward + compute_visuals
 
-        losses = model.get_current_losses()
-        visualizer.print_test_losses(i, losses)
-        for loss_name in model.loss_names:
-            meters_tst[loss_name].update(float(losses[loss_name]))
+        if opt.extract_mesh:
+            pass
 
-        visuals = model.get_current_visuals()
-        visualizer.display_current_results(visuals, epoch=None, save_result=False)
-        img_path = model.get_image_paths()
-        save_images(webpage, visuals, img_path, aspect_ratio=opt.aspect_ratio, width=opt.load_size)
-        losses = {}
-        for loss_name in model.loss_names:
-            losses[loss_name] = meters_tst[loss_name].avg
-        visualizer.print_test_losses('average', losses)
+        else:
+            losses = model.get_current_losses()
+            visualizer.print_test_losses(i, losses)
+            for loss_name in model.loss_names:
+                meters_tst[loss_name].update(float(losses[loss_name]))
+
+            visuals = model.get_current_visuals()
+            visualizer.display_current_results(visuals, epoch=None, save_result=False)
+            img_path = model.get_image_paths()
+            save_images(webpage, visuals, img_path, aspect_ratio=opt.aspect_ratio, width=opt.load_size)
+            losses = {}
+            for loss_name in model.loss_names:
+                losses[loss_name] = meters_tst[loss_name].avg
+            visualizer.print_test_losses('average', losses)
 
     webpage.save()

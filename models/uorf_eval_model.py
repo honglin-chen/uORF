@@ -259,8 +259,8 @@ class uorfEvalModel(BaseModel):
             self.opt.mask_image_feature = True
             self.opt.mask_image = True
             self.opt.use_ray_dir = True
-            self.opt.silhouette_loss = True
-            self.opt.weight_pixelfeat = True
+            self.opt.silhouette_loss = False
+            self.opt.weight_pixelfeat = False
             self.opt.bg_no_pixel = True
 
     def setup(self, opt):
@@ -403,8 +403,8 @@ class uorfEvalModel(BaseModel):
 
         silhouettes = torch.zeros([N, K, H, W], device=dev)
 
-        # if self.opt.extract_mesh:
-        #     raw_masks_density = torch.zeros([K, N, D, H, W, 1])
+        if self.opt.extract_mesh:
+            raw_masks_density = torch.zeros([K, N, D, H, W, 1])
 
         # print(K, N, D, H, W, 'K, N, D, H, W')
 
@@ -509,27 +509,33 @@ class uorfEvalModel(BaseModel):
                     x_recon_ = rendered_ * 2 - 1
                     x_recon[..., h::scale, w::scale] = x_recon_
                     silhouettes[..., h::scale, w::scale] = silhouettes_ # NxKxHxW
-                    raw_masks_density_list.append(masked_raws_[..., -1:])
+                    if self.opt.extract_mesh:
+                        raw_masks_density_list.append(masked_raws_[..., -1:])
+                        raw_masks_density[:, :, :, h::scale, w::scale, :] = masked_raws_[..., -1:].view(K, N, D, H_, W_, 1)
 
-                else:
-                    raws_density_, masked_raws_density_, unmasked_raws_density_, masks_for_silhouette_density_, raw_masks_density_ = \
-                        self.netDensityDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat_,
-                                               ray_dir_input=ray_dir_input_, decoder_type='density')
-
-                    raws_density_ = raws_density_.view([N, D, H_, W_, 4])
-                    masks_for_silhouette_density_ = masks_for_silhouette_density_.view([K, N, D, H_, W_])
-                    raws_density[:, :, h::scale, w::scale, :] = raws_density_
-                    masks_for_silhouette_density[:, :, :, h::scale, w::scale] = masks_for_silhouette_density_
-
-                    raw_masks_density_list.append(raw_masks_density_)
-                    if not self.opt.extract_mesh:
-                        pixel_feat_list.append(pixel_feat_)
-                        z_vals_not_partitioned[:, h::scale, w::scale, :] = z_vals_.view([N, H_, W_, D])
-                        ray_dir_not_partitioned[:, h::scale, w::scale, :] = ray_dir_.view([N, H_, W_, 3])
-                    # raw_masks_density[:, :, :, h::scale, w::scale, :] = raw_masks_density_.view(K, N, D, H_, W_, 1)
+                # else:
+                #     raws_density_, masked_raws_density_, unmasked_raws_density_, masks_for_silhouette_density_, raw_masks_density_ = \
+                #         self.netDensityDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat_,
+                #                                ray_dir_input=ray_dir_input_, decoder_type='density')
+                #
+                #     raws_density_ = raws_density_.view([N, D, H_, W_, 4])
+                #     masks_for_silhouette_density_ = masks_for_silhouette_density_.view([K, N, D, H_, W_])
+                #     raws_density[:, :, h::scale, w::scale, :] = raws_density_
+                #     masks_for_silhouette_density[:, :, :, h::scale, w::scale] = masks_for_silhouette_density_
+                #
+                #     raw_masks_density_list.append(raw_masks_density_)
+                #
+                #     pixel_feat_list.append(pixel_feat_)
+                #     z_vals_not_partitioned[:, h::scale, w::scale, :] = z_vals_.view([N, H_, W_, D])
+                #     ray_dir_not_partitioned[:, h::scale, w::scale, :] = ray_dir_.view([N, H_, W_, 3])
+                #     if self.opt.extract_mesh:
+                #         raw_masks_density[:, :, :, h::scale, w::scale, :] = raw_masks_density_.view(K, N, D, H_, W_, 1)
 
         if self.opt.extract_mesh:
-            return raw_masks_density_list
+            print(raw_masks_density.shape, 'raw_masks_density.shape')
+            # return raw_masks_density
+            # return raw_masks_density_list
+
         if self.opt.unified_decoder:
             pass
         else:

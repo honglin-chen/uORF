@@ -21,6 +21,7 @@ python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
     --without_slot_feature \
     --pixel_nerf \
     --frame5 \
+    --extract_mesh \
 
 #    --debug2 \
 #    --pixel_after_density \
