@@ -85,6 +85,7 @@ class uorfEvalModel(BaseModel):
         parser.add_argument('--n_freq', type=int, default=5, help='how many increased freq?')
         parser.add_argument('--n_samp', type=int, default=64, help='num of samp per ray')
         parser.add_argument('--n_layer', type=int, default=3, help='num of layers bef/aft skip link in decoder')
+        parser.add_argument('--no_locality_epoch', type=int, default=0)
         parser.add_argument('--bottom', action='store_true', help='one more encoder layer on bottom')
         parser.add_argument('--input_size', type=int, default=128)
         parser.add_argument('--frustum_size', type=int, default=64, help='Size of rendered images')
@@ -196,7 +197,7 @@ class uorfEvalModel(BaseModel):
         self.projection = Projection(focal_ratio=opt.focal_ratio, device=self.device, nss_scale=opt.nss_scale,
                                      frustum_size=frustum_size, near=opt.near_plane, far=opt.far_plane, render_size=render_size)
         self.projection_coarse = Projection(focal_ratio=opt.focal_ratio, device=self.device, nss_scale=opt.nss_scale,
-                                            frustum_size=[64, 64, 64], near=opt.near_plane, far=opt.far_plane, render_size=render_size)
+                                            frustum_size=[64, 64, 128], near=opt.near_plane, far=opt.far_plane, render_size=render_size)
         if self.opt.extract_mesh:
             print('extract_mesh mode')
             self.projection_mesh = Projection(focal_ratio=opt.focal_ratio, device=self.device, nss_scale=opt.nss_scale,
@@ -207,10 +208,17 @@ class uorfEvalModel(BaseModel):
         self.nets = []
         self.model_names = []
 
+        if self.opt.color_after_density:
+            assert self.opt.unified_decoder
+
+        self.interp_mode = 'nearest' if self.opt.nearest_interp else 'bilinear'
+
         # [uORF Encoder]
         if self.opt.resnet_encoder:
-            self.netEncoder = networks.init_net(PixelEncoder(mask_image=False, mask_image_feature=False),
-                                                gpu_ids=self.gpu_ids, init_type='None')
+            self.netEncoder = networks.init_net(
+                PixelEncoder(mask_image=self.opt.mask_image_slot, mask_image_feature=self.opt.mask_image_feature_slot,
+                             index_interp=self.interp_mode), gpu_ids=self.gpu_ids, init_type='None')
+
             self.parameters.append(self.netEncoder.parameters())
             self.nets.append(self.netEncoder)
             self.model_names.append('Encoder')
@@ -249,10 +257,10 @@ class uorfEvalModel(BaseModel):
             self.netCentroidDecoder = networks.init_net(
                 CentroidDecoder(input_dim=p_dim,
                                 z_dim=p_dim,
-                                cam2pixel=self.projection.cam2spixel,
-                                world2nss=self.projection.world2nss,
-                                near=self.projection.near,
-                                far=self.projection.far,
+                                cam2pixel=self.projection_coarse.cam2spixel,
+                                world2nss=self.projection_coarse.world2nss,
+                                near=self.projection_coarse.near,
+                                far=self.projection_coarse.far,
                                 small_latent=self.opt.small_latent,
                                 n_layers=opt.n_layer),
                 gpu_ids=self.gpu_ids, init_type='xavier')
@@ -348,15 +356,15 @@ class uorfEvalModel(BaseModel):
         self.dice_loss = DiceLoss()
 
         # [Extract Mesh]
-        if self.opt.extract_mesh:
-            self.opt.gt_seg = True
-            self.opt.pixel_encoder = True
-            self.opt.mask_image_feature = True
-            self.opt.mask_image = True
-            self.opt.use_ray_dir = True
-            self.opt.silhouette_loss = False
-            self.opt.weight_pixelfeat = False
-            self.opt.bg_no_pixel = True
+        # if self.opt.extract_mesh:
+        #     self.opt.gt_seg = True
+        #     self.opt.pixel_encoder = True
+        #     self.opt.mask_image_feature = True
+        #     self.opt.mask_image = True
+        #     self.opt.use_ray_dir = True
+        #     self.opt.silhouette_loss = False
+        #     self.opt.weight_pixelfeat = False
+        #     self.opt.bg_no_pixel = True
 
     def setup(self, opt):
         """Load and print networks; create schedulers
@@ -428,7 +436,7 @@ class uorfEvalModel(BaseModel):
 
         # [Compute GT segment centroid]
         if self.opt.predict_centroid:
-            frustum_size = self.projection.frustum_size
+            frustum_size = self.projection_coarse.frustum_size
             _masks = F.interpolate(masks.float(), size=frustum_size[0:2], mode='nearest').flatten(2, 3)  # NxKx(HxW)
             x = torch.arange(frustum_size[0]).to(self.device)  # frustum_size
             y = torch.arange(frustum_size[1]).to(self.device)  # frustum_size
@@ -439,6 +447,7 @@ class uorfEvalModel(BaseModel):
             center_y = (_masks * y).sum(-1) / (_masks.sum(-1) + 1e-12)  # NxK
             self.segment_masks = _masks
             self.segment_centers = torch.stack([center_x, center_y], dim=-1)  # NxKx2
+            # print(self.segment_centers, 'segment_centers')
 
     def forward(self, epoch=0, frus_nss_coor=None):
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
@@ -547,10 +556,13 @@ class uorfEvalModel(BaseModel):
             p_slots, _ = self.netSlotAttention_pos(pos_feat, masks=attn.unsqueeze(0))  # 1xKxC
 
             # Predict centroid
-            frustum_size_ = torch.Tensor(self.projection.frustum_size).to(self.device)
+            frustum_size_ = torch.Tensor(self.projection_coarse.frustum_size).to(self.device)
             self.netCentroidDecoder.frustum_size = frustum_size_
             self.netCentroidDecoder.cam2world = self.cam2world
             _, centroid_nss, centroid_pixel = self.netCentroidDecoder(p_slots.squeeze(0))
+            # print(centroid_nss, 'centroid_nss')
+            # print(centroid_pixel, 'centroid_pixel')
+            # print(centroid_nss.max(), centroid_nss.min(), centroid_nss.mean(), centroid_nss.std(), 'centroid max, min, mean, std')
 
 
         for (j, (frus_nss_coor_, z_vals_, ray_dir_)) in enumerate(zip(frus_nss_coor, z_vals, ray_dir)):
@@ -622,6 +634,8 @@ class uorfEvalModel(BaseModel):
                 if self.opt.predict_centroid:
 
                     # Transform sampling coordinates
+                    # print(sampling_coor_fg_[0], 'sampling coor 0')
+                    # print(centroid_nss, 'centroid nss')
                     sampling_coor_fg_ = self.netCentroidDecoder.transform_coords(coords=sampling_coor_fg_,
                                                                                 centroids=centroid_nss)
 
@@ -692,7 +706,7 @@ class uorfEvalModel(BaseModel):
                 #         raw_masks_density[:, :, :, h::scale, w::scale, :] = raw_masks_density_.view(K, N, D, H_, W_, 1)
 
         if self.opt.extract_mesh:
-            print(raw_masks_density.shape, 'raw_masks_density.shape')
+            print(raw_masks_density.shape, 'raw_masks_density.shape')  # KxNxDxHxWx1
             # return raw_masks_density
             # return raw_masks_density_list
 

@@ -26,6 +26,9 @@ if __name__ == '__main__':
     print('creating web directory', web_dir)
     webpage = HTML(web_dir, 'Experiment = %s, Phase = %s, Epoch = %s' % (opt.name, opt.phase, opt.epoch))
 
+    if opt.unified_decoder:
+        model.netDecoder.locality = False
+
     for i, data in enumerate(dataset):
         visualizer.reset()
         model.set_input(data)  # unpack data from data loader
