@@ -9,6 +9,8 @@ import glob
 import numpy as np
 import random
 
+from torchvision import transforms
+
 
 class MultiscenesDataset(BaseDataset):
     @staticmethod
@@ -22,6 +24,7 @@ class MultiscenesDataset(BaseDataset):
         parser.add_argument('--skip', type=int, default=0)
         parser.add_argument('--dataset_nearest_interp', action='store_true')
         parser.add_argument('--dataset_combine_masks', action='store_true')
+        parser.add_argument('--color_jitter', action='store_true')
         return parser
 
     def __init__(self, opt):
@@ -58,11 +61,29 @@ class MultiscenesDataset(BaseDataset):
             # print(scene_filenames)
             self.scenes.append(scene_filenames)
 
+        if self.opt.color_jitter:
+            self.color_transform = transforms.ColorJitter(0.4, 0.4, 0.4, 0.4)
+
     def _transform(self, img):
         if self.opt.dataset_nearest_interp:
             img = TF.resize(img, (self.opt.load_size, self.opt.load_size), Image.NEAREST)
         else:
             img = TF.resize(img, (self.opt.load_size, self.opt.load_size))
+
+        if self.opt.color_jitter:
+
+            if self.reset_color_jitter:
+                self.reset_color_jitter = False
+                self.prev_brightness = float(torch.empty(1).uniform_(0.6, 1.4))
+                self.prev_contrast = float(torch.empty(1).uniform_(0.6, 1.4))
+                self.prev_saturation = float(torch.empty(1).uniform_(0.6, 1.4))
+                self.prev_hue = float(torch.empty(1).uniform_(-0.4, 0.4))
+
+            img = TF.adjust_brightness(img, self.prev_brightness)
+            img = TF.adjust_contrast(img, self.prev_contrast)
+            img = TF.adjust_saturation(img, self.prev_saturation)
+            img = TF.adjust_hue(img, self.prev_hue)
+
         img = TF.to_tensor(img)
         img = TF.normalize(img, [0.5] * img.shape[0], [0.5] * img.shape[0])  # [0,1] -> [-1,1]
         return img
@@ -104,6 +125,7 @@ class MultiscenesDataset(BaseDataset):
         else:
             filenames = scene_filenames[:self.n_img_each_scene]
         rets = []
+        self.reset_color_jitter = True
         for path in filenames:
             img = Image.open(path).convert('RGB')
             img_data = self._transform(img)
