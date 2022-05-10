@@ -143,7 +143,7 @@ def load_gt_mesh_from_hdf(path, frame='0005', num_objects=3, seg_colors=None, se
         return obj_vertices, obj_faces, scene_vertices, scene_faces
 
 def compute_mesh_from_voxel(voxel, threshold):
-    # voxel has shape [K-1, ]
+    # voxel is a numpy array with shape [K, H, W, D], where K is the number of objects
     obj_vertices = []
     obj_faces = []
     scene_vertices = []
@@ -152,9 +152,11 @@ def compute_mesh_from_voxel(voxel, threshold):
     count = 0
     for obj_id in range(voxel.shape[0]):
         vtx, faces, _, _ = measure.marching_cubes_lewiner(voxel[obj_id], threshold)
-        # vtx, faces = mcubes.marching_cubes(voxel[obj_id], threshold)
+
+        # transform the axis so that it aligns with the GT pointcloud
         vtx = np.matmul(toggle_xz, vtx.T).T
         vtx[:,2] = -vtx[:, 2] # invert yz
+
         faces = np.matmul(toggle_xz, faces.T).T.astype(np.uint64)
         scene_vertices.append(vtx)
         scene_faces.append(faces + count)
