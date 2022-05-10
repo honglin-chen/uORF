@@ -1,7 +1,21 @@
 import numpy as np
 import skimage.measure as measure
+# import mcubes
 import h5py
 from scipy.spatial.transform import Rotation as R
+import torch
+
+toggle_yz = np.array([
+    [1, 0, 0],
+    [0, 0, 1],
+    [0, 1, 0],
+])
+
+toggle_xz = np.array([
+    [0, 0, 1],
+    [0, 1, 0],
+    [1, 0, 0],
+])
 
 def get_surface_points_from_voxel(V, threshold, num):
     vtx, faces, _, _ = measure.marching_cubes_lewiner(V, threshold)
@@ -14,7 +28,7 @@ def get_surface_points_from_voxel(V, threshold, num):
 def get_surface_points_from_mesh(vtx, faces, d, num):
 
     points = _sample_ptcld_vf(vtx, faces, d)
-    print('Finish sampling')
+
     while len(points) < num:
         d *= 2
         points = _sample_ptcld_vf(vtx, faces, d)
@@ -76,7 +90,7 @@ def normalize_points(points):
     points = points - (bound_l + bound_h) / 2
     points = points / (bound_h - bound_l).max()
 
-    points = torch.tensor(points)[None]
+    points = torch.tensor(points)
     return points
 
 def transform_vertices(pts, rotations, trans, scale):
@@ -86,18 +100,25 @@ def transform_vertices(pts, rotations, trans, scale):
 
     return transformed_pts
 
-def load_gt_mesh_from_hdf(path, frame='0005', num_objects=3):
+def load_gt_mesh_from_hdf(path, frame='0005', num_objects=3, seg_colors=None, seg_masks=None):
     with h5py.File(path, 'r') as f:
         obj_vertices = []
         obj_faces = []
         scene_vertices = []
         scene_faces = []
 
+        if seg_colors is not None:
+            static_obj_seg_colors = torch.tensor(f["static"]['object_segmentation_colors'][:])
+            match = (seg_colors.unsqueeze(2) == static_obj_seg_colors.unsqueeze(1)).all(-1)[...,0]
+            assert match.sum() == seg_colors.shape[0] == static_obj_seg_colors.shape[0]
+            match_idx = torch.nonzero(match)[:, 1]
+        else:
+            match_idx = range(num_objects)
+
         count = 0
-        for obj_idx in range(num_objects):
+        for obj_idx in match_idx:
             vertices = f["static"]["mesh"][f"vertices_{obj_idx}"][:]
             faces = f["static"]["mesh"][f"faces_{obj_idx}"][:]
-            # obj_name = f["static"]["model_names"][:][obj_idx]
 
             scale = np.array(f["static"]["scale"][:])[obj_idx]
             scale_factor = np.array(f["frames"][frame]["objects"]["scale_factor"][:])[obj_idx]
@@ -106,12 +127,6 @@ def load_gt_mesh_from_hdf(path, frame='0005', num_objects=3):
             translation = np.array(f["frames"][frame]["objects"]["positions"][:])[obj_idx]
 
             vertices = transform_vertices(vertices, rotation, translation, scale)
-
-            toggle_yz = np.array([
-                [1, 0, 0],
-                [0, 0, 1],
-                [0, 1, 0],
-            ])
 
             vertices = np.matmul(toggle_yz, vertices.T).T
             faces = np.matmul(toggle_yz, faces.T).T
@@ -137,6 +152,10 @@ def compute_mesh_from_voxel(voxel, threshold):
     count = 0
     for obj_id in range(voxel.shape[0]):
         vtx, faces, _, _ = measure.marching_cubes_lewiner(voxel[obj_id], threshold)
+        # vtx, faces = mcubes.marching_cubes(voxel[obj_id], threshold)
+        vtx = np.matmul(toggle_xz, vtx.T).T
+        vtx[:,2] = -vtx[:, 2] # invert yz
+        faces = np.matmul(toggle_xz, faces.T).T.astype(np.uint64)
         scene_vertices.append(vtx)
         scene_faces.append(faces + count)
         obj_vertices.append(vtx)
@@ -147,6 +166,18 @@ def compute_mesh_from_voxel(voxel, threshold):
     scene_faces = np.concatenate(scene_faces)
 
     return obj_vertices, obj_faces, scene_vertices, scene_faces
+
+
+def cd_dis(xyz1, xyz2, batch_size):
+    assert xyz1.shape[1] == xyz2.shape[1] and xyz1.shape[2] == 3 and xyz2.shape[2] == 3
+    all_scores = list()
+    for idx in range(int(math.ceil(xyz1.shape[0] / batch_size))):
+        indl = idx * batch_size
+        indh = min(xyz1.shape[0], (idx + 1) * batch_size)
+        scores = _cd_dis(xyz1[indl:indh].copy(), xyz2[indl:indh].copy())
+        all_scores.append(scores)
+    all_scores = np.concatenate(all_scores)
+    return all_scores
 
 if __name__ == '__main__':
 
