@@ -700,17 +700,20 @@ class uorfEvalModel(BaseModel):
 
         if self.opt.extract_mesh:
             # evaluate mesh
+            num_points = 1024
+            threshold = 5.0
+
+            hdf_path = self.input_paths[0].replace('_frame5_img0.png', '.hdf5')
 
             obj_mesh_loss = []
             scene_mesh_loss = []
-            for view_id in range(1, raw_masks_density.shape[1]):
-                voxels = raw_masks_density[1:, view_id, ..., -1].cpu().numpy()  # remove background
-                num_points = 1024
-                threshold = 5.0
-                num_objects = voxels.shape[0]
-                hdf_path = self.input_paths[0].replace('_frame5_img0.png', '.hdf5')
 
-                d = 5e-7 / (voxels.shape[0] ** 2)
+            for view_id in range(1, raw_masks_density.shape[1]):
+
+                voxels = raw_masks_density[1:, view_id, ..., -1].cpu().numpy()  # remove background
+                d = 5e-7 / (voxels.shape[-1] ** 2)
+                num_objects = voxels.shape[0]
+
                 gt_obj_vtx, gt_obj_face, gt_scene_vtx, gt_scene_face = \
                     load_gt_mesh_from_hdf(hdf_path, frame='0005', num_objects=num_objects, seg_colors=self.obj_seg_colors[view_id])
                 pred_obj_vtx, pred_obj_face, pred_scene_vtx, pred_scene_face = compute_mesh_from_voxel(voxels, threshold=threshold)
@@ -731,8 +734,8 @@ class uorfEvalModel(BaseModel):
 
                     normalize_pred_obj_pts.append(normalize_points(pred_pts))
                     normalize_gt_obj_pts.append(normalize_points(gt_pts))
+                    breakpoint()
                     distance = chamfer_distance(normalize_points(pred_pts)[None], normalize_points(gt_pts)[None])
-
                     total_mesh_loss += distance[0]
                 obj_mesh_loss.append(total_mesh_loss / num_objects)
 
