@@ -23,6 +23,7 @@ python train.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_each_scene 4  \
     --pixel_nerf \
     --frame5 \
     --continue_train --exp_id 'latest' \
+    --color_jitter \
 
 echo "Done"
 # node5 cuda 6

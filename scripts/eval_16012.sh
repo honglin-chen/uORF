@@ -1,5 +1,5 @@
 #!/bin/bash
-DATAROOT=${1:-'tdw_20obj_2000'}
+DATAROOT=${1:-'tdw_30obj_2000'}
 CHECKPOINT=${2:-'/data2/wanhee/uORF/checkpoints/'}
 PORT=8077
 python -m visdom.server -p $PORT &>/dev/null &
@@ -14,6 +14,7 @@ python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
     --focal_ratio 0.9605 0.9605 \
     --near_plane 1 --far_plane 8 \
     --unified_decoder \
+    --no_locality_epoch 0 \
     --gt_seg \
     --restrict_world \
     --frame5 \

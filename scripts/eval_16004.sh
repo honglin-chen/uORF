@@ -1,14 +1,14 @@
 #!/bin/bash
-DATAROOT=${1:-'tdw_20obj_2000'}
+DATAROOT=${1:-'tdw_30obj_2000'}
 CHECKPOINT=${2:-'/data2/wanhee/uORF/checkpoints/'}
 PORT=8077
 python -m visdom.server -p $PORT &>/dev/null &
 python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
-    --checkpoints_dir $CHECKPOINT --name '16003' --exp_id 'latest' \
+    --checkpoints_dir $CHECKPOINT --name '16004' --exp_id 'latest' \
     --results_dir 'results' \
     --display_port $PORT --display_ncols 4 \
     --load_size 128 --input_size 128 --mask_size 128 --render_size 8 --frustum_size 128 \
-    --n_samp 128 --z_dim 64 --num_slots 4 \
+    --n_samp 128 --z_dim 64 --num_slots 2 \
     --model 'uorf_eval' \
     --skip 1000 \
     --focal_ratio 0.9605 0.9605 \
@@ -18,21 +18,11 @@ python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
     --pixel_encoder --mask_image \
     --use_ray_dir \
     --restrict_world \
+    --combine_masks --dataset_combine_masks \
     --without_slot_feature \
     --pixel_nerf \
     --frame5 \
-    --extract_mesh
-
-#    --debug2 \
-#    --pixel_after_density \
-#    --without_slot_feature \
-# /data2/wanhee/uORF/checkpoints/15201/run-2022-05-03-01-02-10 node6
-#/data2/wanhee/uORF/checkpoints/15202/run-2022-05-03-00-28-03 node6
-#/data2/wanhee/uORF/checkpoints/15202/run-2022-05-03-01-05-51 node6
-#/data2/wanhee/uORF/checkpoints/15203/run-2022-05-03-01-14-20 node5
-#/data2/wanhee/uORF/checkpoints/15204/run-2022-05-03-01-18-38 node5
-# /data2/wanhee/uORF/checkpoints/15211/run-2022-05-03-00-55-41
-# /data2/wanhee/uORF/checkpoints/15221/run-2022-05-03-10-49-43 node5
+#    --extract_mesh \
 
 # same bg fg decoder did not work before
 echo "Done"

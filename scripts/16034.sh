@@ -1,10 +1,10 @@
 #!/bin/bash
 DATAROOT=${1:-'tdw_20obj_2000'}
-PORT=${2:-16004}
+PORT=${2:-16034}
 NSCENES=${3:-1000}
 python -m visdom.server -p $PORT &>/dev/null &
 python train.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_each_scene 4  \
-    --checkpoints_dir 'checkpoints' --name '16004' \
+    --checkpoints_dir 'checkpoints' --name '16034' \
     --display_port $PORT --display_ncols 4 --print_freq 200 --display_freq 200 --display_grad \
     --load_size 128 --n_samp 128 --input_size 128 --mask_size 128 --supervision_size 64 \
     --niter 1200 --coarse_epoch 600 --z_dim 64 --num_slots 2 \
@@ -22,6 +22,7 @@ python train.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_each_scene 4  \
     --without_slot_feature \
     --pixel_nerf \
     --frame5 \
+    --silhouette_loss --silhouette_l2_loss \
     --continue_train --exp_id 'latest' \
 
 echo "Done"
