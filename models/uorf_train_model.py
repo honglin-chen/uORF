@@ -690,6 +690,7 @@ class uorfTrainModel(BaseModel):
                 raw2transmittances(raws_density, z_vals, ray_dir, uvw=uvw, KNDHW=(K, N, D, H, W), masks=masks_for_silhouette_density)
             self.silhouettes = silhouettes # NxKxHxW
 
+
             silhouette0 = silhouettes[0:1].transpose(0, 1) # Kx1xHxW
             # uv = uv.unsqueeze(1) # Kx1x(NxDxHxW)x2
             silhouettes_for_color = F.grid_sample(silhouette0, uv.unsqueeze(1), mode='bilinear', padding_mode='zeros',) # Kx1(C)x1x(NxDxHxW)
