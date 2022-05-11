@@ -491,18 +491,17 @@ class uorfEvalModel(BaseModel):
             if self.opt.combine_masks:
                 K = 2
                 z_slots = torch.zeros([K, 64])
-                attn = torch.zeros([K, self.opt.input_size ** 2])
+                attn = torch.zeros([K, self.opt.input_size**2])
             else:
                 K = self.opt.num_slots
                 z_slots = torch.zeros([K, 64])
-                attn = torch.zeros([K, self.opt.input_size ** 2])
+                attn = torch.zeros([K, self.opt.input_size**2])
         else:
             z_slots, attn = self.netSlotAttention(feat, masks=attn)  # 1xKxC, 1xKxN
             z_slots, attn = z_slots.squeeze(0), attn.squeeze(0)  # KxC, KxN (N = HxW)
             K = attn.shape[0]
             if self.opt.debug:
                 z_slots *= 0
-                print('z_slots are zero now')
 
         # Pixel Encoder Forward (to get feature values in pixel coordinates (uv), call pixelEncoder.index(uv), not forward)
         if not self.opt.uorf:
@@ -639,15 +638,6 @@ class uorfEvalModel(BaseModel):
                     sampling_coor_fg_ = self.netCentroidDecoder.transform_coords(coords=sampling_coor_fg_,
                                                                                 centroids=centroid_nss)
 
-                    # # Compute centroid loss
-                    # self.netCentroidDecoder.x = self.x
-                    # self.loss_centroid = self.netCentroidDecoder.centroid_loss(
-                    #     centroid_pixel=centroid_pixel, margin=self.opt.loss_centroid_margin,
-                    #     segment_centers=self.segment_centers, segment_masks=self.segment_masks, epoch=epoch)
-                    #
-                    # if self.opt.learn_only_centroid:
-                    #     return
-
                 if self.opt.mask_as_decoder_input or self.opt.weight_pixel_slot_mask:
                     silhouette0 = self.silhouette_masks[0:1].transpose(0, 1)  # Kx1xHxW
                     # uv = uv.unsqueeze(1)  # Kx1x(NxDxHxW)x2
@@ -661,6 +651,9 @@ class uorfEvalModel(BaseModel):
                 if self.opt.unified_decoder:
                     if self.opt.debug2:
                         pixel_feat_ *= 0
+                    if self.opt.uorf:
+                        pixel_feat_ = None
+                        ray_dir_input_ = None
                     raws_, masked_raws_, unmasked_raws_, masks_for_silhouette_ = \
                         self.netDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat=pixel_feat_,
                                         ray_dir_input=ray_dir_input_, decoder_type='unified',

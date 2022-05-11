@@ -400,11 +400,13 @@ class Decoder(nn.Module):
             input_dim += 1
             if not mask_as_decoder_input:
                 input_dim += 1 if not self.multiply_mask_pixelfeat else pixel_dim
-        if pixel_dim is not None or 0:
+        if pixel_dim is not None and pixel_dim is not 0:
             if self.no_concatenate:
                 pass
             else:
                 input_dim += pixel_dim
+
+        print(input_dim, 'input_dim')
 
         if small_latent:
             latent_dim = z_dim // 2
@@ -538,7 +540,6 @@ class Decoder(nn.Module):
             z_fg = z_slots[1:, :]  # (K-1)xC
             if self.without_slot_feature:
                 # print(self.without_slot_feature, 'without_slot_feature')
-
                 input_bg = query_bg
                 # print(input_bg.shape, 'input_bg.shape')
             else:
