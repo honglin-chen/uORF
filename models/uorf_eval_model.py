@@ -169,6 +169,8 @@ class uorfEvalModel(BaseModel):
                             help='epoch 0-10: learn only fg silhouette, epoch 10-20: learn silhouette and rgb, epoch 20- rgb')
         parser.add_argument('--learn_fg_first', action='store_true')
 
+        parser.add_argument('--no_locality_epoch', default=0)
+
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -188,7 +190,9 @@ class uorfEvalModel(BaseModel):
         - define loss function, visualization images, model names, and optimizers
         """
         BaseModel.__init__(self, opt)  # call the initialization method of BaseModel
-        self.loss_names = ['ari', 'fgari', 'nvari', 'psnr', 'ssim', 'lpips', 'obj_mesh', 'scene_mesh']
+        self.loss_names = ['ari', 'fgari', 'nvari', 'psnr', 'ssim', 'lpips']
+        if opt.extract_mesh:
+            self.loss_names = ['obj_mesh', 'scene_mesh']
         n = opt.n_img_each_scene
         self.visual_names = ['input_image',] + ['gt_novel_view{}'.format(i+1) for i in range(n-1)] + \
                             ['x_rec{}'.format(i) for i in range(n)] + \
@@ -747,7 +751,6 @@ class uorfEvalModel(BaseModel):
 
                     normalize_pred_obj_pts.append(normalize_points(pred_pts))
                     normalize_gt_obj_pts.append(normalize_points(gt_pts))
-                    breakpoint()
                     distance = chamfer_distance(normalize_points(pred_pts)[None], normalize_points(gt_pts)[None])
                     total_mesh_loss += distance[0]
                 obj_mesh_loss.append(total_mesh_loss / num_objects)
@@ -785,8 +788,8 @@ class uorfEvalModel(BaseModel):
                     print('Save mesh data to: ', save_path)
                     np.save(save_path, visualize_dict)
 
-            self.loss_obj_mesh = np.mean(obj_mesh_loss) * 1e3
-            self.loss_scene_mesh = np.mean(scene_mesh_loss) * 1e3
+            self.loss_obj_mesh = np.mean(obj_mesh_loss) * 10.
+            self.loss_scene_mesh = np.mean(scene_mesh_loss) * 10.
 
             print('Average object mesh loss: ', self.loss_obj_mesh, obj_mesh_loss)
             print('Scene mesh loss: ', self.loss_scene_mesh, scene_mesh_loss)
@@ -886,8 +889,9 @@ class uorfEvalModel(BaseModel):
 
 
     def compute_visuals(self):
-        # if self.opt.extract_mesh:
-        #     return
+        if self.opt.extract_mesh:
+            return
+
         with torch.no_grad():
             cam2world = self.cam2world[:self.opt.n_img_each_scene]
             _, N, D, H, W, _ = self.masked_raws.shape
@@ -948,6 +952,7 @@ class uorfEvalModel(BaseModel):
                     ari_score = adjusted_rand_score(gt_mask_idx, this_mask_idx)
                     nvari_meter.update(ari_score)
                 self.loss_nvari = nvari_meter.val
+
 
     def backward(self):
         pass

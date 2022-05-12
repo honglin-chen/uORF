@@ -35,7 +35,15 @@ if __name__ == '__main__':
         model.test()           # run inference: forward + compute_visuals
 
         if opt.extract_mesh:
-            pass
+            losses = model.get_current_losses()
+            visualizer.print_test_losses(i, losses)
+            for loss_name in model.loss_names:
+                meters_tst[loss_name].update(float(losses[loss_name]))
+
+            losses = {}
+            for loss_name in model.loss_names:
+                losses[loss_name] = meters_tst[loss_name].avg
+            visualizer.print_test_losses('average', losses)
 
         else:
             losses = model.get_current_losses()
