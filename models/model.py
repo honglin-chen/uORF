@@ -432,6 +432,8 @@ class Decoder(nn.Module):
                                      nn.Linear(latent_dim//4, 3))
         if pixel_dim is not None and bg_no_pixel and not no_concatenate and not color_after_density:
             input_dim += -pixel_dim
+        if bg_no_pixel:
+            input_dim += -3
         before_skip = [nn.Linear(input_dim, latent_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(latent_dim + input_dim, latent_dim), nn.ReLU(True)]
         for i in range(n_layers - 1):
@@ -513,7 +515,8 @@ class Decoder(nn.Module):
         query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
         if self.use_ray_dir:
             if not self.ray_after_density:
-                query_bg = torch.cat([query_bg, ray_dir_input], dim=1)
+                if not self.bg_no_pixel:
+                    query_bg = torch.cat([query_bg, ray_dir_input], dim=1)
                 query_fg_ex = torch.cat([query_fg_ex, ray_dir_input[None, ...].expand(K-1, -1, -1).flatten(0, 1)], dim=1)
 
         if no_concatenate and pixel_feat is not None:

@@ -503,7 +503,16 @@ class uorfTrainModel(BaseModel):
             frustum_size = torch.Tensor(self.projection_fine.frustum_size).to(self.device)
 
         if self.opt.use_ray_dir:
-            ray_dir_input = ray_dir.view([N, H, W, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
+            # ray_dir_input = ray_dir.view([N, H, W, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
+
+            ray_dir_input = ray_dir.view([N, H, W, 3])[0].unsqueeze(0) # 1xHxWx3
+            ray_dir_input /= torch.norm(ray_dir_input, dim=-1).unsqueeze(-1) # 1xHxWx3
+            ray_dir_input = ray_dir_input.squeeze(0).view([H*W, 3]).unsqueeze(-1) # (HxW)x3x1
+            cam2world_raydir = self.cam2world[:, :3, :3].unsqueeze(1) # Nx4x4 -> Nx1x3x3
+            ray_dir_input = torch.matmul(cam2world_raydir, ray_dir_input) # (j x 1 x n x m, k x m x p)-->(j x k x n x p)
+            # Nx1x3x3, (HxW)x3x1 --> Nx(HxW)x3x1
+            ray_dir_input = ray_dir_input.view([N, H, W, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
+
             ray_dir_input = ray_dir_input.flatten(0, 3)
         else:
             ray_dir_input = None
