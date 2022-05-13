@@ -25,6 +25,7 @@ class MultiscenesDataset(BaseDataset):
         parser.add_argument('--dataset_nearest_interp', action='store_true')
         parser.add_argument('--dataset_combine_masks', action='store_true')
         parser.add_argument('--color_jitter', action='store_true')
+        parser.add_argument('--use_eisen_seg', action='store_true')
         return parser
 
     def __init__(self, opt):
@@ -36,6 +37,7 @@ class MultiscenesDataset(BaseDataset):
         BaseDataset.__init__(self, opt)
         self.n_scenes = opt.n_scenes
         self.n_img_each_scene = opt.n_img_each_scene
+        self.use_eisen_seg = opt.use_eisen_seg
         self.min_num_masks = self.opt.num_slots if not self.opt.dataset_combine_masks else 4
         image_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*.png')))  # root/00000_sc000_az00_el00.png
         mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask.png')))
@@ -153,7 +155,7 @@ class MultiscenesDataset(BaseDataset):
                 ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot, 'depth': depth}
             else:
                 ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot}
-            mask_path = path.replace('.png', '_mask.png')
+            mask_path = path.replace('.png', '_pred_mask.png' if self.use_eisen_seg else '_mask.png')
             if os.path.isfile(mask_path):
                 mask = Image.open(mask_path).convert('RGB')
                 # mask_l = mask.convert('L')
@@ -180,11 +182,26 @@ class MultiscenesDataset(BaseDataset):
                 # additional attributes: GT background mask and object masks
                 ret['bg_mask'] = mask_l == bg_color
                 obj_masks = []
-                for i in range(len(greyscale_dict)):
-                    if greyscale_dict[i] == bg_color:
-                        continue
-                    obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
-                    obj_masks.append(obj_mask)
+                if self.use_eisen_seg:
+                    breakpoint()
+                    area = (mask_l == greyscale_dict[:, None, None]).sum(dim=[1, 2])
+                    if self.min_num_masks < len(greyscale_dict):
+                        _, idx = area.topk(k=self.min_num_masks)
+                    else:
+                        idx = range(len(greyscale_dict))
+
+                    for i in range(len(greyscale_dict)):
+                        if greyscale_dict[i] == bg_color:
+                            continue
+                        if i in idx:
+                            obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
+                            obj_masks.append(obj_mask)
+                else:
+                    for i in range(len(greyscale_dict)):
+                        if greyscale_dict[i] == bg_color:
+                            continue
+                        obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
+                        obj_masks.append(obj_mask)
                 obj_masks = torch.stack(obj_masks)  # Kx1xHxW
 
                 # if the number of masks is too small, pad with empty masks

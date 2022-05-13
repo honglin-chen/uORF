@@ -3,12 +3,12 @@ DATAROOT=${1:-'tdw_20obj_2000'}
 CHECKPOINT=${2:-'/data2/wanhee/uORF/checkpoints/'}
 PORT=8077
 python -m visdom.server -p $PORT &>/dev/null &
-python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
+python test.py --dataroot $DATAROOT --n_scenes 100 --n_img_each_scene 4 \
     --checkpoints_dir $CHECKPOINT --name '16004_20obj' --exp_id 'latest' \
     --results_dir 'results' \
     --display_port $PORT --display_ncols 4 \
-    --load_size 128 --input_size 128 --mask_size 128 --render_size 32 --frustum_size 128 \
-    --n_samp 128 --z_dim 64 --num_slots 2 \
+    --load_size 128 --input_size 128 --mask_size 128 --render_size 64 --frustum_size 256 \
+    --n_samp 256 --z_dim 64 --num_slots 2 \
     --model 'uorf_eval' \
     --skip 1000 \
     --focal_ratio 0.9605 0.9605 \
@@ -23,7 +23,7 @@ python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
     --without_slot_feature \
     --pixel_nerf \
     --frame5 \
-#    --extract_mesh \
+    --extract_mesh \
 
 # same bg fg decoder did not work before
 echo "Done"
