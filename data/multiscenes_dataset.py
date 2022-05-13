@@ -183,7 +183,7 @@ class MultiscenesDataset(BaseDataset):
                 ret['bg_mask'] = mask_l == bg_color
                 obj_masks = []
                 if self.use_eisen_seg:
-                    breakpoint()
+
                     area = (mask_l == greyscale_dict[:, None, None]).sum(dim=[1, 2])
                     if self.min_num_masks < len(greyscale_dict):
                         _, idx = area.topk(k=self.min_num_masks)
