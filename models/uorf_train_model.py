@@ -294,8 +294,6 @@ class uorfTrainModel(BaseModel):
                     self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size],
                                                                 num_pos_feats=p_dim // 2).to(self.device)
 
-
-
         # [Slot attention]
         self.num_slots = opt.num_slots
         if not self.opt.without_slot_feature:
@@ -332,27 +330,6 @@ class uorfTrainModel(BaseModel):
             self.parameters.append(self.netDecoder.parameters())
             self.nets.append(self.netDecoder)
             self.model_names.append('Decoder')
-        else:
-            # [Density Decoder]
-            if self.opt.density_no_pixel:
-                pixel_dim = None
-            self.netDensityDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                        locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, bg_no_pixel=self.opt.bg_no_pixel,
-                                                        use_ray_dir=False, small_latent=self.opt.small_latent, decoder_type='density',
-                                                               restrict_world=self.opt.restrict_world, mask_as_decoder_input=self.opt.mask_as_decoder_input), gpu_ids=self.gpu_ids, init_type='xavier')
-            self.parameters.append(self.netDensityDecoder.parameters())
-            self.nets.append(self.netDensityDecoder)
-            self.model_names.append('DensityDecoder')
-
-            # [Color Decoder]
-            pixel_dim = 64
-            self.netColorDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                        locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality, bg_no_pixel=self.opt.bg_no_pixel,
-                                                        use_ray_dir=self.opt.use_ray_dir, small_latent=self.opt.small_latent, decoder_type='color',
-                                                             reduce_color_decoder=self.opt.reduce_color_decoder, restrict_world=self.opt.restrict_world, density_as_color_input=self.opt.density_as_color_input, mask_as_decoder_input=self.opt.mask_as_decoder_input), gpu_ids=self.gpu_ids, init_type='xavier')
-            self.parameters.append(self.netColorDecoder.parameters())
-            self.nets.append(self.netColorDecoder)
-            self.model_names.append('ColorDecoder')
 
         if self.isTrain:  # only defined during training time
             self.optimizer = optim.Adam(chain(*self.parameters), lr=opt.lr)
@@ -400,10 +377,6 @@ class uorfTrainModel(BaseModel):
                 mode_ = 'bilinear'
             else:
                 mode_ = 'nearest'
-            if self.opt.antialias:
-                antialias_ = True
-            else:
-                antialias_ = False
 
             masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode=mode_)
             self.masks = masks.flatten(2, 3)
@@ -553,10 +526,6 @@ class uorfTrainModel(BaseModel):
             self.world2nss = self.projection_fine.world2nss
             frustum_size = torch.Tensor(self.projection_fine.frustum_size).to(self.device)
 
-            # print(self.cam2spixel, 'self.cam2spixel')
-            # print(self.world2nss, 'self.world2nss')
-            # print(frustum_size, 'frustum_size')
-
             # construct uv in the first image coordinates
             cam02world = cam2world[0:1] # 1x4x4
             world2cam0 = cam02world.inverse() # 1x4x4
@@ -569,24 +538,6 @@ class uorfTrainModel(BaseModel):
             # print(pixel_cam0_coor[..., 2].max(), pixel_cam0_coor[..., 2].min(), pixel_cam0_coor[..., 2].mean(), pixel_cam0_coor[..., 2].std(), 'pixel_cam0_coor statistics')
             uv = pixel_cam0_coor[:, :, 0:2]/ pixel_cam0_coor[:, :, 2].unsqueeze(-1) # 1x(NxDxHxW)x2
             uv = (uv + 0.)/frustum_size[0:2][None, None, :] * 2 - 1 # nomalize to fit in with [-1, 1] grid # TODO: check this
-            # print(uv.max(), uv.min(), uv.mean(), uv.std(), 'max, min, mean, std')
-
-            # print('----')
-            # print(uv.view([N, D, H, W, 2])[1, 32, 0, 0, :] ,'uv')
-            # print('----')
-            # 0 -> 0.5/frustum_size, 1 -> 1.5/frustum_size, ..., frustum_size-1 -> (frustum_size-0.5/frustum_size)
-            # then, change [0, 1] -> [-1, 1]
-            # if self.opt.debug:
-            #     uv = torch.cat([uv[..., 1:2], uv[..., 0:1]], dim=-1) # flip uv
-
-            if self.opt.weight_pixelfeat:
-                w = pixel_cam0_coor[:, :, 2:3]
-                w = (w - self.opt.near_plane) / (self.opt.far_plane - self.opt.near_plane)  # [0, 1] torch linspace is inclusive (include final value)
-                w = w * frustum_size[2:3][None, None, :]  # [0, 63]
-                w = (w + 0.) / frustum_size[2] * 2 - 1  # [-1, 1]
-
-                # uvw = torch.cat([w, uv], dim=-1)  # 1x(NxDxHxW)x3 # this is wrong. think about the x y z coordinate system! (H, W, D)
-                uvw = torch.cat([uv, w], dim=-1)  # 1x(NxDxHxW)x3
 
             if self.opt.pixel_encoder:
                 if self.opt.mask_image or self.opt.mask_image_feature:
@@ -667,89 +618,8 @@ class uorfTrainModel(BaseModel):
             rgb_map, depth_map, _, _, _, silhouettes = raw2outputs(raws, z_vals, ray_dir, return_silhouettes=masks_for_silhouette)
             self.silhouettes = silhouettes
 
-        else:
-            if self.opt.density_no_pixel:
-                raws_density, masked_raws_density, unmasked_raws_density, masks_for_silhouette_density, raw_masks_density = \
-                    self.netDensityDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat=None,
-                                           ray_dir_input=ray_dir_input, decoder_type='density', silhouettes=silhouettes_for_density)
-                # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1
-            else:
-                raws_density, masked_raws_density, unmasked_raws_density, masks_for_silhouette_density, raw_masks_density = \
-                    self.netDensityDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat, ray_dir_input=ray_dir_input, decoder_type='density', silhouettes=silhouettes_for_density)
-                # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1
-            raws_density = raws_density.view([N, D, H, W, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-            masks_for_silhouette_density = masks_for_silhouette_density.view([K, N, D, H, W])
-
-            if self.opt.rgb_loss_density_decoder:
-                rgb_map, depth_map, _, _, _, _ = raw2outputs(raws_density, z_vals, ray_dir)
-                rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                x_recon_density = rendered * 2 - 1
-                self.loss_recon_density = self.L2_loss(x_recon_density, x)
-
-            weights, transmittance_samples, silhouettes =\
-                raw2transmittances(raws_density, z_vals, ray_dir, uvw=uvw, KNDHW=(K, N, D, H, W), masks=masks_for_silhouette_density)
-            self.silhouettes = silhouettes # NxKxHxW
-
-            silhouette0 = silhouettes[0:1].transpose(0, 1) # Kx1xHxW
-            # uv = uv.unsqueeze(1) # Kx1x(NxDxHxW)x2
-            silhouettes_for_color = F.grid_sample(silhouette0, uv.unsqueeze(1), mode='bilinear', padding_mode='zeros',) # Kx1(C)x1x(NxDxHxW)
-            silhouettes_for_color = silhouettes_for_color.flatten(0, 3).view(K, N, D, H, W).permute([1, 2, 0, 3, 4]) # NxDxKxHxW
-
-            self.transmittance_samples = transmittance_samples
-
-            # transmittance_samples Nx(HxWxD) # pixel_feat Kx(NxDxHxW)xC
-            transmittance_samples = transmittance_samples.view([N, H, W, D]).permute([0, 3, 1, 2]).flatten(0, 3)[None, ..., None] # 1x(NxDxHxW)x1
-            raws_color, masked_raws_color, unmasked_raws_color, masks_for_silhouette_color = \
-                self.netColorDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat=pixel_feat,
-                                ray_dir_input=ray_dir_input, transmittance_samples=transmittance_samples, raw_masks_density=raw_masks_density, silhouettes=silhouettes_for_color, decoder_type='color')
-
-            raws = raws_color.view([N, D, H, W, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-            masked_raws = masked_raws_color.view([K, N, D, H, W, 4])
-            unmasked_raws = unmasked_raws_color.view([K, N, D, H, W, 4])
-            masks_for_silhouette = masks_for_silhouette_color.view([K, N, D, H, W])
-
-            rgb_map, _, _, _, = raw2colors(raws, weights, z_vals)
-
-
         rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
         x_recon = rendered * 2 - 1
-
-        if self.opt.progressive_silhouette:
-            # print(epoch, 'epoch')
-            start = 0
-            if self.opt.predict_centroid:
-                start = 30
-                self.opt.only_make_silhouette_not_delete = True
-            else:
-                self.opt.only_make_silhouette_not_delete = False
-            if epoch < start:
-                self.opt.silhouette_loss = False
-                self.loss_silhouette = 0.
-                self.opt.learn_only_silhouette = False
-                self.opt.only_make_silhouette_not_delete = True
-                self.opt.silhouette_epoch = 0
-            # elif epoch < 10 + start:
-            #     self.opt.silhouette_loss = True
-            #     self.opt.learn_only_silhouette = True
-            #     self.opt.bg_no_silhouette_loss = True
-            #     self.opt.only_make_silhouette_not_delete = True
-            #     # self.opt.silhouette_l2_loss = True
-            #     self.opt.silhouette_epoch = 0
-            # elif epoch < 20 + start:
-            #     self.opt.silhouette_loss = True
-            #     self.opt.learn_only_silhouette = False
-            #     self.opt.bg_no_silhouette_loss = True
-            #     self.opt.only_make_silhouette_not_delete = True
-            #     # self.opt.silhouette_l2_loss = True
-            elif epoch < 30 + start:
-                self.opt.silhouette_loss = True
-                self.opt.learn_only_silhouette = False
-                self.opt.bg_no_silhouette_loss = False
-                self.opt.only_make_silhouette_not_delete = True
-            else:
-                self.opt.silhouette_loss = False
-                self.opt.silhouette_l2_loss = False
-                self.loss_silhouette = 0.
 
         if self.opt.learn_only_silhouette:
             self.loss_recon *= 0.
