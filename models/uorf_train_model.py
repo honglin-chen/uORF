@@ -184,6 +184,9 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--loss_centroid_margin', type=float, default=0.05, help='max margin for the centroid loss')
         parser.add_argument('--progressive_silhouette', action='store_true', help='epoch 0-10: learn only fg silhouette, epoch 10-20: learn silhouette and rgb, epoch 20- rgb')
         parser.add_argument('--learn_fg_first', action='store_true')
+        parser.add_argument('--silhouette_expand', action='store_true', help='expand the silhouette for 1 pixel')
+        parser.add_argument('--fg_only_delete_bg', action='store_true', help='only remove the background from bg')
+        parser.add_argument('--debug3', action='store_true', help='20001')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=2000, custom_lr=True, lr_policy='warmup')
@@ -338,6 +341,8 @@ class uorfTrainModel(BaseModel):
         self.L2_loss = nn.MSELoss()
         self.L1_loss = nn.L1Loss()
         self.dice_loss = DiceLoss()
+        if self.opt.silhouette_expand:
+            self.maxpool2d = nn.MaxPool2d(3, stride=1, padding=1)
 
     def setup(self, opt):
         """Load and print networks; create schedulers
@@ -656,6 +661,16 @@ class uorfTrainModel(BaseModel):
             # print(idx, 'idx')
             silhouette_masks_ = self.silhouette_masks[:, idx:, ...]
             silhouettes_ = self.silhouettes[:, idx:, ...]
+            if self.opt.silhouette_expand:
+                assert self.opt.bg_no_silhouette_loss
+                silhouette_masks_ = self.maxpool2d(silhouette_masks_)
+            if self.opt.debug3:
+                for _ in range(5):
+                    silhouette_masks_ = self.maxpool2d(silhouette_masks_)
+            if self.opt.fg_only_delete_bg:
+                # print(silhouette_masks_.max(), silhouette_masks_.min(), 'max', 'min') # 1, 0
+                silhouettes_ *= (1 - silhouette_masks_)
+                silhouette_masks_ *= 0
             if self.opt.only_make_silhouette_not_delete:
                 silhouettes_ *= silhouette_masks_
             if self.opt.mask_div_by_mean:
