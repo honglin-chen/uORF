@@ -1,13 +1,13 @@
 #!/bin/bash
 DATAROOT=${1:-'tdw_30obj_multibg'}
-PORT=${2:-19012}
+PORT=${2:-19033}
 NSCENES=${3:-3000}
 python -m visdom.server -p $PORT &>/dev/null &
 python train.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_each_scene 4  \
-    --checkpoints_dir 'checkpoints' --name '19012' \
-    --display_port $PORT --display_ncols 4 --print_freq 200 --display_freq 200 --display_grad \
+    --checkpoints_dir 'checkpoints' --name '19033' \
+    --display_port $PORT --display_ncols 4 --print_freq 200 --display_freq 20 --display_grad \
     --load_size 128 --n_samp 128 --input_size 128 --mask_size 128 --supervision_size 64 \
-    --niter 85 --coarse_epoch 25 --z_dim 64 --num_slots 4 \
+    --niter 82 --coarse_epoch 22 --z_dim 64 --num_slots 4 \
     --save_latest_freq 500 \
     --model 'uorf_train' \
     --focal_ratio 0.9605 0.9605 \
@@ -15,12 +15,16 @@ python train.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_each_scene 4  \
     --unified_decoder \
     --no_locality_epoch 0 \
     --gt_seg \
-    --uorf \
+    --pixel_encoder --mask_image \
+    --use_ray_dir \
     --restrict_world \
+    --without_slot_feature \
+    --pixel_nerf \
     --frame5 \
     --use_eisen_seg \
     --continue_train --exp_id 'latest' \
     --percept_in 0 \
+    --color_jitter \
 
 echo "Done"
-# node3 cuda 3
+# node5 cuda 1

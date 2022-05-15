@@ -20,6 +20,9 @@ python train.py --dataroot $DATAROOT --n_scenes $NSCENES --n_img_each_scene 4  \
     --restrict_world \
     --frame5 \
     --bg_no_pixel \
+    --silhouette_loss --silhouette_l2_loss --bg_no_silhouette_loss --silhouette_expand --fg_only_delete_bg \
+    --continue_train --exp_id 'latest' \
+    --percept_in 0 \
 
 echo "Done"
 # 25
