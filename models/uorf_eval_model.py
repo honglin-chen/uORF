@@ -88,6 +88,7 @@ class uorfEvalModel(BaseModel):
         parser.add_argument('--n_freq', type=int, default=5, help='how many increased freq?')
         parser.add_argument('--n_samp', type=int, default=64, help='num of samp per ray')
         parser.add_argument('--n_layer', type=int, default=3, help='num of layers bef/aft skip link in decoder')
+        parser.add_argument('--no_locality_epoch', type=int, default=0)
         parser.add_argument('--bottom', action='store_true', help='one more encoder layer on bottom')
         parser.add_argument('--input_size', type=int, default=128)
         parser.add_argument('--frustum_size', type=int, default=64, help='Size of rendered images')
@@ -169,8 +170,6 @@ class uorfEvalModel(BaseModel):
                             help='epoch 0-10: learn only fg silhouette, epoch 10-20: learn silhouette and rgb, epoch 20- rgb')
         parser.add_argument('--learn_fg_first', action='store_true')
 
-        parser.add_argument('--no_locality_epoch', default=0)
-
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -240,8 +239,7 @@ class uorfEvalModel(BaseModel):
             p_dim = z_dim
             if self.opt.resnet_encoder:
                 self.pos_emb = position_encoding_image(size=[opt.input_size // 2, opt.input_size // 2],
-                                                       num_pos_feats=p_dim // 2).to(
-                    self.device)
+                                                       num_pos_feats=p_dim // 2).to(self.device)
             else:
                 self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size],
                                                        num_pos_feats=p_dim // 2).to(self.device)
@@ -275,7 +273,6 @@ class uorfEvalModel(BaseModel):
             self.model_names.append('CentroidDecoder')
 
             if not self.opt.slot_positional_encoding:
-
                 if self.opt.resnet_encoder:
                     self.pos_emb = position_encoding_image(size=[opt.input_size // 2, opt.input_size // 2],
                                                            num_pos_feats=p_dim // 2).to(self.device)
@@ -324,53 +321,11 @@ class uorfEvalModel(BaseModel):
             self.parameters.append(self.netDecoder.parameters())
             self.nets.append(self.netDecoder)
             self.model_names.append('Decoder')
-        else:
-            # [Density Decoder]
-            if self.opt.density_no_pixel:
-                pixel_dim = None
-            self.netDensityDecoder = networks.init_net(
-                Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim,
-                        n_layers=opt.n_layer,
-                        locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality,
-                        bg_no_pixel=self.opt.bg_no_pixel,
-                        use_ray_dir=False, small_latent=self.opt.small_latent, decoder_type='density',
-                        restrict_world=self.opt.restrict_world, mask_as_decoder_input=self.opt.mask_as_decoder_input),
-                gpu_ids=self.gpu_ids, init_type='xavier')
-
-            self.parameters.append(self.netDensityDecoder.parameters())
-            self.nets.append(self.netDensityDecoder)
-            self.model_names.append('DensityDecoder')
-
-            # [Color Decoder]
-            pixel_dim = 64
-            self.netColorDecoder = networks.init_net(
-                Decoder(n_freq=opt.n_freq, input_dim=6 * opt.n_freq + 3 + z_dim, pixel_dim=pixel_dim, z_dim=opt.z_dim,
-                        n_layers=opt.n_layer,
-                        locality_ratio=opt.obj_scale / opt.nss_scale, fixed_locality=opt.fixed_locality,
-                        bg_no_pixel=self.opt.bg_no_pixel,
-                        use_ray_dir=self.opt.use_ray_dir, small_latent=self.opt.small_latent, decoder_type='color',
-                        reduce_color_decoder=self.opt.reduce_color_decoder, restrict_world=self.opt.restrict_world,
-                        density_as_color_input=self.opt.density_as_color_input,
-                        mask_as_decoder_input=self.opt.mask_as_decoder_input), gpu_ids=self.gpu_ids, init_type='xavier')
-            self.parameters.append(self.netColorDecoder.parameters())
-            self.nets.append(self.netColorDecoder)
-            self.model_names.append('ColorDecoder')
 
         self.L2_loss = torch.nn.MSELoss()
         self.L1_loss = torch.nn.L1Loss()
         self.LPIPS_loss = lpips.LPIPS().cuda()
         self.dice_loss = DiceLoss()
-
-        # [Extract Mesh]
-        # if self.opt.extract_mesh:
-        #     self.opt.gt_seg = True
-        #     self.opt.pixel_encoder = True
-        #     self.opt.mask_image_feature = True
-        #     self.opt.mask_image = True
-        #     self.opt.use_ray_dir = True
-        #     self.opt.silhouette_loss = False
-        #     self.opt.weight_pixelfeat = False
-        #     self.opt.bg_no_pixel = True
 
     def setup(self, opt):
         """Load and print networks; create schedulers
@@ -403,12 +358,10 @@ class uorfEvalModel(BaseModel):
             self.mask_idx = input['mask_idx']
             self.fg_idx = input['fg_idx']
             self.obj_idxs = input['obj_idxs']  # NxKxHxW
-            self.obj_masks = input['obj_masks'] # NxKxHxW
 
         if 'masks' in input.keys():
             bg_masks = input['bg_mask'][0:1].to(self.device)
             obj_masks = input['obj_masks'][0:1].to(self.device)
-
             masks = torch.cat([bg_masks, obj_masks], dim=1)
             if self.opt.combine_masks:
                 obj_mask = torch.zeros_like(obj_masks[:, 0, ...])
@@ -421,10 +374,6 @@ class uorfEvalModel(BaseModel):
                 mode_ = 'bilinear'
             else:
                 mode_ = 'nearest'
-            if self.opt.antialias:
-                antialias_ = True
-            else:
-                antialias_ = False
 
             masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode='nearest')
             self.masks = masks.flatten(2, 3)
@@ -501,11 +450,11 @@ class uorfEvalModel(BaseModel):
             if self.opt.combine_masks:
                 K = 2
                 z_slots = torch.zeros([K, 64])
-                attn = torch.zeros([K, self.opt.input_size ** 2])
+                attn = torch.zeros([K, self.opt.input_size**2])
             else:
                 K = self.opt.num_slots
                 z_slots = torch.zeros([K, 64])
-                attn = torch.zeros([K, self.opt.input_size ** 2])
+                attn = torch.zeros([K, self.opt.input_size**2])
         else:
             z_slots, attn = self.netSlotAttention(feat, masks=attn)  # 1xKxC, 1xKxN
             z_slots, attn = z_slots.squeeze(0), attn.squeeze(0)  # KxC, KxN (N = HxW)
@@ -532,27 +481,21 @@ class uorfEvalModel(BaseModel):
         # 4x(NxDx(H/2)x(W/2))x3, 4x(Nx(H/2)x(W/2))xD, 4x(Nx(H/2)x(W/2))x3
         x = self.x
         x_recon = torch.zeros([N, 3, H, W], device=dev)
-        rendered = torch.zeros([N, 3, H, W], device=dev)
         masked_raws = torch.zeros([K, N, D, H, W, 4], device=dev)
         unmasked_raws = torch.zeros([K, N, D, H, W, 4], device=dev)
-        transmittance_samples = torch.zeros([N, H, W, D], device=dev)
         raws = torch.zeros([N, D, H, W, 4], device=dev)
-        raws_density = torch.zeros([N, D, H, W, 4], device=dev)
-        masks_for_silhouette_density = torch.zeros([K, N, D, H, W], device=dev)
-        uvw = torch.zeros([1, N, D, H, W, 3], device=dev) # 1x(NxDxHxW)x3
-
-        z_vals_not_partitioned = torch.zeros([N, H, W, D], device=dev)
-        ray_dir_not_partitioned = torch.zeros([N, H, W, 3], device=dev)
-
         silhouettes = torch.zeros([N, K, H, W], device=dev)
+
+        # rendered = torch.zeros([N, 3, H, W], device=dev)
+        # transmittance_samples = torch.zeros([N, H, W, D], device=dev)
+        # raws_density = torch.zeros([N, D, H, W, 4], device=dev)
+        # masks_for_silhouette_density = torch.zeros([K, N, D, H, W], device=dev)
+        # uvw = torch.zeros([1, N, D, H, W, 3], device=dev) # 1x(NxDxHxW)x3
+        # z_vals_not_partitioned = torch.zeros([N, H, W, D], device=dev)
+        # ray_dir_not_partitioned = torch.zeros([N, H, W, 3], device=dev)
 
         if self.opt.extract_mesh:
             raw_masks_density = torch.zeros([K, N, D, H, W, 1])
-
-        # print(K, N, D, H, W, 'K, N, D, H, W')
-
-        raw_masks_density_list = []
-        pixel_feat_list = []
 
         # Decoder centroid
         if self.opt.predict_centroid:
@@ -570,10 +513,6 @@ class uorfEvalModel(BaseModel):
             self.netCentroidDecoder.frustum_size = frustum_size_
             self.netCentroidDecoder.cam2world = self.cam2world
             _, centroid_nss, centroid_pixel = self.netCentroidDecoder(p_slots.squeeze(0))
-            # print(centroid_nss, 'centroid_nss')
-            # print(centroid_pixel, 'centroid_pixel')
-            # print(centroid_nss.max(), centroid_nss.min(), centroid_nss.mean(), centroid_nss.std(), 'centroid max, min, mean, std')
-
 
         for (j, (frus_nss_coor_, z_vals_, ray_dir_)) in enumerate(zip(frus_nss_coor, z_vals, ray_dir)):
             # print(j, 'j')
@@ -614,19 +553,6 @@ class uorfEvalModel(BaseModel):
                 # if self.opt.debug:
                 #     uv = torch.cat([uv[..., 1:2], uv[..., 0:1]], dim=-1) # flip uv
 
-                if self.opt.weight_pixelfeat:
-                    w_ = pixel_cam0_coor_[:, :, 2:3]
-                    w_ = (w_ - self.opt.near_plane) / (
-                                self.opt.far_plane - self.opt.near_plane)  # [0, 1] torch linspace is inclusive (include final value)
-                    # w_ = (w_ + 0.) * 2 - 1  # [-1, 1]
-                    w = w * frustum_size[2:3][None, None, :]  # [0, 63]
-                    w = (w + 0.) / frustum_size[2] * 2 - 1  # [-1, 1]
-
-                    # uvw = torch.cat([w, uv], dim=-1)  # 1x(NxDxHxW)x3 # this is wrong. think about the x y z coordinate system! (H, W, D)
-                    uvw_ = torch.cat([uv_, w_], dim=-1)  # 1x(NxDxHxW)x3
-
-                    uvw[:, :, :, h::scale, w::scale, :] = uvw_.view([1, N, D, H_, W_, 3])
-
                 if self.opt.pixel_encoder:
                     if self.opt.mask_image or self.opt.mask_image_feature:
                         uv_ = uv_.expand(K, -1, -1)  # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
@@ -640,80 +566,52 @@ class uorfEvalModel(BaseModel):
                 else:
                     uv_ = uv_.expand(K, -1, -1)
 
-                # Decoder centroid
-                if self.opt.predict_centroid:
+            # Decoder centroid
+            if self.opt.predict_centroid:
+                # Transform sampling coordinates
+                sampling_coor_fg_ = self.netCentroidDecoder.transform_coords(coords=sampling_coor_fg_,
+                                                                            centroids=centroid_nss)
 
-                    # Transform sampling coordinates
-                    # print(sampling_coor_fg_[0], 'sampling coor 0')
-                    # print(centroid_nss, 'centroid nss')
-                    sampling_coor_fg_ = self.netCentroidDecoder.transform_coords(coords=sampling_coor_fg_,
-                                                                                centroids=centroid_nss)
+            if self.opt.mask_as_decoder_input or self.opt.weight_pixel_slot_mask:
+                silhouette0 = self.silhouette_masks[0:1].transpose(0, 1)  # Kx1xHxW
+                # uv = uv.unsqueeze(1)  # Kx1x(NxDxHxW)x2
+                silhouettes_for_density_ = F.grid_sample(silhouette0, uv_.unsqueeze(1), mode='bilinear',
+                                                        padding_mode='zeros', )  # Kx1(C)x1x(NxDxHxW)
+                silhouettes_for_density_ = silhouettes_for_density_.flatten(0, 3).view(K, N, D, H_, W_).permute(
+                    [1, 2, 0, 3, 4])  # NxDxKxHxW  # NxDxKxHxW
+            else:
+                silhouettes_for_density_ = None
 
-                    # # Compute centroid loss
-                    # self.netCentroidDecoder.x = self.x
-                    # self.loss_centroid = self.netCentroidDecoder.centroid_loss(
-                    #     centroid_pixel=centroid_pixel, margin=self.opt.loss_centroid_margin,
-                    #     segment_centers=self.segment_centers, segment_masks=self.segment_masks, epoch=epoch)
-                    #
-                    # if self.opt.learn_only_centroid:
-                    #     return
+            if self.opt.unified_decoder:
+                if self.opt.debug2:
+                    pixel_feat_ *= 0
+                if self.opt.uorf:
+                    pixel_feat_ = None
+                    ray_dir_input_ = None
+                raws_, masked_raws_, unmasked_raws_, masks_for_silhouette_ = \
+                    self.netDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat=pixel_feat_,
+                                    ray_dir_input=ray_dir_input_, decoder_type='unified',
+                                    silhouettes=silhouettes_for_density_)
+                # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1
+                raws_ = raws_.view([N, D, H_, W_, 4])#.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
+                masked_raws_ = masked_raws_.view([K, N, D, H_, W_, 4])
+                unmasked_raws_ = unmasked_raws_.view([K, N, D, H_, W_, 4])
+                masks_for_silhouette_ = masks_for_silhouette_.view([K, N, D, H_, W_])
 
-                if self.opt.mask_as_decoder_input or self.opt.weight_pixel_slot_mask:
-                    silhouette0 = self.silhouette_masks[0:1].transpose(0, 1)  # Kx1xHxW
-                    # uv = uv.unsqueeze(1)  # Kx1x(NxDxHxW)x2
-                    silhouettes_for_density_ = F.grid_sample(silhouette0, uv_.unsqueeze(1), mode='bilinear',
-                                                            padding_mode='zeros', )  # Kx1(C)x1x(NxDxHxW)
-                    silhouettes_for_density_ = silhouettes_for_density_.flatten(0, 3).view(K, N, D, H_, W_).permute(
-                        [1, 2, 0, 3, 4])  # NxDxKxHxW  # NxDxKxHxW
-                else:
-                    silhouettes_for_density_ = None
+                raws[..., h::scale, w::scale, :] = raws_
+                masked_raws[..., h::scale, w::scale, :] = masked_raws_
+                unmasked_raws[..., h::scale, w::scale, :] = unmasked_raws_
 
-                if self.opt.unified_decoder:
-                    if self.opt.debug2:
-                        pixel_feat_ *= 0
-                    raws_, masked_raws_, unmasked_raws_, masks_for_silhouette_ = \
-                        self.netDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat=pixel_feat_,
-                                        ray_dir_input=ray_dir_input_, decoder_type='unified',
-                                        silhouettes=silhouettes_for_density_)
-                    # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1
-                    raws_ = raws_.view([N, D, H_, W_, 4])#.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                    masked_raws_ = masked_raws_.view([K, N, D, H_, W_, 4])
-                    unmasked_raws_ = unmasked_raws_.view([K, N, D, H_, W_, 4])
-                    masks_for_silhouette_ = masks_for_silhouette_.view([K, N, D, H_, W_])
-
-                    raws[..., h::scale, w::scale, :] = raws_
-                    masked_raws[..., h::scale, w::scale, :] = masked_raws_
-                    unmasked_raws[..., h::scale, w::scale, :] = unmasked_raws_
-
-                    z_vals, ray_dir = z_vals_, ray_dir_
-                    raws_ = raws_.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                    rgb_map_, depth_map_, _, _, _, silhouettes_ = raw2outputs(raws_, z_vals_, ray_dir_,
-                                                                           return_silhouettes=masks_for_silhouette_)
-                    rendered_ = rgb_map_.view(N, H_, W_, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                    x_recon_ = rendered_ * 2 - 1
-                    x_recon[..., h::scale, w::scale] = x_recon_
-                    silhouettes[..., h::scale, w::scale] = silhouettes_ # NxKxHxW
-                    if self.opt.extract_mesh:
-                        raw_masks_density_list.append(masked_raws_[..., -1:])
-                        raw_masks_density[:, :, :, h::scale, w::scale, :] = masked_raws_[..., -1:].view(K, N, D, H_, W_, 1)
-
-                # else:
-                #     raws_density_, masked_raws_density_, unmasked_raws_density_, masks_for_silhouette_density_, raw_masks_density_ = \
-                #         self.netDensityDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat_,
-                #                                ray_dir_input=ray_dir_input_, decoder_type='density')
-                #
-                #     raws_density_ = raws_density_.view([N, D, H_, W_, 4])
-                #     masks_for_silhouette_density_ = masks_for_silhouette_density_.view([K, N, D, H_, W_])
-                #     raws_density[:, :, h::scale, w::scale, :] = raws_density_
-                #     masks_for_silhouette_density[:, :, :, h::scale, w::scale] = masks_for_silhouette_density_
-                #
-                #     raw_masks_density_list.append(raw_masks_density_)
-                #
-                #     pixel_feat_list.append(pixel_feat_)
-                #     z_vals_not_partitioned[:, h::scale, w::scale, :] = z_vals_.view([N, H_, W_, D])
-                #     ray_dir_not_partitioned[:, h::scale, w::scale, :] = ray_dir_.view([N, H_, W_, 3])
-                #     if self.opt.extract_mesh:
-                #         raw_masks_density[:, :, :, h::scale, w::scale, :] = raw_masks_density_.view(K, N, D, H_, W_, 1)
+                z_vals, ray_dir = z_vals_, ray_dir_
+                raws_ = raws_.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
+                rgb_map_, depth_map_, _, _, _, silhouettes_ = raw2outputs(raws_, z_vals_, ray_dir_,
+                                                                       return_silhouettes=masks_for_silhouette_)
+                rendered_ = rgb_map_.view(N, H_, W_, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+                x_recon_ = rendered_ * 2 - 1
+                x_recon[..., h::scale, w::scale] = x_recon_
+                silhouettes[..., h::scale, w::scale] = silhouettes_ # NxKxHxW
+                if self.opt.extract_mesh:
+                    raw_masks_density[:, :, :, h::scale, w::scale, :] = masked_raws_[..., -1:].view(K, N, D, H_, W_, 1)
 
         if self.opt.extract_mesh:
             # evaluate mesh
@@ -794,73 +692,6 @@ class uorfEvalModel(BaseModel):
             print('Average object mesh loss: ', self.loss_obj_mesh, obj_mesh_loss)
             print('Scene mesh loss: ', self.loss_scene_mesh, scene_mesh_loss)
 
-            # return raw_masks_density_list
-        if self.opt.unified_decoder:
-            pass
-        else:
-            raws_density = raws_density.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-            uvw = uvw.view([1, N, D, H, W, 3]).flatten(1, 4)
-            uv = uvw[..., 0:2].expand(K, -1, -1)
-
-            z_vals_not_partitioned = z_vals_not_partitioned.flatten(0, 2)
-            ray_dir_not_partitioned = ray_dir_not_partitioned.flatten(0, 2)
-
-            weights, transmittance_samples, silhouettes = \
-                raw2transmittances(raws_density, z_vals_not_partitioned, ray_dir_not_partitioned, uvw=uvw, KNDHW=(K, N, D, H, W),
-                                   masks=masks_for_silhouette_density)
-
-            transmittance_samples = transmittance_samples.view([N, H, W, D]).permute([0, 3, 1, 2]).flatten(0, 3)[
-                None, ..., None]  # 1x(NxDxHxW)x1
-
-            silhouette0 = silhouettes[0:1].transpose(0, 1)  # Kx1xHxW
-            uv = uv.unsqueeze(1)  # Kx1x(NxDxHxW)x2
-            silhouettes_for_color = F.grid_sample(silhouette0, uv, mode='bilinear',
-                                                  padding_mode='zeros', )  # Kx1(C)x1x(NxDxHxW)
-            silhouettes_for_color = silhouettes_for_color.flatten(0, 3).view(K, N, D, H, W).permute(
-                [1, 2, 0, 3, 4])  # NxDxKxHxW
-
-            for (j, (frus_nss_coor_, z_vals_, ray_dir_)) in enumerate(zip(frus_nss_coor, z_vals, ray_dir)):
-                h, w = divmod(j, scale)
-                H_, W_ = H // scale, W // scale
-                sampling_coor_fg_ = frus_nss_coor_[None, ...].expand(K - 1, -1, -1)  # (K-1)xPx3
-                sampling_coor_bg_ = frus_nss_coor_  # Px3
-
-                if self.opt.use_ray_dir:
-                    ray_dir_input_ = ray_dir_.view([N, H_, W_, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
-                    ray_dir_input_ = ray_dir_input_.flatten(0, 3)
-                else:
-                    ray_dir_input_ = None
-
-                pixel_feat_ = pixel_feat_list[j]
-                raw_masks_density_ = raw_masks_density_list[j]
-                # raw_masks_density_ = raw_masks_density[:, :, :, h::scale, w::scale, :].flatten(1, 4)
-                silhouettes_for_color_ = silhouettes_for_color[:, :, :, h::scale, w::scale] # NxDxKxHxW
-                transmittance_samples_ = transmittance_samples.view([N, D, H, W])[:, :, h::scale, w::scale].flatten(0, 3)[
-                None, ..., None]
-
-                raws_color_, masked_raws_color_, unmasked_raws_color_, masks_for_silhouette_color_ = \
-                    self.netColorDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat=pixel_feat_,
-                                         ray_dir_input=ray_dir_input_, transmittance_samples=transmittance_samples_,
-                                         raw_masks_density=raw_masks_density_,
-                                         silhouettes=silhouettes_for_color_,
-                                         decoder_type='color')
-
-                raws_ = raws_color_.view([N, D, H_, W_, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0,
-                                                                                         end_dim=2)  # (NxHxW)xDx4
-                masked_raws_ = masked_raws_color_.view([K, N, D, H_, W_, 4])
-                unmasked_raws_ = unmasked_raws_color_.view([K, N, D, H_, W_, 4])
-                masked_raws[..., h::scale, w::scale, :] = masked_raws_
-                unmasked_raws[..., h::scale, w::scale, :] = unmasked_raws_
-                masks_for_silhouette_ = masks_for_silhouette_color_.view([K, N, D, H_, W_])
-
-                weights_ = weights.view([N, H, W, D])[:, h::scale, w::scale, :] # [N_rays, N_samples]
-                weights_ = weights_.flatten(0, 2)
-
-                rgb_map_, _, _, _, = raw2colors(raws_, weights_, z_vals_)
-
-                rendered_ = rgb_map_.view(N, H_, W_, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                x_recon_ = rendered_ * 2 - 1
-                x_recon[..., h::scale, w::scale] = x_recon_
 
         x_recon_novel, x_novel = x_recon[1:], F.interpolate(x[1:], size=[self.opt.frustum_size, self.opt.frustum_size], mode='bilinear')
         self.loss_recon = self.L2_loss(x_recon_novel, x_novel)
@@ -891,7 +722,6 @@ class uorfEvalModel(BaseModel):
     def compute_visuals(self):
         if self.opt.extract_mesh:
             return
-
         with torch.no_grad():
             cam2world = self.cam2world[:self.opt.n_img_each_scene]
             _, N, D, H, W, _ = self.masked_raws.shape
@@ -952,7 +782,6 @@ class uorfEvalModel(BaseModel):
                     ari_score = adjusted_rand_score(gt_mask_idx, this_mask_idx)
                     nvari_meter.update(ari_score)
                 self.loss_nvari = nvari_meter.val
-
 
     def backward(self):
         pass

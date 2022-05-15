@@ -8,7 +8,6 @@ import torch
 import glob
 import numpy as np
 import random
-import torch.nn.functional as F
 
 from torchvision import transforms
 
@@ -26,7 +25,6 @@ class MultiscenesDataset(BaseDataset):
         parser.add_argument('--dataset_nearest_interp', action='store_true')
         parser.add_argument('--dataset_combine_masks', action='store_true')
         parser.add_argument('--color_jitter', action='store_true')
-        parser.add_argument('--use_eisen_seg', action='store_true')
         return parser
 
     def __init__(self, opt):
@@ -38,7 +36,6 @@ class MultiscenesDataset(BaseDataset):
         BaseDataset.__init__(self, opt)
         self.n_scenes = opt.n_scenes
         self.n_img_each_scene = opt.n_img_each_scene
-        self.use_eisen_seg = opt.use_eisen_seg
         self.min_num_masks = self.opt.num_slots if not self.opt.dataset_combine_masks else 4
         image_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*.png')))  # root/00000_sc000_az00_el00.png
         mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask.png')))
@@ -156,12 +153,10 @@ class MultiscenesDataset(BaseDataset):
                 ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot, 'depth': depth}
             else:
                 ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot}
-            mask_path = path.replace('.png', '_pred_mask.png' if self.use_eisen_seg else '_mask.png')
+            mask_path = path.replace('.png', '_mask.png')
             if os.path.isfile(mask_path):
                 mask = Image.open(mask_path).convert('RGB')
                 # mask_l = mask.convert('L')
-                seg_color = torch.tensor(np.array(mask)).permute(2, 0, 1) # [3, H, W]
-                seg_color = TF.resize(seg_color, (self.opt.load_size, self.opt.load_size), Image.NEAREST)
                 mask_l = self._object_id_hash(mask)
                 mask = self._transform_mask(mask)
                 ret['mask'] = mask
@@ -185,37 +180,12 @@ class MultiscenesDataset(BaseDataset):
                 # additional attributes: GT background mask and object masks
                 ret['bg_mask'] = mask_l == bg_color
                 obj_masks = []
-                obj_seg_colors = []
-                if self.use_eisen_seg:
-
-                    area = (mask_l == greyscale_dict[:, None, None]).sum(dim=[1, 2])
-                    if self.min_num_masks < len(greyscale_dict):
-                        _, idx = area.topk(k=self.min_num_masks)
-                    else:
-                        idx = range(len(greyscale_dict))
-
-                    for i in range(len(greyscale_dict)):
-                        if greyscale_dict[i] == bg_color:
-                            continue
-                        if i in idx:
-                            obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
-                            obj_masks.append(obj_mask)
-                else:
-                    for i in range(len(greyscale_dict)):
-                        if greyscale_dict[i] == bg_color:
-                            continue
-                        obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
-                        obj_masks.append(obj_mask)
-
-                        # get object segment color
-                        color, count = (obj_mask * seg_color).flatten(1, 2).unique(dim=-1, return_counts=True)
-                        count[color.sum(0) == 0] = 0
-                        argmax = count.argmax(-1)
-                        color = color[:, argmax]
-                        obj_seg_colors.append(torch.tensor(color).view(1, 3))
-
+                for i in range(len(greyscale_dict)):
+                    if greyscale_dict[i] == bg_color:
+                        continue
+                    obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
+                    obj_masks.append(obj_mask)
                 obj_masks = torch.stack(obj_masks)  # Kx1xHxW
-                obj_seg_colors = torch.stack(obj_seg_colors, dim=0)
 
                 # if the number of masks is too small, pad with empty masks
                 if obj_masks.shape[0] < self.min_num_masks:
@@ -226,7 +196,6 @@ class MultiscenesDataset(BaseDataset):
                     return self.buffer_rets
 
                 ret['obj_masks'] = obj_masks  # KxHxW
-                ret['obj_seg_colors'] = obj_seg_colors
 
             rets.append(ret)
         self.buffer_rets = rets
@@ -258,7 +227,6 @@ def collate_fn(batch):
     if 'mask' in flat_batch[0]:
         masks = torch.stack([x['mask'] for x in flat_batch])
         ret['masks'] = masks
-        ret['obj_seg_colors'] = torch.stack([x['obj_seg_colors'] for x in flat_batch])
         mask_idx = torch.stack([x['mask_idx'] for x in flat_batch])
         ret['mask_idx'] = mask_idx
         fg_idx = torch.stack([x['fg_idx'] for x in flat_batch])

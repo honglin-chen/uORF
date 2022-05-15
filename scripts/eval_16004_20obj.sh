@@ -3,7 +3,7 @@ DATAROOT=${1:-'tdw_20obj_2000'}
 CHECKPOINT=${2:-'/data2/wanhee/uORF/checkpoints/'}
 PORT=8077
 python -m visdom.server -p $PORT &>/dev/null &
-python test.py --dataroot $DATAROOT --n_scenes 10 --n_img_each_scene 4 \
+python test.py --dataroot $DATAROOT --n_scenes 100 --n_img_each_scene 4 \
     --checkpoints_dir $CHECKPOINT --name '16004_20obj' --exp_id 'latest' \
     --results_dir 'results' \
     --display_port $PORT --display_ncols 4 \
