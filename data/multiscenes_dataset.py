@@ -160,8 +160,6 @@ class MultiscenesDataset(BaseDataset):
             if os.path.isfile(mask_path):
                 mask = Image.open(mask_path).convert('RGB')
                 # mask_l = mask.convert('L')
-                seg_color = torch.tensor(np.array(mask)).permute(2, 0, 1) # [3, H, W]
-                seg_color = TF.resize(seg_color, (self.opt.load_size, self.opt.load_size), Image.NEAREST)
                 mask_l = self._object_id_hash(mask)
                 mask = self._transform_mask(mask)
                 ret['mask'] = mask
@@ -184,10 +182,9 @@ class MultiscenesDataset(BaseDataset):
 
                 # additional attributes: GT background mask and object masks
                 ret['bg_mask'] = mask_l == bg_color
-                obj_masks = []
-                obj_seg_colors = []
-                if self.use_eisen_seg:
 
+                obj_masks = []
+                if self.use_eisen_seg:
                     area = (mask_l == greyscale_dict[:, None, None]).sum(dim=[1, 2])
                     if self.min_num_masks < len(greyscale_dict):
                         _, idx = area.topk(k=self.min_num_masks)
@@ -200,6 +197,7 @@ class MultiscenesDataset(BaseDataset):
                         if i in idx:
                             obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
                             obj_masks.append(obj_mask)
+
                 else:
                     for i in range(len(greyscale_dict)):
                         if greyscale_dict[i] == bg_color:
@@ -207,12 +205,20 @@ class MultiscenesDataset(BaseDataset):
                         obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
                         obj_masks.append(obj_mask)
 
-                        # get object segment color
-                        color, count = (obj_mask * seg_color).flatten(1, 2).unique(dim=-1, return_counts=True)
-                        count[color.sum(0) == 0] = 0
-                        argmax = count.argmax(-1)
-                        color = color[:, argmax]
-                        obj_seg_colors.append(torch.tensor(color).view(1, 3))
+                # Get object segment color
+                # - First get 2D segmentation color map of GT masks
+                gt_mask_path = path.replace('.png', '_mask.png')
+                gt_mask = Image.open(gt_mask_path).convert('RGB')
+                seg_color = torch.tensor(np.array(gt_mask)).permute(2, 0, 1)  # [3, H, W]
+                seg_color = TF.resize(seg_color, (self.opt.load_size, self.opt.load_size), Image.NEAREST)
+
+                obj_seg_colors = []
+                for obj_mask in obj_masks:
+                    color, count = (obj_mask * seg_color).flatten(1, 2).unique(dim=-1, return_counts=True)
+                    count[color.sum(0) == 0] = 0
+                    argmax = count.argmax(-1)
+                    color = color[:, argmax]
+                    obj_seg_colors.append(torch.tensor(color).view(1, 3))
 
                 obj_masks = torch.stack(obj_masks)  # Kx1xHxW
                 obj_seg_colors = torch.stack(obj_seg_colors, dim=0)

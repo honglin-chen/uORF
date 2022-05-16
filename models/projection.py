@@ -118,7 +118,7 @@ class Projection(object):
             # z = torch.linspace(-1, 9, self.frustum_size[2])  # 6
             x = torch.linspace(-2.5, 2.5, self.frustum_size[0]) # -2.5, 2.5
             y = torch.linspace(-2.5, 2.5, self.frustum_size[1]) # -2.5, 2.5
-            z = torch.linspace(4, 9, self.frustum_size[2])  # 6 # 4, 7
+            z = torch.linspace(3, 9, self.frustum_size[2])  # 6 # 4, 7
             x, y, z = torch.meshgrid([x, y, z])
             x_frus = x.flatten().to(self.device)
             y_frus = y.flatten().to(self.device)

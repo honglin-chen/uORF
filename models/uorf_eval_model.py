@@ -626,6 +626,7 @@ class uorfEvalModel(BaseModel):
             for view_id in range(1, raw_masks_density.shape[1]):
 
                 voxels = raw_masks_density[1:, view_id, ..., -1].cpu().numpy()  # remove background
+
                 d = 5e-7 / (voxels.shape[-1] ** 2)
                 num_objects = voxels.shape[0]
 

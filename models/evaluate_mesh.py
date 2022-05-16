@@ -1,6 +1,6 @@
 import numpy as np
 import skimage.measure as measure
-# import mcubes
+import mcubes
 import h5py
 from scipy.spatial.transform import Rotation as R
 import torch
@@ -152,6 +152,7 @@ def compute_mesh_from_voxel(voxel, threshold):
     count = 0
     for obj_id in range(voxel.shape[0]):
         vtx, faces, _, _ = measure.marching_cubes_lewiner(voxel[obj_id], threshold)
+        # vtx, faces, _, _ = mcubes.marching_cubes(mcubes.smooth(voxel[obj_id]), threshold)
 
         # transform the axis so that it aligns with the GT pointcloud
         vtx = np.matmul(toggle_xz, vtx.T).T
