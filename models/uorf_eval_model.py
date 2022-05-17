@@ -190,6 +190,7 @@ class uorfEvalModel(BaseModel):
         n = opt.n_img_each_scene
         self.visual_names = ['input_image',] + ['gt_novel_view{}'.format(i+1) for i in range(n-1)] + \
                             ['x_rec{}'.format(i) for i in range(n)] + \
+                            ['slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['gt_mask{}'.format(i) for i in range(n)] + \
                             ['render_mask{}'.format(i) for i in range(n)]
         render_size = (opt.render_size, opt.render_size)

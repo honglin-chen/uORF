@@ -187,6 +187,10 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--silhouette_expand', action='store_true', help='expand the silhouette for 1 pixel')
         parser.add_argument('--fg_only_delete_bg', action='store_true', help='only remove the background from bg')
         parser.add_argument('--debug3', action='store_true', help='20001')
+        parser.add_argument('--border_zero', action='store_true', help='put padding of grid sample to zero so that it does not use border values')
+        parser.add_argument('--border_slot_no_pixel', action='store_true', help='put slot features instead of pixel features outside the border')
+        parser.add_argument('--pixel_zero', action='store_true', help='put zeros on pixel features')
+        parser.add_argument('--stop_hungarian', action='store_true', help='stop hungarian matching')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=2000, custom_lr=True, lr_policy='warmup')
@@ -307,8 +311,9 @@ class uorfTrainModel(BaseModel):
             self.model_names.append('SlotAttention')
 
         # [Pixel Encoder]
+        self.index_padding = 'zeros' if self.opt.border_zero else 'border'
         if not self.opt.uorf:
-            self.netPixelEncoder = networks.init_net(PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature, index_interp=self.interp_mode), gpu_ids=self.gpu_ids, init_type='None')
+            self.netPixelEncoder = networks.init_net(PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature, index_interp=self.interp_mode, index_padding=self.index_padding), gpu_ids=self.gpu_ids, init_type='None')
             self.parameters.append(self.netPixelEncoder.parameters())
             self.nets.append(self.netPixelEncoder)
             self.model_names.append('PixelEncoder')
@@ -328,7 +333,8 @@ class uorfTrainModel(BaseModel):
                         ray_after_density=self.opt.ray_after_density, multiply_mask_pixelfeat=self.opt.multiply_mask_pixelfeat,
                         without_slot_feature=self.opt.without_slot_feature, same_bg_fg_decoder=self.opt.same_bg_fg_decoder,
                         color_after_density=self.opt.color_after_density, no_concatenate=self.opt.no_concatenate,
-                        weight_pixel_slot_mask=self.opt.weight_pixel_slot_mask),
+                        weight_pixel_slot_mask=self.opt.weight_pixel_slot_mask,
+                        pixel_zero=self.opt.pixel_zero, border_slot_no_pixel=self.opt.border_slot_no_pixel),
                 gpu_ids=self.gpu_ids, init_type='xavier')
             self.parameters.append(self.netDecoder.parameters())
             self.nets.append(self.netDecoder)
@@ -661,9 +667,13 @@ class uorfTrainModel(BaseModel):
             # print(idx, 'idx')
             silhouette_masks_ = self.silhouette_masks[:, idx:, ...]
             silhouettes_ = self.silhouettes[:, idx:, ...]
+            if self.opt.use_eisen_seg and self.opt.num_slots != 2:
+                if not self.opt.stop_hungarian:
+                    silhouettes_, silhouette_masks_ = util.silhouette_hungarian_matching(silhouettes_, silhouette_masks_)
             if self.opt.silhouette_expand:
                 assert self.opt.bg_no_silhouette_loss
-                silhouette_masks_ = self.maxpool2d(silhouette_masks_)
+                for _ in range(1):
+                    silhouette_masks_ = self.maxpool2d(silhouette_masks_)
             if self.opt.debug3:
                 for _ in range(5):
                     silhouette_masks_ = self.maxpool2d(silhouette_masks_)

@@ -342,7 +342,7 @@ class Decoder(nn.Module):
                  fixed_locality=False, no_concatenate=False, bg_no_pixel=False, use_ray_dir=False, small_latent=False, decoder_type=None,
                  restrict_world=False, reduce_color_decoder=False, density_as_color_input=False, mask_as_decoder_input=False,
                  ray_after_density=False, multiply_mask_pixelfeat=False, same_bg_fg_decoder=False, without_slot_feature=False,
-                 color_after_density=False, weight_pixel_slot_mask=False):
+                 color_after_density=False, weight_pixel_slot_mask=False, pixel_zero=False, border_slot_no_pixel=False):
         """
         freq: raised frequency
         input_dim: pos emb dim + slot dim
@@ -374,6 +374,8 @@ class Decoder(nn.Module):
         self.without_slot_feature = without_slot_feature
         self.color_after_density = color_after_density
         self.weight_pixel_slot_mask = weight_pixel_slot_mask
+        self.pixel_zero = pixel_zero
+        self.border_slot_no_pixel = border_slot_no_pixel
         print(self.color_after_density, 'put pixel feature after density decoder')
         print(self.without_slot_feature, 'self.without_slot_feature')
         if color_after_density:
@@ -548,6 +550,17 @@ class Decoder(nn.Module):
             else:
                 input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
             if pixel_feat is not None and not self.bg_no_pixel and not self.color_after_density:
+                if self.pixel_zero:
+                    pixel_feat[0:1] = pixel_feat[0:1] * 0.
+                    # print(pixel_feat[0:1].squeeze(0), 'this should be all zero')
+                if self.border_slot_no_pixel:
+                    pixel_feat_bg = pixel_feat[0:1] # 1xPx64
+                    pixel_feat_bg_0 = torch.all(pixel_feat_bg == 0., dim=-1).unsqueeze(-1) # 1xPx1
+                    # print(pixel_feat_bg_0.max()) # this is True
+                    # print(pixel_feat_bg_0.min()) # this is False
+                    pixel_feat_bg = pixel_feat_bg * ~pixel_feat_bg_0 + z_bg.expand(P, -1).unsqueeze(0) * pixel_feat_bg_0
+                    pixel_feat[0:1] = pixel_feat_bg
+
                 input_bg = torch.cat([pixel_feat[0:1].squeeze(0), input_bg], dim=1)
             if self.without_slot_feature:
                 input_fg = query_fg_ex

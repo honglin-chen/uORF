@@ -17,6 +17,7 @@ import random
 import colorsys
 import torch.nn.functional as F
 from matplotlib import patches,  lines
+from scipy.optimize import linear_sum_assignment
 
 
 
@@ -368,3 +369,55 @@ class GroupMeters(object):
         else:
             meters_kv = values
         return meters_kv
+
+def compute_dice_cost(inputs, targets):
+    """
+    Compute the DICE cost, similar to generalized IOU for masks
+    Args:
+        inputs: A float tensor of shape [B, K, H, W]
+        targets: A float tensor with shape [B, O, H, W].
+    """
+    inputs = inputs.flatten(2, 3).unsqueeze(2)  # [B, K, 1, N]
+    targets = targets.flatten(2, 3).unsqueeze(1)  # [B, 1, O, N]
+
+    numerator = 2 * (inputs * targets).sum(-1)
+    denominator = inputs.sum(-1) + targets.sum(-1)
+    loss = 1 - (numerator + 1) / (denominator + 1)
+    return loss
+
+def silhouette_hungarian_matching(mask_a, mask_b, eps=1e-9):
+    """
+        Compute the hungarian between two masks based on dice cost
+        Args:
+            mask_a: A float tensor of shape [B, K, H, W]
+            mask_b: A float tensor with shape [B, O, H, W]. Stores the binary
+                     classification label for each element in inputs
+                    (0 for the negative class and 1 for the positive class).
+    """
+
+    B, K, H, W = mask_a.shape
+    _, O, _, _ = mask_b.shape
+
+    dice_cost = compute_dice_cost(mask_a, mask_b)
+    matched_a, matched_b = [], []
+
+    for batch_idx in range(dice_cost.shape[0]):
+        indices = linear_sum_assignment(dice_cost[batch_idx].detach().cpu())
+        matched_a.append(mask_a[batch_idx, indices[0]].reshape(1, K, H, W))
+        matched_b.append(mask_b[batch_idx, indices[1]].reshape(1, O, H, W))
+
+    matched_a = torch.cat(matched_a, 0)
+    matched_b = torch.cat(matched_b, 0)
+
+    # # Visualization
+    # for i in range(B):
+    #     fig, axs = plt.subplots(2, K)
+    #     for k in range(K):
+    #         axs[0, k].imshow(matched_a[i, k].detach().cpu())
+    #         axs[1, k].imshow(matched_b[i, k].detach().cpu())
+    #
+    #     plt.show()
+    #     plt.savefig('tmp%d.png' % i)
+    #     plt.close()
+
+    return matched_a, matched_b
