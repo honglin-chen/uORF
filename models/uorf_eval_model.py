@@ -18,6 +18,9 @@ from sklearn.metrics import adjusted_rand_score
 import lpips
 from piq import ssim as compute_ssim
 from piq import psnr as compute_psnr
+from .evaluate_mesh import *
+import h5py
+from pytorch3d.loss import chamfer_distance
 
 def positionalencoding2d(d_model, height, width):
     """
@@ -167,6 +170,14 @@ class uorfEvalModel(BaseModel):
                             help='epoch 0-10: learn only fg silhouette, epoch 10-20: learn silhouette and rgb, epoch 20- rgb')
         parser.add_argument('--learn_fg_first', action='store_true')
 
+        parser.add_argument('--border_zero', action='store_true',
+                            help='put padding of grid sample to zero so that it does not use border values')
+        parser.add_argument('--border_slot_no_pixel', action='store_true',
+                            help='put slot features instead of pixel features outside the border')
+        parser.add_argument('--pixel_zero', action='store_true', help='put zeros on pixel features')
+        parser.add_argument('--stop_hungarian', action='store_true', help='stop hungarian matching')
+        parser.add_argument('--moveobj', action='store_true', help='move obj')
+
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -187,6 +198,8 @@ class uorfEvalModel(BaseModel):
         """
         BaseModel.__init__(self, opt)  # call the initialization method of BaseModel
         self.loss_names = ['ari', 'fgari', 'nvari', 'psnr', 'ssim', 'lpips']
+        if opt.extract_mesh:
+            self.loss_names = ['obj_mesh', 'scene_mesh']
         n = opt.n_img_each_scene
         self.visual_names = ['input_image',] + ['gt_novel_view{}'.format(i+1) for i in range(n-1)] + \
                             ['x_rec{}'.format(i) for i in range(n)] + \
@@ -290,9 +303,10 @@ class uorfEvalModel(BaseModel):
             self.model_names.append('SlotAttention')
 
         # [Pixel Encoder]
+        self.index_padding = 'zeros' if self.opt.border_zero else 'border'
         if not self.opt.uorf:
             self.netPixelEncoder = networks.init_net(
-                PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature),
+                PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature, index_padding=self.index_padding),
                 gpu_ids=self.gpu_ids, init_type='None')
             self.parameters.append(self.netPixelEncoder.parameters())
             self.nets.append(self.netPixelEncoder)
@@ -315,7 +329,8 @@ class uorfEvalModel(BaseModel):
                         without_slot_feature=self.opt.without_slot_feature,
                         same_bg_fg_decoder=self.opt.same_bg_fg_decoder,
                         color_after_density=self.opt.color_after_density, no_concatenate=self.opt.no_concatenate,
-                        weight_pixel_slot_mask=self.opt.weight_pixel_slot_mask),
+                        weight_pixel_slot_mask=self.opt.weight_pixel_slot_mask,
+                        pixel_zero=self.opt.pixel_zero, border_slot_no_pixel=self.opt.border_slot_no_pixel),
                 gpu_ids=self.gpu_ids, init_type='xavier')
             self.parameters.append(self.netDecoder.parameters())
             self.nets.append(self.netDecoder)
@@ -348,6 +363,9 @@ class uorfEvalModel(BaseModel):
         self.cam2world = input['cam2world'].to(self.device)
         if not self.opt.fixed_locality:
             self.cam2world_azi = input['azi_rot'].to(self.device)
+
+        self.input_paths = input['paths']
+        self.obj_seg_colors = input['obj_seg_colors']
 
         self.image_paths = input['paths']
         if 'masks' in input:
@@ -514,8 +532,9 @@ class uorfEvalModel(BaseModel):
             # print(j, 'j')
             h, w = divmod(j, scale)
             H_, W_ = H // scale, W // scale
-            sampling_coor_fg_ = frus_nss_coor_[None, ...].expand(K - 1, -1, -1)  # (K-1)xPx3
+            sampling_coor_fg_ = frus_nss_coor_[None, ...].expand(K - 1, -1, -1).clone()  # (K-1)xPx3
             sampling_coor_bg_ = frus_nss_coor_  # Px3
+            sampling_coor_fg_[-1] += torch.Tensor([0., 0., 0.5]).to(self.device) / self.opt.nss_scale
 
             if self.opt.use_ray_dir:
                 ray_dir_input_ = ray_dir_.view([N, H_, W_, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
@@ -610,8 +629,86 @@ class uorfEvalModel(BaseModel):
                     raw_masks_density[:, :, :, h::scale, w::scale, :] = masked_raws_[..., -1:].view(K, N, D, H_, W_, 1)
 
         if self.opt.extract_mesh:
-            print(raw_masks_density.shape, 'raw_masks_density.shape')  # KxNxDxHxWx1
-            # use "raw_masks_density" if you want to extract mesh
+            # evaluate mesh
+            num_points = 1024
+            threshold = 5.0
+
+            hdf_path = self.input_paths[0].replace('_frame5_img0.png', '.hdf5')
+
+            obj_mesh_loss = []
+            scene_mesh_loss = []
+
+            for view_id in range(1, raw_masks_density.shape[1]):
+
+                voxels = raw_masks_density[1:, view_id, ..., -1].cpu().numpy()  # remove background
+
+                d = 5e-7 / (voxels.shape[-1] ** 2)
+                num_objects = voxels.shape[0]
+
+                gt_obj_vtx, gt_obj_face, gt_scene_vtx, gt_scene_face = \
+                    load_gt_mesh_from_hdf(hdf_path, frame='0005', num_objects=num_objects,
+                                          seg_colors=self.obj_seg_colors[view_id])
+                pred_obj_vtx, pred_obj_face, pred_scene_vtx, pred_scene_face = compute_mesh_from_voxel(voxels,
+                                                                                                       threshold=threshold)
+
+                pred_obj_pts = []
+                gt_obj_pts = []
+                normalize_pred_obj_pts = []
+                normalize_gt_obj_pts = []
+
+                # object mesh loss
+                total_mesh_loss = 0.
+                for obj_id, data in enumerate(zip(pred_obj_vtx, pred_obj_face, gt_obj_vtx, gt_obj_face)):
+                    pred_vtx, pred_face, gt_vtx, gt_face = data
+                    pred_pts = get_surface_points_from_mesh(pred_vtx, pred_face, d=d, num=num_points)
+                    gt_pts = get_surface_points_from_mesh(gt_vtx, gt_face, d=d, num=num_points)
+                    pred_obj_pts.append(pred_pts)
+                    gt_obj_pts.append(gt_pts)
+
+                    normalize_pred_obj_pts.append(normalize_points(pred_pts))
+                    normalize_gt_obj_pts.append(normalize_points(gt_pts))
+                    distance = chamfer_distance(normalize_points(pred_pts)[None], normalize_points(gt_pts)[None])
+                    total_mesh_loss += distance[0]
+                obj_mesh_loss.append(total_mesh_loss / num_objects)
+
+                # scene mesh loss
+                normalize_pred_scene_pts = normalize_points(np.concatenate(pred_obj_pts, axis=0))[None]
+                normalize_gt_scene_pts = normalize_points(np.concatenate(gt_obj_pts, axis=0))[None]
+                scene_mesh_loss.append(chamfer_distance(normalize_pred_scene_pts, normalize_gt_scene_pts)[0])
+
+                if view_id == 1:
+                    visualize_dict = {
+                        'image': self.x[0],
+                        'gt_obj_vtx': gt_obj_vtx,
+                        'gt_obj_face': gt_obj_face,
+                        'gt_scene_vtx': gt_scene_vtx,
+                        'gt_scene_face': gt_scene_face,
+                        'gt_obj_pts': gt_obj_pts,
+                        'normalize_gt_obj_pts': normalize_gt_obj_pts,
+                        'normalize_gt_obj_pts': normalize_gt_obj_pts,
+                        'normalize_gt_scene_pts': normalize_gt_scene_pts,
+                        'pred_obj_vtx': pred_obj_vtx,
+                        'pred_obj_face': pred_obj_face,
+                        'pred_scene_vtx': pred_scene_vtx,
+                        'pred_scene_face': pred_scene_face,
+                        'pred_obj_pts': pred_obj_pts,
+                        'normalize_pred_obj_pts': normalize_pred_obj_pts,
+                        'normalize_pred_scene_pts': normalize_pred_scene_pts,
+                        'voxels': voxels,
+                    }
+                    file_name = self.input_paths[0].replace('_frame5_img0.png', '.npy').split('/')[-1]
+                    save_folder = os.path.join('checkpoints', self.opt.name, self.opt.exp_id, 'mesh')
+                    if not os.path.exists(save_folder):
+                        os.mkdir(save_folder)
+                    save_path = os.path.join(save_folder, file_name)
+                    print('Save mesh data to: ', save_path)
+                    np.save(save_path, visualize_dict)
+
+            self.loss_obj_mesh = np.mean(obj_mesh_loss) * 10.
+            self.loss_scene_mesh = np.mean(scene_mesh_loss) * 10.
+
+            print('Average object mesh loss: ', self.loss_obj_mesh, obj_mesh_loss)
+            print('Scene mesh loss: ', self.loss_scene_mesh, scene_mesh_loss)
 
         x_recon_novel, x_novel = x_recon[1:], F.interpolate(x[1:], size=[self.opt.frustum_size, self.opt.frustum_size], mode='bilinear')
         self.loss_recon = self.L2_loss(x_recon_novel, x_novel)

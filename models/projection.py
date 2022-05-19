@@ -109,10 +109,10 @@ class Projection(object):
 
         frus_world_coor = torch.matmul(cam2world, frus_cam_coor)  # Nx4x(WxHxD)
         if self.extract_mesh:
-            print(cam2world, 'cam2world')
-            print(frus_world_coor[:, 0, :].max(), frus_world_coor[:, 0, :].min())
-            print(frus_world_coor[:, 1, :].max(), frus_world_coor[:, 1, :].min())
-            print(frus_world_coor[:, 2, :].max(), frus_world_coor[:, 2, :].min())
+            # print(cam2world, 'cam2world')
+            # print(frus_world_coor[:, 0, :].max(), frus_world_coor[:, 0, :].min())
+            # print(frus_world_coor[:, 1, :].max(), frus_world_coor[:, 1, :].min())
+            # print(frus_world_coor[:, 2, :].max(), frus_world_coor[:, 2, :].min())
             # x = torch.linspace(-7, 3, self.frustum_size[0]) # -1
             # y = torch.linspace(-6.5, 3.5, self.frustum_size[1]) # -1
             # z = torch.linspace(-1, 9, self.frustum_size[2])  # 6

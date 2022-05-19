@@ -4,7 +4,7 @@ CHECKPOINT=${2:-'/data2/wanhee/uORF/checkpoints/'}
 PORT=8077
 python -m visdom.server -p $PORT &>/dev/null &
 python test.py --dataroot $DATAROOT --n_scenes 600 --n_img_each_scene 4 \
-    --checkpoints_dir $CHECKPOINT --name '19013' --exp_id 'latest' \
+    --checkpoints_dir $CHECKPOINT --name '19012' --exp_id 'latest' \
     --results_dir 'results' \
     --display_port $PORT --display_ncols 4 \
     --load_size 128 --input_size 128 --mask_size 128 --render_size 32 --frustum_size 128 \
@@ -16,13 +16,12 @@ python test.py --dataroot $DATAROOT --n_scenes 600 --n_img_each_scene 4 \
     --unified_decoder \
     --no_locality_epoch 0 \
     --gt_seg \
-    --pixel_encoder --mask_image \
-    --use_ray_dir \
+    --uorf \
     --restrict_world \
-    --without_slot_feature \
-    --pixel_nerf \
     --frame5 \
     --use_eisen_seg \
+
+echo "Done"
 
 #    --extract_mesh \
 

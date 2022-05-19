@@ -202,17 +202,40 @@ class MultiscenesDataset(BaseDataset):
                             continue
                         obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
                         obj_masks.append(obj_mask)
+
+                # Get object segment color
+                # - First get 2D segmentation color map of GT masks
+                gt_mask_path = path.replace('.png', '_mask.png')
+                gt_mask = Image.open(gt_mask_path).convert('RGB')
+                seg_color = torch.tensor(np.array(gt_mask)).permute(2, 0, 1)  # [3, H, W]
+                seg_color = TF.resize(seg_color, (self.opt.load_size, self.opt.load_size), Image.NEAREST)
+
+                obj_seg_colors = []
+                for obj_mask in obj_masks:
+                    color, count = (obj_mask * seg_color).flatten(1, 2).unique(dim=-1, return_counts=True)
+                    count[color.sum(0) == 0] = 0
+                    argmax = count.argmax(-1)
+                    color = color[:, argmax]
+                    obj_seg_colors.append(torch.tensor(color).view(1, 3))
+
                 obj_masks = torch.stack(obj_masks)  # Kx1xHxW
+                obj_seg_colors = torch.stack(obj_seg_colors, dim=0)
 
                 # if the number of masks is too small, pad with empty masks
                 if obj_masks.shape[0] < self.min_num_masks:
                     obj_masks = torch.cat([obj_masks, torch.zeros_like(obj_masks[0:(self.min_num_masks-obj_masks.shape[0])])], dim=0)
+
+                if obj_seg_colors.shape[0] < self.min_num_masks-1:
+                    print(self.min_num_masks, 'self.min_num_masks')
+                    obj_seg_colors = torch.cat([obj_seg_colors, torch.zeros_like(obj_seg_colors[0:(self.min_num_masks-1-obj_masks.shape[0])])], dim=0)
+                    print('Error reading segmentation color: ', path)
 
                 if obj_masks.shape[0] > self.min_num_masks:
                     print('Error reading file: ', path)
                     return self.buffer_rets
 
                 ret['obj_masks'] = obj_masks  # KxHxW
+                ret['obj_seg_colors'] = obj_seg_colors
 
             rets.append(ret)
         self.buffer_rets = rets
@@ -245,6 +268,7 @@ def collate_fn(batch):
         masks = torch.stack([x['mask'] for x in flat_batch])
         ret['masks'] = masks
         mask_idx = torch.stack([x['mask_idx'] for x in flat_batch])
+        ret['obj_seg_colors'] = torch.stack([x['obj_seg_colors'] for x in flat_batch])
         ret['mask_idx'] = mask_idx
         fg_idx = torch.stack([x['fg_idx'] for x in flat_batch])
         ret['fg_idx'] = fg_idx

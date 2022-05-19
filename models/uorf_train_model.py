@@ -667,12 +667,14 @@ class uorfTrainModel(BaseModel):
             # print(idx, 'idx')
             silhouette_masks_ = self.silhouette_masks[:, idx:, ...]
             silhouettes_ = self.silhouettes[:, idx:, ...]
+            # print(silhouettes_.shape, 'silhouettes_.shape')
+            # print(silhouette_masks_.shape, 'silhouette_masks.shape')
             if self.opt.use_eisen_seg and self.opt.num_slots != 2:
                 if not self.opt.stop_hungarian:
                     silhouettes_, silhouette_masks_ = util.silhouette_hungarian_matching(silhouettes_, silhouette_masks_)
             if self.opt.silhouette_expand:
                 assert self.opt.bg_no_silhouette_loss
-                for _ in range(1):
+                for _ in range(3):
                     silhouette_masks_ = self.maxpool2d(silhouette_masks_)
             if self.opt.debug3:
                 for _ in range(5):
