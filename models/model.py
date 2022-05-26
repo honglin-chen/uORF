@@ -402,7 +402,7 @@ class Decoder(nn.Module):
             input_dim += 1
             if not mask_as_decoder_input:
                 input_dim += 1 if not self.multiply_mask_pixelfeat else pixel_dim
-        if pixel_dim is not None and pixel_dim is not 0:
+        if pixel_dim != None and pixel_dim != 0:
             if self.no_concatenate:
                 pass
             else:
@@ -432,7 +432,7 @@ class Decoder(nn.Module):
         self.f_color = nn.Sequential(nn.Linear(latent_dim + ray_dir_dim + pixel_dim_color, latent_dim//4),
                                      nn.ReLU(True),
                                      nn.Linear(latent_dim//4, 3))
-        if pixel_dim is not None and bg_no_pixel and not no_concatenate and not color_after_density:
+        if pixel_dim != None and bg_no_pixel and not no_concatenate and not color_after_density:
             input_dim += -pixel_dim
         if bg_no_pixel:
             input_dim += -3
@@ -489,7 +489,7 @@ class Decoder(nn.Module):
         # if self.pixel_dim and pixel_feat is None:
         #     pixel_feat = self.substitute_pixel_feat[None, None, ...].expand(K, P, -1)
 
-        # if transmittance_samples is not None:
+        # if transmittance_samples != None:
         #     pixel_feat *= transmittance_samples
         #     pixel_feat += self.substitute_pixel_feat[None, None, ...].expand(K, P, -1) * (1. - transmittance_samples) # this option was previous behavior, I thought that it is quite hard coding
 
@@ -521,7 +521,7 @@ class Decoder(nn.Module):
                     query_bg = torch.cat([query_bg, ray_dir_input], dim=1)
                 query_fg_ex = torch.cat([query_fg_ex, ray_dir_input[None, ...].expand(K-1, -1, -1).flatten(0, 1)], dim=1)
 
-        if no_concatenate and pixel_feat is not None:
+        if no_concatenate and pixel_feat != None:
             if pixel_feat==None:
                 raise NotImplementedError('there should be pixel_feat for no_concatenate')
             pixel_feat = self.change_dim(pixel_feat) # Kx(P)xC_z_slot
@@ -549,7 +549,7 @@ class Decoder(nn.Module):
                 # print(input_bg.shape, 'input_bg.shape')
             else:
                 input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
-            if pixel_feat is not None and not self.bg_no_pixel and not self.color_after_density:
+            if pixel_feat != None and not self.bg_no_pixel and not self.color_after_density:
                 if self.pixel_zero:
                     pixel_feat[0:1] = pixel_feat[0:1] * 0.
                     # print(pixel_feat[0:1].squeeze(0), 'this should be all zero')
@@ -567,7 +567,7 @@ class Decoder(nn.Module):
             else:
                 z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
                 input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
-            if pixel_feat is not None and not self.color_after_density:
+            if pixel_feat != None and not self.color_after_density:
                 input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
                 # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape in tdw
 
@@ -738,7 +738,7 @@ class PixelDecoder(nn.Module):
         else:
             input_bg = self.positional_encoding(sampling_coor_bg)
         input_bg = torch.cat([pixel_feat[0:1].squeeze(0), input_bg], dim=1)
-        if ray_dir is not None:
+        if ray_dir != None:
             input_bg = torch.cat([input_bg, ray_dir.expand(P, -1)], dim=1)
 
         sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
@@ -750,7 +750,7 @@ class PixelDecoder(nn.Module):
             z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
             input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
         input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
-        if ray_dir is not None:
+        if ray_dir != None:
             input_fg = torch.cat([input_fg, ray_dir.expand(P, -1)], dim=1)
             #TODO: need to generalize for the case K-1 != 1
         # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape
@@ -855,7 +855,7 @@ class SlotAttention(nn.Module):
         output: slots: BxKxC, attn: BxKxN
         """
         B, _, _ = feat.shape
-        K = num_slots if num_slots is not None else self.num_slots
+        K = num_slots if num_slots != None else self.num_slots
 
         mu = self.slots_mu.expand(B, K-1, -1)
         sigma = self.slots_logsigma.exp().expand(B, K-1, -1)
@@ -963,7 +963,7 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, r
 
     if weight_pixelfeat:
         K, N, D, H, W = KNDHW
-        if input_transmittance_cam0 is not None:
+        if input_transmittance_cam0 != None:
             transmittance_cam0 = input_transmittance_cam0
         else:
             transmittance_cam0 = transmittance.view(N, H, W, D)[0] #HxWxD
@@ -1007,7 +1007,7 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, r
     else:
         mask_map = None
 
-    if return_silhouettes is not None:
+    if return_silhouettes != None:
         masks = return_silhouettes # [K, N, D, H, W]
         masks = masks.permute([1, 3, 4, 2, 0]) # [N, H, W, D, K]
         weights_silhouettes = weights.view([masks.shape[0], masks.shape[1], masks.shape[2], masks.shape[3]]).unsqueeze(-1) # (NxHxW)xD -> NxHxWxDx1
@@ -1409,7 +1409,7 @@ class CentroidDecoder(nn.Module):
 
     def forward(self, p_slots):
 
-        assert p_slots is not None
+        assert p_slots != None
         p_fg = p_slots[1:]  # (K-1)xC
         tmp = self.p_before(p_fg)
         tmp = self.p_after(torch.cat([p_fg, tmp], dim=1))

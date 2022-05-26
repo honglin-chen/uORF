@@ -534,7 +534,9 @@ class uorfEvalModel(BaseModel):
             H_, W_ = H // scale, W // scale
             sampling_coor_fg_ = frus_nss_coor_[None, ...].expand(K - 1, -1, -1).clone()  # (K-1)xPx3
             sampling_coor_bg_ = frus_nss_coor_  # Px3
-            sampling_coor_fg_[-1] += torch.Tensor([0., 0., 0.5]).to(self.device) / self.opt.nss_scale
+            sampling_coor_fg_[-1] += torch.Tensor([0.0, 0.0, 0.0]).to(self.device) / self.opt.nss_scale
+            frus_nss_coor_change_ = frus_nss_coor_.clone()
+            frus_nss_coor_change_ += torch.Tensor([0.0, 0.0, 0.0]).to(self.device) / self.opt.nss_scale
 
             if self.opt.use_ray_dir:
                 ray_dir_input_ = ray_dir_.view([N, H_, W_, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
@@ -563,6 +565,17 @@ class uorfEvalModel(BaseModel):
                 pixel_cam0_coor_ = pixel_cam0_coor_.squeeze(-1)  # 1x(NxDxHxW)x4
                 uv_ = pixel_cam0_coor_[:, :, 0:2] / pixel_cam0_coor_[:, :, 2].unsqueeze(-1)  # 1x(NxDxHxW)x2
                 uv_ = (uv_ + 0.) / frustum_size[0:2][None, None, :] * 2 - 1  # nomalize to fit in with [-1, 1] grid # TODO: check this
+
+                frus_nss_coor_change_ = torch.cat([frus_nss_coor_change_, torch.ones_like(frus_nss_coor_[:, 0].unsqueeze(1))],
+                          dim=-1)  # Px4
+                frus_world_coor_change_ = torch.matmul(nss2world[None, ...], frus_nss_coor_change_[None, ..., None])  # 1xPx4x1
+                frus_cam0_coor_change_ = torch.matmul(world2cam0[None, ...],
+                                               frus_world_coor_change_)  # 1x1x4x4, 1x(NxDxHxW)x4x1 -> 1x(NxDxHxW)x4x1 # TODO: check this
+                pixel_cam0_coor_change_ = torch.matmul(self.cam2spixel[None, ...], frus_cam0_coor_change_)  # 1x1x4x4, 1x(NxDxHxW)x4x1
+                pixel_cam0_coor_change_ = pixel_cam0_coor_change_.squeeze(-1)  # 1x(NxDxHxW)x4
+                uv_change_ = pixel_cam0_coor_change_[:, :, 0:2] / pixel_cam0_coor_change_[:, :, 2].unsqueeze(-1)  # 1x(NxDxHxW)x2
+                uv_change_ = (uv_change_ + 0.) / frustum_size[0:2][None, None, :] * 2 - 1
+
                 # 0 -> 0.5/frustum_size, 1 -> 1.5/frustum_size, ..., frustum_size-1 -> (frustum_size-0.5/frustum_size)
                 # then, change [0, 1] -> [-1, 1]
                 # if self.opt.debug:
@@ -570,9 +583,12 @@ class uorfEvalModel(BaseModel):
 
                 if self.opt.pixel_encoder:
                     if self.opt.mask_image or self.opt.mask_image_feature:
-                        uv_ = uv_.expand(K, -1, -1)  # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
+                        uv_ = uv_.expand(K-1, -1, -1)  # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
+                        uv_ = torch.cat([uv_, uv_change_], dim=0)
+                        # print(uv_.shape, 'uv_.shape')
                         pixel_feat_ = self.netPixelEncoder.index(uv_)  # Kx(NxDxHxW)x2 -> KxCx(NxDxHxW)
                         pixel_feat_ = pixel_feat_.transpose(1, 2)
+
                     else:
                         pixel_feat_ = self.netPixelEncoder.index(uv_)  # 1x(NxDxHxW)x2 -> 1xCx(NxDxHxW)
                         pixel_feat_ = pixel_feat_.transpose(1, 2)  # 1x(NxDxHxW)xC
@@ -603,6 +619,7 @@ class uorfEvalModel(BaseModel):
                 if self.opt.uorf:
                     pixel_feat_ = None
                     ray_dir_input_ = None
+
                 raws_, masked_raws_, unmasked_raws_, masks_for_silhouette_ = \
                     self.netDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat=pixel_feat_,
                                     ray_dir_input=ray_dir_input_, decoder_type='unified',
