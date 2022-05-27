@@ -191,6 +191,8 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--border_slot_no_pixel', action='store_true', help='put slot features instead of pixel features outside the border')
         parser.add_argument('--pixel_zero', action='store_true', help='put zeros on pixel features')
         parser.add_argument('--stop_hungarian', action='store_true', help='stop hungarian matching')
+        parser.add_argument('--learn_bg_first', action='store_true', help='learn bg first for first 60 epoch')
+        parser.add_argument('--debug_no_ray_dir', action='store_true')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=2000, custom_lr=True, lr_policy='warmup')
@@ -525,6 +527,8 @@ class uorfTrainModel(BaseModel):
             ray_dir_input = ray_dir_input.view([N, H, W, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
 
             ray_dir_input = ray_dir_input.flatten(0, 3)
+            if self.opt.debug_no_ray_dir:
+                ray_dir_input *= 0
         else:
             ray_dir_input = None
 
@@ -621,8 +625,11 @@ class uorfTrainModel(BaseModel):
             pass
         if self.opt.unified_decoder:
             render_bg = True
+            render_fg = True
             if self.opt.learn_fg_first:
                 render_bg = False if epoch < 60 else True
+            if self.opt.learn_bg_first:
+                render_fg = False if epoch < 60 else True
             raws, masked_raws, unmasked_raws, masks_for_silhouette = \
                 self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, pixel_feat=pixel_feat,
                                        ray_dir_input=ray_dir_input, decoder_type='unified',
@@ -645,17 +652,24 @@ class uorfTrainModel(BaseModel):
             self.loss_recon *= 0.
             self.loss_perc *= 0.
         else:
-            if self.opt.learn_fg_first:
-                if epoch > 60:
-                    self.opt.learn_fg_first = False
+            if self.opt.learn_fg_first or self.opt.learn_bg_first:
                 obj_masks = self.silhouette_masks[:, 1:, :, :] # NxKxHxW
                 obj_mask = torch.zeros_like(obj_masks[:, 0, ...])
                 for i in range(obj_masks.shape[1]):
                     obj_mask = obj_mask + obj_masks[:, i, ...]
                 obj_mask = obj_mask.unsqueeze(1)
-                self.loss_recon = self.L2_loss(x_recon, x * obj_mask + -(1-obj_mask)*torch.ones_like(x)) #Nx3xHxW
             else:
                 self.loss_recon = self.L2_loss(x_recon, x)
+
+            if self.opt.learn_fg_first:
+                if epoch > 60:
+                    self.opt.learn_fg_first = False
+                self.loss_recon = self.L2_loss(x_recon, x * obj_mask + -(1-obj_mask)*torch.ones_like(x)) #Nx3xHxW
+            if self.opt.learn_bg_first:
+                if epoch > 60:
+                    self.opt.learn_bg_first = False
+                self.loss_recon = self.L2_loss(x_recon * (1-obj_mask), x * (1-obj_mask))
+
             x_norm, rendered_norm = self.vgg_norm((x + 1) / 2), self.vgg_norm(rendered)
             rendered_feat, x_feat = self.perceptual_net(rendered_norm), self.perceptual_net(x_norm)
             self.loss_perc = self.weight_percept * self.L2_loss(rendered_feat, x_feat)
