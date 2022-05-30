@@ -22,6 +22,8 @@ from .evaluate_mesh import *
 import h5py
 from pytorch3d.loss import chamfer_distance
 
+import trimesh
+
 def positionalencoding2d(d_model, height, width):
     """
     :param d_model: dimension of the model
@@ -645,10 +647,11 @@ class uorfEvalModel(BaseModel):
                 if self.opt.extract_mesh:
                     raw_masks_density[:, :, :, h::scale, w::scale, :] = masked_raws_[..., -1:].view(K, N, D, H_, W_, 1)
 
+
         if self.opt.extract_mesh:
             # evaluate mesh
             num_points = 1024
-            threshold = 5.0
+            threshold = 30.0
 
             hdf_path = self.input_paths[0].replace('_frame5_img0.png', '.hdf5')
 
@@ -657,16 +660,28 @@ class uorfEvalModel(BaseModel):
 
             for view_id in range(1, raw_masks_density.shape[1]):
 
-                voxels = raw_masks_density[1:, view_id, ..., -1].cpu().numpy()  # remove background
+                voxels = raw_masks_density[0:, view_id, ..., -1].cpu().numpy()  # remove background
 
                 d = 5e-7 / (voxels.shape[-1] ** 2)
                 num_objects = voxels.shape[0]
 
-                gt_obj_vtx, gt_obj_face, gt_scene_vtx, gt_scene_face = \
-                    load_gt_mesh_from_hdf(hdf_path, frame='0005', num_objects=num_objects,
-                                          seg_colors=self.obj_seg_colors[view_id])
+                # gt_obj_vtx, gt_obj_face, gt_scene_vtx, gt_scene_face = \
+                #     load_gt_mesh_from_hdf(hdf_path, frame='0005', num_objects=num_objects,
+                #                           seg_colors=self.obj_seg_colors[view_id])
                 pred_obj_vtx, pred_obj_face, pred_scene_vtx, pred_scene_face = compute_mesh_from_voxel(voxels,
                                                                                                        threshold=threshold)
+
+                # Rahul save mesh
+                verts, faces = pred_scene_vtx, pred_scene_face
+                verts[:, 1] = (verts[:, 1] / 127 - 0.5) * 5
+                verts[:, 0] = (verts[:, 0] / 127 - 0.5) * 5
+                verts[:, 2] = (verts[:, 2] / 127 - 0.5) * 5 + 4.5
+
+                verts = verts - verts.min(0) * np.array([0, 0, 1])
+                mesh = trimesh.Trimesh(vertices=verts, faces=faces)
+
+                c = mesh.export('./' + 'test_full.obj')
+                print('mesh is successfully saved')
 
                 pred_obj_pts = []
                 gt_obj_pts = []
