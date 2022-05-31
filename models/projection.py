@@ -58,6 +58,13 @@ class Projection(object):
             z_vals: (NxHxW)xD
             ray_dir: (NxHxW)x3
         """
+
+        if len(cam2world.shape) == 4:
+            B, _N = cam2world.shape[0:2]
+            cam2world = cam2world.flatten(0, 1)
+            resize = True
+        else:
+            resize = False
         N = cam2world.shape[0]
         W, H, D = self.frustum_size
         pixel_coor = self.construct_frus_coor()
@@ -76,7 +83,11 @@ class Projection(object):
             frus_nss_coor = torch.stack(frus_nss_coor_, dim=0)  # 4xNxDx(H/s)x(W/s)x3
             frus_nss_coor = frus_nss_coor.flatten(start_dim=1, end_dim=4)  # 4x(NxDx(H/s)x(W/s))x3
         else:
-            frus_nss_coor = frus_nss_coor.flatten(start_dim=0, end_dim=3)  # (NxDxHxW)x3
+            if resize:
+                frus_nss_coor = frus_nss_coor.reshape(B, _N, D, H, W, 3).flatten(start_dim=1, end_dim=4) # Bx(NxDxHxW)x3
+            else:
+                frus_nss_coor = frus_nss_coor.flatten(start_dim=0, end_dim=3)  # (NxDxHxW)x3
+
 
         z_vals = (frus_cam_coor[2] - self.near) / (self.far - self.near)  # (WxHxD) range=[0,1]
         z_vals = z_vals.expand(N, W * H * D)  # Nx(WxHxD)
@@ -89,7 +100,10 @@ class Projection(object):
             z_vals = torch.stack(z_vals_, dim=0)  # 4xNx(H/s)x(W/s)xD
             z_vals = z_vals.flatten(start_dim=1, end_dim=3)  # 4x(Nx(H/s)x(W/s))xD
         else:
-            z_vals = z_vals.view(N, W, H, D).permute([0, 2, 1, 3]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xD
+            if resize:
+                z_vals = z_vals.view(B, _N, W, H, D).permute([0, 1, 3, 2, 4]).flatten(start_dim=1, end_dim=3)  # Bx(NxHxW)xD
+            else:
+                z_vals = z_vals.view(N, W, H, D).permute([0, 2, 1, 3]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xD
 
         # construct cam coord for ray_dir
         x = torch.arange(self.frustum_size[0])
@@ -109,7 +123,10 @@ class Projection(object):
             ray_dir = torch.stack(ray_dir_, dim=0)  # 4xNx(H/s)x(W/s)x3
             ray_dir = ray_dir.flatten(start_dim=1, end_dim=3)  # 4x(Nx(H/s)x(W/s))x3
         else:
-            ray_dir = ray_dir.expand(N, H, W, 3).flatten(start_dim=0, end_dim=2)  # (NxHxW)x3
+            if resize:
+                ray_dir = ray_dir.expand(B, _N, H, W, 3).flatten(start_dim=1, end_dim=3)  # Bx(NxHxW)x3
+            else:
+                ray_dir = ray_dir.expand(N, H, W, 3).flatten(start_dim=0, end_dim=2)  # (NxHxW)x3
         return frus_nss_coor, z_vals, ray_dir
 
 if __name__ == '__main__':

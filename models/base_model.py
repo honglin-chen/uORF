@@ -6,7 +6,7 @@ from . import networks
 import time
 
 
-class BaseModel(ABC):
+class BaseModel(torch.nn.Module):
     """This class is an abstract base class (ABC) for models.
     To create a subclass, you need to implement the following five functions:
         -- <__init__>:                      initialize the class; first call BaseModel.__init__(self, opt).
@@ -17,6 +17,7 @@ class BaseModel(ABC):
     """
 
     def __init__(self, opt):
+        super(BaseModel, self).__init__()
         """Initialize the BaseModel class.
 
         Parameters:

@@ -4,6 +4,7 @@ from data import create_dataset
 from models import create_model
 from util.visualizer import Visualizer
 from util.util import AverageMeter, set_seed
+import torch.nn as nn
 
 
 if __name__ == '__main__':
@@ -14,6 +15,7 @@ if __name__ == '__main__':
 
     model = create_model(opt)      # create a model given opt.model and other options
     model.setup(opt)               # regular setup: load and print networks; create schedulers
+    model = nn.DataParallel(model)
     visualizer = Visualizer(opt)   # create a visualizer that display/save images and plots
     total_iters = 0                # the total number of training iterations
 
@@ -25,9 +27,9 @@ if __name__ == '__main__':
         iter_data_time = time.time()    # timer for data loading per iteration
         epoch_iter = 0                  # the number of training iterations in current epoch, reset to 0 every epoch
         print('Dataset size:', len(dataset))
-        meters_trn = {stat: AverageMeter() for stat in model.loss_names}
+        meters_trn = {stat: AverageMeter() for stat in model.module.loss_names}
         opt.stage = 'coarse' if epoch < opt.coarse_epoch else 'fine'
-        model.netDecoder.locality = True if epoch < opt.no_locality_epoch else False
+        model.module.netDecoder.locality = True if epoch < opt.no_locality_epoch else False
         for i, data in enumerate(dataset):  # inner loop within one epoch
             iter_start_time = time.time()  # timer for computation per iteration
             if total_iters % opt.print_freq == 0:
@@ -35,20 +37,23 @@ if __name__ == '__main__':
             visualizer.reset()
             total_iters += opt.batch_size
             epoch_iter += opt.batch_size
-            model.set_input(data)         # unpack data from dataset and apply preprocessing
-            layers, avg_grad = model.optimize_parameters(opt.display_grad, epoch)   # calculate loss functions, get gradients, update network weights
+
+            x, cam2world, cam2azi = model.module.set_input(data)         # unpack data from dataset and apply preprocessing
+            loss = model(x[None].expand(2, -1, -1, -1, -1), cam2world[None].expand(2, -1, -1, -1), cam2azi[None].expand(2, -1, -1, -1)) # feedforward and calculate loss
+            layers, avg_grad = model.module.optimize_parameters(loss, opt.display_grad, epoch)   # get gradients, update network weights
+
             if opt.custom_lr and opt.stage == 'coarse':
-                model.update_learning_rate()    # update learning rates at the beginning of every step
+                model.module.update_learning_rate()    # update learning rates at the beginning of every step
 
             if total_iters % opt.display_freq == 0:   # display images on visdom and save images to a HTML file
                 save_result = total_iters % opt.update_html_freq == 0
-                model.compute_visuals()
+                model.module.compute_visuals()
                 if opt.display_grad:
                     visualizer.display_grad(layers, avg_grad)
-                visualizer.display_current_results(model.get_current_visuals(), epoch, save_result)
+                visualizer.display_current_results(model.module.get_current_visuals(), epoch, save_result)
 
-            losses = model.get_current_losses()
-            for loss_name in model.loss_names:
+            losses = model.module.get_current_losses()
+            for loss_name in model.module.loss_names:
                 meters_trn[loss_name].update(float(losses[loss_name]))
                 losses[loss_name] = meters_trn[loss_name].avg
             if total_iters % opt.print_freq == 0:    # print training losses and save logging information to the disk
@@ -56,12 +61,12 @@ if __name__ == '__main__':
                 visualizer.print_current_losses(epoch, epoch_iter, losses, t_comp, t_data)
                 if opt.display_id > 0:
                     visualizer.plot_current_losses(epoch, float(epoch_iter) / dataset_size, losses)
-                print('learning rate:', model.optimizers[0].param_groups[0]['lr'])
+                print('learning rate:', model.module.optimizers[0].param_groups[0]['lr'])
 
             if total_iters % opt.save_latest_freq == 0:   # cache our latest model every <save_latest_freq> iterations
                 print('saving the latest model (epoch %d, total_iters %d)' % (epoch, total_iters))
                 save_suffix = 'iter_%d' % total_iters if opt.save_by_iter else 'latest'
-                model.save_networks(save_suffix)
+                model.module.save_networks(save_suffix)
 
             iter_data_time = time.time()
 

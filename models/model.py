@@ -40,12 +40,12 @@ class Encoder(nn.Module):
         output:
             feature_map: BxCxHxW
         """
-        W, H = x.shape[3], x.shape[2]
+        B, W, H = x.shape[0], x.shape[3], x.shape[2]
         X = torch.linspace(-1, 1, W)
         Y = torch.linspace(-1, 1, H)
         y1_m, x1_m = torch.meshgrid([Y, X])
         x2_m, y2_m = 2 - x1_m, 2 - y1_m  # Normalized distance in the four direction
-        pixel_emb = torch.stack([x1_m, x2_m, y1_m, y2_m]).to(x.device).unsqueeze(0)  # 1x4xHxW
+        pixel_emb = torch.stack([x1_m, x2_m, y1_m, y2_m]).to(x.device).unsqueeze(0).expand(B, -1, -1, -1)  # 1x4xHxW
         x_ = torch.cat([x, pixel_emb], dim=1)
 
         if self.bottom:
@@ -113,39 +113,43 @@ class Decoder(nn.Module):
             z_slots: KxC, K: #slots, C: #feat_dim
             fg_transform: If self.fixed_locality, it is 1x4x4 matrix nss2cam0, otherwise it is 1x3x3 azimuth rotation of nss2cam0
         """
-        K, C = z_slots.shape
-        P = sampling_coor_bg.shape[0]
+
+
+        B, K, C = z_slots.shape
+        P = sampling_coor_bg.shape[1]
 
         if self.fixed_locality:
-            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
-            sampling_coor_fg = torch.cat([sampling_coor_fg, torch.ones_like(sampling_coor_fg[:, :, 0:1])], dim=-1)  # (K-1)xPx4
-            sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx4x1
-            sampling_coor_fg = sampling_coor_fg.squeeze(-1)[:, :, :3]  # (K-1)xPx3
+            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # Bx(K-1)xP
+            sampling_coor_fg = torch.cat([sampling_coor_fg, torch.ones_like(sampling_coor_fg[:, :, :, 0:1])], dim=-1)  # Bx(K-1)xPx4
+            sampling_coor_fg = torch.matmul(fg_transform[:, None, ...], sampling_coor_fg[..., None])  # Bx(K-1)xPx4x1
+            sampling_coor_fg = sampling_coor_fg.squeeze(-1)[:, :, :, 3]  # Bx(K-1)xPx3
         else:
-            sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx3x1
-            sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
-            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
+            sampling_coor_fg = torch.matmul(fg_transform[:, None, ...], sampling_coor_fg[..., None])  # Bx(K-1)xPx3x1
+            sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # Bx(K-1)xPx3
+            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # Bx(K-1)xP
 
-        z_bg = z_slots[0:1, :]  # 1xC
-        z_fg = z_slots[1:, :]  # (K-1)xC
-        query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
-        input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
 
-        sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
-        query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
-        z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
-        input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
+        z_bg = z_slots[:, 0:1, :]  # Bx1xC
+        z_fg = z_slots[:, 1:, :]  # Bx(K-1)xC
+        query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # BxPx60, 60 means increased-freq feat dim
+        input_bg = torch.cat([query_bg, z_bg.expand(-1, P, -1)], dim=-1)  # BxPx(60+C)
 
+        sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=1, end_dim=2)  # Bx((K-1)xP)x3
+        query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # Bx((K-1)xP)x60
+        z_fg_ex = z_fg[:, :, None, :].expand(-1, -1, P, -1).flatten(start_dim=1, end_dim=2)  # Bx((K-1)xP)xC
+        input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=-1)  # Bx((K-1)xP)x(60+C)
+
+        breakpoint()
         tmp = self.b_before(input_bg)
-        bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=1)).view([1, P, self.out_ch])  # Px5 -> 1xPx5
+        bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=-1)).view([B, 1, P, self.out_ch])  # BxPx5 -> Bx1xPx5
         tmp = self.f_before(input_fg)
-        tmp = self.f_after(torch.cat([input_fg, tmp], dim=1))  # ((K-1)xP)x64
-        latent_fg = self.f_after_latent(tmp)  # ((K-1)xP)x64
-        fg_raw_rgb = self.f_color(latent_fg).view([K-1, P, 3])  # ((K-1)xP)x3 -> (K-1)xPx3
-        fg_raw_shape = self.f_after_shape(tmp).view([K - 1, P])  # ((K-1)xP)x1 -> (K-1)xP, density
+        tmp = self.f_after(torch.cat([input_fg, tmp], dim=-1))  # Bx((K-1)xP)x64
+        latent_fg = self.f_after_latent(tmp)  # Bx((K-1)xP)x64
+        fg_raw_rgb = self.f_color(latent_fg).view([B, K-1, P, 3])  # Bx((K-1)xP)x3 -> Bx(K-1)xPx3
+        fg_raw_shape = self.f_after_shape(tmp).view([B, K - 1, P])  # B((K-1)xP)x1 -> Bx(K-1)xP, density
         if self.locality:
             fg_raw_shape[outsider_idx] *= 0
-        fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # (K-1)xPx4
+        fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # Bx(K-1)xPx4
 
         all_raws = torch.cat([bg_raws, fg_raws], dim=0)  # KxPx4
         raw_masks = F.relu(all_raws[:, :, -1:], True)  # KxPx1
@@ -272,7 +276,7 @@ def sin_emb(x, n_freq=5, keep_ori=True):
     for freq in freqs:
         for emb_fn in emb_fns:
             embedded.append(emb_fn(freq * x))
-    embedded_ = torch.cat(embedded, dim=1)
+    embedded_ = torch.cat(embedded, dim=-1)
     return embedded_
 
 def raw2outputs(raw, z_vals, rays_d, render_mask=False):

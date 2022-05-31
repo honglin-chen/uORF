@@ -57,6 +57,7 @@ class uorfNoGanModel(BaseModel):
         return parser
 
     def __init__(self, opt):
+        super(uorfNoGanModel).__init__()
         """Initialize this model class.
 
         Parameters:
@@ -119,34 +120,40 @@ class uorfNoGanModel(BaseModel):
         Parameters:
             input: a dictionary that contains the data itself and its metadata information.
         """
-        self.x = input['img_data'].to(self.device)
-        self.cam2world = input['cam2world'].to(self.device)
+        x = input['img_data'].to(self.device)
+        cam2world = input['cam2world'].to(self.device)
         if not self.opt.fixed_locality:
-            self.cam2world_azi = input['azi_rot'].to(self.device)
+            cam2world_azi = input['azi_rot'].to(self.device)
 
-    def forward(self, epoch=0):
+        return x, cam2world, cam2world_azi
+
+    def forward(self, x, cam2world, cam2world_azi, epoch=0):
+
+        B, NV, C, H, W = x.shape
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
         self.weight_percept = self.opt.weight_percept if epoch >= self.opt.percept_in else 0
         self.loss_recon = 0
         self.loss_perc = 0
-        dev = self.x[0:1].device
-        nss2cam0 = self.cam2world[0:1].inverse() if self.opt.fixed_locality else self.cam2world_azi[0:1].inverse()
+        dev = x[:, 0:1].device
+        nss2cam0 = cam2world[:, 0:1].inverse() if self.opt.fixed_locality else cam2world_azi[:, 0:1].inverse()
 
         # Encoding images
-        feature_map = self.netEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
+        feature_map = self.netEncoder(F.interpolate(x[:, 0:1].flatten(0, 1), size=self.opt.input_size,
+                                                    mode='bilinear', align_corners=False))  # BxCxHxW
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention
-        z_slots, attn = self.netSlotAttention(feat)  # 1xKxC, 1xKxN
-        z_slots, attn = z_slots.squeeze(0), attn.squeeze(0)  # KxC, KxN
-        K = attn.shape[0]
+        z_slots, attn = self.netSlotAttention(feat)  # BxKxC, BxKxN
+        K = attn.shape[1]
 
-        cam2world = self.cam2world
-        N = cam2world.shape[0]
+        # cam2world = cam2world
+        N = cam2world.shape[1]
         if self.opt.stage == 'coarse':
             frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
-            x = F.interpolate(self.x, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
+            x = F.interpolate(x.flatten(0, 1), size=self.opt.supervision_size, mode='bilinear', align_corners=False)
+            x = x.reshape(B, NV, 3, self.opt.supervision_size, self.opt.supervision_size)
+
             self.z_vals, self.ray_dir = z_vals, ray_dir
         else:
             W, H, D = self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp
@@ -159,11 +166,11 @@ class uorfNoGanModel(BaseModel):
             W_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             frus_nss_coor_, z_vals_, ray_dir_ = frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(0, 3), z_vals_.flatten(0, 2), ray_dir_.flatten(0, 2)
-            x = self.x[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
+            x = x[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.z_vals, self.ray_dir = z_vals, ray_dir
 
-        sampling_coor_fg = frus_nss_coor[None, ...].expand(K - 1, -1, -1)  # (K-1)xPx3
-        sampling_coor_bg = frus_nss_coor  # Px3
+        sampling_coor_fg = frus_nss_coor[:, None, ...].expand(B, K - 1, -1, -1)  # (K-1)xPx3
+        sampling_coor_bg = frus_nss_coor  # BxPx3
 
         W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
         raws, masked_raws, unmasked_raws, masks = self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0)  # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1
@@ -193,6 +200,9 @@ class uorfNoGanModel(BaseModel):
             setattr(self, 'unmasked_raws', unmasked_raws.detach())
             setattr(self, 'attn', attn)
 
+        loss = self.loss_recon + self.loss_perc
+        return loss
+
     def compute_visuals(self):
         with torch.no_grad():
             _, N, D, H, W, _ = self.masked_raws.shape
@@ -218,18 +228,18 @@ class uorfNoGanModel(BaseModel):
 
                 setattr(self, 'slot{}_attn'.format(k), self.attn[k] * 2 - 1)
 
-    def backward(self):
-        """Calculate losses, gradients, and update network weights; called in every training iteration"""
-        loss = self.loss_recon + self.loss_perc
-        loss.backward()
-        self.loss_perc = self.loss_perc / self.weight_percept if self.weight_percept > 0 else self.loss_perc
+    # def backward(self):
+    #     """Calculate losses, gradients, and update network weights; called in every training iteration"""
+    #
+    #     loss.backward()
+    #     self.loss_perc = self.loss_perc / self.weight_percept if self.weight_percept > 0 else self.loss_perc
 
-    def optimize_parameters(self, ret_grad=False, epoch=0):
+    def optimize_parameters(self, loss, ret_grad=False, epoch=0):
         """Update network weights; it will be called in every training iteration."""
-        self.forward(epoch)
+        # self.forward(epoch)
         for opm in self.optimizers:
             opm.zero_grad()
-        self.backward()
+        loss.backward()
         avg_grads = []
         layers = []
         if ret_grad:
