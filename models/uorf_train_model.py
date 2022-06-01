@@ -13,8 +13,11 @@ from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outp
 from .position_encoding import position_encoding_image
 import pdb
 from util import util
+from unet import UNet
 
 import math
+
+import numpy as np
 
 def positionalencoding2d(d_model, height, width):
     """
@@ -193,6 +196,10 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--stop_hungarian', action='store_true', help='stop hungarian matching')
         parser.add_argument('--learn_bg_first', action='store_true', help='learn bg first for first 60 epoch')
         parser.add_argument('--debug_no_ray_dir', action='store_true')
+        parser.add_argument('--save_mesh_xyz_density', action='store_true', help='save numpy array of xyz coord and sigma')
+
+        parser.add_argument('--use_unet', action='store_true', help='use unet instead of any pixel or slot encoder')
+
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=2000, custom_lr=True, lr_policy='warmup')
@@ -223,6 +230,8 @@ class uorfTrainModel(BaseModel):
                             ['x_rec{}'.format(i) for i in range(n)] + \
                             ['slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['unmasked_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
+                            ['silhoutte_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
+                            ['depth_map{}'.format(i) for i in range(n)] + \
                             ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
         self.perceptual_net = get_perceptual_net().cuda()
         self.vgg_norm = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -645,8 +654,20 @@ class uorfTrainModel(BaseModel):
             rgb_map, depth_map, _, _, _, silhouettes = raw2outputs(raws, z_vals, ray_dir, return_silhouettes=masks_for_silhouette)
             self.silhouettes = silhouettes
 
+            if self.opt.save_mesh_xyz_density:
+                coordinates_mesh = frus_world_coor.view(N, D, H, W, 4)
+                masked_raws_mesh = masked_raws.view(K, N, D, H, W, 4)
+                if self.opt.save_mesh_xyz_density:
+                    with open('./xyz.npy', 'wb') as f:
+                        np.save(f, coordinates_mesh.detach().cpu().numpy())  # NxDxHxWx4
+                    with open('./sigma.npy', 'wb') as f:
+                        np.save(f, masked_raws_mesh.detach().cpu().numpy())  # K,N,D,H,W,1
+                    print('xyz and sigma are saved')
+
         rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
         x_recon = rendered * 2 - 1
+
+        depth_map = depth_map.view(N, H, W, 1).permute([0, 3, 1, 2]) # Nx1xHxW
 
         if self.opt.learn_only_silhouette:
             self.loss_recon *= 0.
@@ -743,6 +764,7 @@ class uorfTrainModel(BaseModel):
             for i in range(self.opt.n_img_each_scene):
                 setattr(self, 'x_rec{}'.format(i), x_recon[i])
                 setattr(self, 'x{}'.format(i), x[i])
+                setattr(self, 'depth_map{}'.format(i), depth_map[i])
             setattr(self, 'masked_raws', masked_raws.detach())
             setattr(self, 'unmasked_raws', unmasked_raws.detach())
             setattr(self, 'attn', attn)
@@ -753,6 +775,7 @@ class uorfTrainModel(BaseModel):
             _, N, D, H, W, _ = self.masked_raws.shape
             masked_raws = self.masked_raws  # KxNxDxHxWx4
             unmasked_raws = self.unmasked_raws  # KxNxDxHxWx4
+            silhouttes = self.silhouettes  # NxKxHxW ??
             for k in range(self.num_slots):
                 raws = masked_raws[k]  # NxDxHxWx4
                 z_vals, ray_dir = self.z_vals, self.ray_dir
@@ -772,6 +795,39 @@ class uorfTrainModel(BaseModel):
                     setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i])
 
                 setattr(self, 'slot{}_attn'.format(k), self.attn[k] * 2 - 1)
+
+                sil = silhouttes[:, k]  # (NxKxHxW)
+
+                for i in range(self.opt.n_img_each_scene):
+                    setattr(self, 'silhoutte_slot{}_view{}'.format(k, i),
+                            sil[i].expand(3, sil[i].shape[0], sil[i].shape[1]))
+
+                # setattr(self, 'slot{}_attn'.format(k), self.attn[k] * 2 - 1)
+
+    # def compute_visuals(self):
+    #     with torch.no_grad():
+    #         _, N, D, H, W, _ = self.masked_raws.shape
+    #         masked_raws = self.masked_raws  # KxNxDxHxWx4
+    #         unmasked_raws = self.unmasked_raws  # KxNxDxHxWx4
+    #         for k in range(self.num_slots):
+    #             raws = masked_raws[k]  # NxDxHxWx4
+    #             z_vals, ray_dir = self.z_vals, self.ray_dir
+    #             raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
+    #             rgb_map, depth_map, _, _, _, _ = raw2outputs(raws, z_vals, ray_dir)
+    #             rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+    #             x_recon = rendered * 2 - 1
+    #             for i in range(self.opt.n_img_each_scene):
+    #                 setattr(self, 'slot{}_view{}'.format(k, i), x_recon[i])
+    #
+    #             raws = unmasked_raws[k]  # (NxDxHxW)x4
+    #             raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
+    #             rgb_map, depth_map, _, _, _, _ = raw2outputs(raws, z_vals, ray_dir)
+    #             rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+    #             x_recon = rendered * 2 - 1
+    #             for i in range(self.opt.n_img_each_scene):
+    #                 setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i])
+    #
+    #             setattr(self, 'slot{}_attn'.format(k), self.attn[k] * 2 - 1)
 
     def backward(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""

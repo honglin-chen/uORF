@@ -179,6 +179,10 @@ class uorfEvalModel(BaseModel):
         parser.add_argument('--pixel_zero', action='store_true', help='put zeros on pixel features')
         parser.add_argument('--stop_hungarian', action='store_true', help='stop hungarian matching')
         parser.add_argument('--moveobj', action='store_true', help='move obj')
+        parser.add_argument('--extract_mesh_camproj', action='store_true', help='change the projection class we are using to camera coordinate, just like during the training')
+        parser.add_argument('--save_mesh_xyz_density', action='store_true', help='save numpy array of xyz coord and sigma')
+
+        parser.add_argument('--debug_no_ray_dir', action='store_true')
 
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
@@ -490,7 +494,7 @@ class uorfEvalModel(BaseModel):
         N = cam2world.shape[0]
         W, H, D = self.projection.frustum_size
         scale = H // self.opt.render_size
-        if self.opt.extract_mesh:
+        if self.opt.extract_mesh and not self.opt.extract_mesh_camproj:
             frus_nss_coor, z_vals, ray_dir = self.projection_mesh.construct_sampling_coor(cam2world, partitioned=True)
         else:
             frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world, partitioned=True)
@@ -501,6 +505,7 @@ class uorfEvalModel(BaseModel):
         unmasked_raws = torch.zeros([K, N, D, H, W, 4], device=dev)
         raws = torch.zeros([N, D, H, W, 4], device=dev)
         silhouettes = torch.zeros([N, K, H, W], device=dev)
+        coordinates = torch.zeros([N, D, H, W, 4], device=dev)
 
         # rendered = torch.zeros([N, 3, H, W], device=dev)
         # transmittance_samples = torch.zeros([N, H, W, D], device=dev)
@@ -545,6 +550,9 @@ class uorfEvalModel(BaseModel):
                 ray_dir_input_ = ray_dir_input_.flatten(0, 3)
             else:
                 ray_dir_input_ = None
+
+            if self.opt.debug_no_ray_dir:
+                ray_dir_input_ *= 0
 
             if self.opt.pixel_encoder or self.opt.mask_as_decoder_input:
                 # get cam matrices
@@ -646,12 +654,20 @@ class uorfEvalModel(BaseModel):
                 silhouettes[..., h::scale, w::scale] = silhouettes_ # NxKxHxW
                 if self.opt.extract_mesh:
                     raw_masks_density[:, :, :, h::scale, w::scale, :] = masked_raws_[..., -1:].view(K, N, D, H_, W_, 1)
-
+                if self.opt.save_mesh_xyz_density:
+                    coordinates[:, :, h::scale, w::scale, :] = frus_world_coor_.view(N, D, H_, W_, 4)
 
         if self.opt.extract_mesh:
+            if self.opt.save_mesh_xyz_density:
+                with open('./xyz.npy', 'wb') as f:
+                    np.save(f, coordinates.cpu().numpy()) # NxDxHxWx4
+                with open('./sigma.npy', 'wb') as f:
+                    np.save(f, raw_masks_density.cpu().numpy()) # K,N,D,H,W,1
+                print('xyz and sigma are saved')
+
             # evaluate mesh
             num_points = 1024
-            threshold = 30.0
+            threshold = 10.0
 
             hdf_path = self.input_paths[0].replace('_frame5_img0.png', '.hdf5')
 

@@ -1010,7 +1010,9 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, r
     if return_silhouettes != None:
         masks = return_silhouettes # [K, N, D, H, W]
         masks = masks.permute([1, 3, 4, 2, 0]) # [N, H, W, D, K]
+        # Debug, erase this after 0530
         weights_silhouettes = weights.view([masks.shape[0], masks.shape[1], masks.shape[2], masks.shape[3]]).unsqueeze(-1) # (NxHxW)xD -> NxHxWxDx1
+        # weights_silhouettes = alpha.view([masks.shape[0], masks.shape[1], masks.shape[2], masks.shape[3]]).unsqueeze(-1)  # (NxHxW)xD -> NxHxWxDx1
         silhouettes = torch.sum(weights_silhouettes * masks, dim=-2) # NxHxWxK
         silhouettes = silhouettes.permute([0, 3, 1, 2]) # NxKxHxW
     else:
