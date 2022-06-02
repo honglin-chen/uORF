@@ -2,7 +2,6 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 
-
 class Projection(object):
     def __init__(self, focal_ratio=(350. / 320., 350. / 240.),
                  near=5, far=16, frustum_size=[128, 128, 128], device='cpu',
@@ -90,6 +89,8 @@ class Projection(object):
         """
         N = cam2world.shape[0]
         W, H, D = self.frustum_size
+        from termcolor import  colored
+        # print(colored("W, H, D", 'blue'), W, H, D)
         pixel_coor = self.construct_frus_coor()
         # if self.extract_mesh:
         #     pixel_coor = self.construct_frus_coor_mesh()
@@ -116,9 +117,17 @@ class Projection(object):
             # x = torch.linspace(-7, 3, self.frustum_size[0]) # -1
             # y = torch.linspace(-6.5, 3.5, self.frustum_size[1]) # -1
             # z = torch.linspace(-1, 9, self.frustum_size[2])  # 6
-            x = torch.linspace(-2.5, 2.5, self.frustum_size[0]) # -2.5, 2.5
-            y = torch.linspace(-2.5, 2.5, self.frustum_size[1]) # -2.5, 2.5
-            z = torch.linspace(4, 9, self.frustum_size[2])  # 6 # 4, 7
+
+            # x = torch.linspace(-14, 14, self.frustum_size[0])  # -2.5, 2.5
+            # y = torch.linspace(-14, 14, self.frustum_size[1])  # -2.5, 2.5
+            # z = torch.linspace(0, 28, self.frustum_size[2])  # 6 # 4, 7
+
+            x = torch.linspace(-2.5, 2.5, self.frustum_size[0])  # -2.5, 2.5
+            y = torch.linspace(-2.5, 2.5, self.frustum_size[1])  # -2.5, 2.5
+            z = torch.linspace(2, 7, self.frustum_size[2])  # 6 # 4, 7
+            # x = torch.linspace(-24, 24, self.frustum_size[0]) # -2.5, 2.5
+            # y = torch.linspace(-12, 12, self.frustum_size[1]) # -2.5, 2.5
+            # z = torch.linspace(-12, 12, self.frustum_size[2])  # 6 # 4, 7
             x, y, z = torch.meshgrid([x, y, z])
             x_frus = x.flatten().to(self.device)
             y_frus = y.flatten().to(self.device)
@@ -127,7 +136,9 @@ class Projection(object):
             frus_world_coor = frus_world_coor[None, ...].expand(N, -1, -1)
         frus_nss_coor = torch.matmul(self.world2nss, frus_world_coor)  # Nx4x(WxHxD)
         frus_nss_coor = frus_nss_coor.view(N, 4, W, H, D).permute([0, 4, 3, 2, 1])  # NxDxHxWx4
+        
         frus_nss_coor = frus_nss_coor[..., :3]  # NxDxHxWx3
+        frus_nss_coor_orig = frus_nss_coor.clone()
         scale = H // self.render_size[0]
         if partitioned:
             frus_nss_coor_ = []
@@ -138,8 +149,9 @@ class Projection(object):
             frus_nss_coor = frus_nss_coor.flatten(start_dim=1, end_dim=4)  # 4x(NxDx(H/s)x(W/s))x3
         else:
             frus_nss_coor = frus_nss_coor.flatten(start_dim=0, end_dim=3)  # (NxDxHxW)x3
+            # print("frus_nss_coor", frus_nss_coor.shape)
 
-        z_vals = (frus_cam_coor[2] - self.near) / (self.far - self.near)  # (WxHxD) range=[0,1]
+        z_vals = frus_cam_coor[2] #(frus_cam_coor[2] - self.near) / (self.far - self.near)  # (WxHxD) range=[0,1]
         z_vals = z_vals.expand(N, W * H * D)  # Nx(WxHxD)
         if partitioned:
             z_vals = z_vals.view(N, W, H, D).permute([0, 2, 1, 3])  # NxHxWxD
@@ -172,7 +184,7 @@ class Projection(object):
             ray_dir = ray_dir.flatten(start_dim=1, end_dim=3)  # 4x(Nx(H/s)x(W/s))x3
         else:
             ray_dir = ray_dir.expand(N, H, W, 3).flatten(start_dim=0, end_dim=2)  # (NxHxW)x3
-        return frus_nss_coor, z_vals, ray_dir
+        return frus_nss_coor, z_vals, ray_dir, frus_nss_coor_orig, frus_world_coor
 
 if __name__ == '__main__':
     pass

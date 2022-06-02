@@ -172,6 +172,7 @@ class PixelEncoder(nn.Module):
                     uv = uv * scale - 1.0
 
             uv = uv.unsqueeze(2)  # (B, N, 1, 2)
+            # np.save("../uv.npy", uv.detach().cpu().numpy())
             samples = F.grid_sample(
                 self.latent,
                 uv,
@@ -179,6 +180,7 @@ class PixelEncoder(nn.Module):
                 mode=self.index_interp,
                 padding_mode=self.index_padding,
             )
+            # return uv, samples[:, :, :, 0]  # (B, C, N)
             return samples[:, :, :, 0]  # (B, C, N)
 
     def forward(self, x, masks=None):
@@ -485,6 +487,7 @@ class Decoder(nn.Module):
         #     pixel_feat += self.substitute_pixel_feat[None, None, ...].expand(K, P, -1) * (1. - transmittance_samples) # this option was previous behavior, I thought that it is quite hard coding
 
         if self.fixed_locality:
+            print("************", "locality")
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
             sampling_coor_fg = torch.cat([sampling_coor_fg, torch.ones_like(sampling_coor_fg[:, :, 0:1])], dim=-1)  # (K-1)xPx4
             sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx4x1
@@ -508,6 +511,7 @@ class Decoder(nn.Module):
         query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
         if self.use_ray_dir:
             if not self.ray_after_density:
+                print("ray before density")
                 query_bg = torch.cat([query_bg, ray_dir_input], dim=1)
                 query_fg_ex = torch.cat([query_fg_ex, ray_dir_input[None, ...].expand(K-1, -1, -1).flatten(0, 1)], dim=1)
 
@@ -535,7 +539,6 @@ class Decoder(nn.Module):
             z_fg = z_slots[1:, :]  # (K-1)xC
             if self.without_slot_feature:
                 # print(self.without_slot_feature, 'without_slot_feature')
-
                 input_bg = query_bg
                 # print(input_bg.shape, 'input_bg.shape')
             else:
@@ -621,11 +624,14 @@ class Decoder(nn.Module):
         fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # (K-1)xPx4
 
         all_raws = torch.cat([bg_raws, fg_raws], dim=0)  # KxPx4
-        raw_masks = F.relu(all_raws[:, :, -1:], True)  # KxPx1
+        # raw_masks = F.relu(all_raws[:, :, -1:], True)  # KxPx1
+
+        raw_masks = F.sigmoid(all_raws[:, :, -1:])  # KxPx1
         if decoder_type=='color':
             raw_masks = raw_masks_density
         masks = raw_masks / (raw_masks.sum(dim=0) + 1e-5)  # KxPx1
         raw_rgb = (all_raws[:, :, :3].tanh() + 1) / 2
+
         raw_sigma = raw_masks
 
         masked_rgb = raw_rgb * masks
@@ -633,153 +639,12 @@ class Decoder(nn.Module):
         masked_raws = torch.cat([masked_rgb, raw_sigma], dim=2)
         # at_home
         # masked_raws = unmasked_raws * masks
-        raws = masked_raws.sum(dim=0)
+        raws = masked_raws.mean(dim=0)
 
         if decoder_type=='density':
             return raws, masked_raws, unmasked_raws, masks, raw_masks
 
-        return raws, masked_raws, unmasked_raws, masks
-
-class PixelDecoder(nn.Module):
-    def __init__(self, n_freq=5, input_dim=33+64+128, z_dim=64, n_layers=3, locality=True, locality_ratio=4/7, fixed_locality=False, pixel_positional_encoding=None, use_ray_dir=None, slot_repeat=None):
-        """
-        freq: raised frequency
-        input_dim: pos emb dim + slot dim
-        z_dim: network latent dim
-        n_layers: #layers before/after skip connection.
-        locality: if True, for each obj slot, clamp sigma values to 0 outside obj_scale.
-        locality_ratio: if locality, what value is the boundary to clamp?
-        fixed_locality: if True, compute locality in world space instead of in transformed view space
-        """
-        super().__init__()
-        self.n_freq = n_freq
-        self.locality = locality
-        self.locality_ratio = locality_ratio
-        self.fixed_locality = fixed_locality
-        self.out_ch = 4
-        self.d_out = 4
-        self.pixel_positional_encoding = pixel_positional_encoding
-        self.use_ray_dir = use_ray_dir
-        if pixel_positional_encoding:
-            self.positional_encoding = PositionalEncoding(num_freqs=6, d_in=3, freq_factor=np.pi, include_input=True)
-            input_dim += self.positional_encoding.d_out
-            print(self.positional_encoding.d_out)
-        if use_ray_dir:
-            input_dim += 3
-
-        if slot_repeat:
-            self.bg = ResnetFC(d_in=input_dim-64, d_out=4, n_blocks=4, d_latent=64, d_hidden=64,
-                            beta=0.0, combine_layer=2, combine_type="average", use_spade=False, slot_repeat=slot_repeat,)
-            self.fg = ResnetFC(d_in=input_dim-64, d_out=4, n_blocks=4, d_latent=64, d_hidden=64,
-                            beta=0.0, combine_layer=2, combine_type="average", use_spade=False, slot_repeat=slot_repeat,)
-        else:
-            self.bg = ResnetFC(d_in=input_dim-128, d_out=4, n_blocks=3, d_latent=128, d_hidden=64,
-                               beta=0.0, combine_layer=1, combine_type="average", use_spade=False,)
-            self.fg = ResnetFC(d_in=input_dim-128, d_out=4, n_blocks=3, d_latent=128, d_hidden=64,
-                               beta=0.0, combine_layer=1, combine_type="average", use_spade=False,)
-
-    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, pixel_feat, ray_dir=None, use_background=True, slot_repeat=None):
-        """
-        1. pos emb by Fourier
-        2. for each slot, decode all points from coord and slot feature
-        input:
-            sampling_coor_bg: Px3, P = #points, typically P = NxDxHxW
-            sampling_coor_fg: (K-1)xPx3
-            z_slots: KxC, K: #slots, C: #feat_dim
-            fg_transform: If self.fixed_locality, it is 1x4x4 matrix nss2cam0, otherwise it is 1x3x3 azimuth rotation of nss2cam0
-        """
-        if self.pixel_positional_encoding:
-            K = 2 # because it is pixelnerf
-        else:
-            K, C = z_slots.shape
-        P = sampling_coor_bg.shape[0]
-
-        if self.fixed_locality:
-            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
-            sampling_coor_fg = torch.cat([sampling_coor_fg, torch.ones_like(sampling_coor_fg[:, :, 0:1])], dim=-1)  # (K-1)xPx4
-            sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx4x1
-            sampling_coor_fg = sampling_coor_fg.squeeze(-1)[:, :, :3]  # (K-1)xPx3
-        else:
-            sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx3x1
-            sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
-            outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
-
-        if not self.pixel_positional_encoding:
-            z_bg = z_slots[0:1, :]  # 1xC
-            z_fg = z_slots[1:, :]  # (K-1)xC
-        if not self.pixel_positional_encoding:
-            query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # Px60, 60 means increased-freq feat dim
-            input_bg = torch.cat([query_bg, z_bg.expand(P, -1)], dim=1)  # Px(60+C)
-        else:
-            input_bg = self.positional_encoding(sampling_coor_bg)
-        input_bg = torch.cat([pixel_feat[0:1].squeeze(0), input_bg], dim=1)
-        if ray_dir is not None:
-            input_bg = torch.cat([input_bg, ray_dir.expand(P, -1)], dim=1)
-
-        sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=0, end_dim=1)  # ((K-1)xP)x3
-        if not self.pixel_positional_encoding:
-            query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # ((K-1)xP)x60
-        else:
-            input_fg = self.positional_encoding(sampling_coor_fg_)
-        if not self.pixel_positional_encoding:
-            z_fg_ex = z_fg[:, None, :].expand(-1, P, -1).flatten(start_dim=0, end_dim=1)  # ((K-1)xP)xC
-            input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=1)  # ((K-1)xP)x(60+C)
-        input_fg = torch.cat([pixel_feat[1:].flatten(0, 1), input_fg], dim=1)
-        if ray_dir is not None:
-            input_fg = torch.cat([input_fg, ray_dir.expand(P, -1)], dim=1)
-            #TODO: need to generalize for the case K-1 != 1
-        # print(input_fg.shape, 'input_fg.shape') # torch.Size([4194304, 225]) input_fg.shape
-
-        # Camera frustum culling stuff, currently disabled
-        combine_index = None
-        dim_size = None
-        self.num_views_per_obj = 1
-        B = input_fg.shape[0] # B is batch of points (in rays)
-
-        # Run main NeRF network
-        mlp_output_fg = self.fg(input_fg, combine_inner_dims=(self.num_views_per_obj, B),)
-        if use_background:
-            mlp_output_bg = self.bg(input_bg, combine_inner_dims=(self.num_views_per_obj, B//(K-1)),)
-
-            mlp_output_fg = mlp_output_fg.reshape(-1, B//(K-1), self.d_out)
-            fg_raw_shape = mlp_output_fg[..., 3]
-            fg_raw_rgb = mlp_output_fg[..., :3]
-            if self.locality:
-                fg_raw_shape[outsider_idx] *= 0
-            fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # (K-1)xPx4
-
-            mlp_output_bg = mlp_output_bg.reshape(-1, B//(K-1), self.d_out)
-            bg_raws = mlp_output_bg
-
-            all_raws = torch.cat([bg_raws, fg_raws], dim=0)  # KxPx4
-            raw_masks = F.relu(all_raws[:, :, -1:], True)  # KxPx1
-            masks = raw_masks / (raw_masks.sum(dim=0) + 1e-5)  # KxPx1
-            raw_rgb = (all_raws[:, :, :3].tanh() + 1) / 2
-            raw_sigma = raw_masks
-
-            unmasked_raws = torch.cat([raw_rgb, raw_sigma], dim=2)  # KxPx4
-            masked_raws = unmasked_raws * masks
-            raws = masked_raws.sum(dim=0)
-        else:
-            mlp_output_fg = mlp_output_fg.reshape(-1, B // (K - 1), self.d_out)
-            fg_raw_shape = mlp_output_fg[..., 3]
-            fg_raw_rgb = mlp_output_fg[..., :3]
-            if self.locality:
-                fg_raw_shape[outsider_idx] *= 0
-            fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # 1xPx4
-
-            all_raws = fg_raws  # 1xPx4
-            raw_masks = F.relu(all_raws[:, :, -1:], True)  # 1xPx1
-            masks = raw_masks / (raw_masks.sum(dim=0) + 1e-5)  # 1xPx1
-            raw_rgb = (all_raws[:, :, :3].tanh() + 1) / 2
-            raw_sigma = raw_masks
-
-            unmasked_raws = torch.cat([raw_rgb, raw_sigma], dim=2)  # KxPx4
-            masked_raws = unmasked_raws * masks
-            raws = masked_raws.sum(dim=0)
-
-        return raws, masked_raws, unmasked_raws, masks
-
+        return raws, masked_raws, unmasked_raws, masks#, raw_masks
 
 class SlotAttention(nn.Module):
     def __init__(self, num_slots, in_dim=64, slot_dim=64, iters=3, eps=1e-8, hidden_dim=128, gt_seg=False):
@@ -907,7 +772,9 @@ def sin_emb(x, n_freq=5, keep_ori=True):
     embedded_ = torch.cat(embedded, dim=1)
     return embedded_
 
-def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, uvw=None, wuv=None, KNDHW=None,
+
+
+def raw2outputs(raw, unmasked_raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, uvw=None, wuv=None, KNDHW=None,
                 return_transmittance_cam0=False, input_transmittance_cam0=None, return_silhouettes=None,
                 transmittance_samples=None, masks=None):
     """Transforms model's predictions to semantically meaningful values.
@@ -930,7 +797,16 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, r
 
     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
-    alpha = raw2alpha(raw[..., 3], dists)  # [N_rays, N_samples]
+    # weights = raw2alpha(raw[..., 3], dists)
+
+    alpha = raw[..., 3] #raw2alpha(raw[..., 3], dists)  # [N_rays, N_samples]
+
+    alpha_slots = [] #[K, N_rays, N_samples]
+    for raw_slot in unmasked_raw:
+        alpha_slots.append(raw_slot[..., 3])
+
+    alpha_slots = torch.stack(alpha_slots, 0)
+
     transmittance = torch.cumprod(
         torch.cat([torch.ones((alpha.shape[0], 1), device=device), 1. - alpha + 1e-10], dim=-1)
         , dim=-1)[:,:-1]
@@ -983,15 +859,225 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, r
         mask_map = None
 
     if return_silhouettes is not None:
+        # print("alpha slots")
         masks = return_silhouettes # [K, N, D, H, W]
+
+        alpha_slots = alpha_slots.view(alpha_slots.shape[0], masks.shape[1], masks.shape[3], masks.shape[4], masks.shape[2]) #[K, N, H, W, D]
+        #normalized densities
         masks = masks.permute([1, 3, 4, 2, 0]) # [N, H, W, D, K]
         weights_silhouettes = weights.view([masks.shape[0], masks.shape[1], masks.shape[2], masks.shape[3]]).unsqueeze(-1) # (NxHxW)xD -> NxHxWxDx1
-        silhouettes = torch.sum(weights_silhouettes * masks, dim=-2) # NxHxWxK
-        silhouettes = silhouettes.permute([0, 3, 1, 2]) # NxKxHxW
+        # print("no masking")
+
+        transmittance_silhouettes = transmittance.view([masks.shape[0], masks.shape[1], masks.shape[2], masks.shape[3]]).unsqueeze(
+            0)  # (NxHxW)xD -> 1xNxHxWxD
+        silhouettes = torch.sum(transmittance_silhouettes*alpha_slots, dim=-1) # KxNxHxW
+        silhouettes = silhouettes.permute([1, 0, 2, 3]) # NxKxHxW
+
+
+        # silhouettes = torch.sum(transmittance_silhouettes*alpha_slots, dim=-2) # NxHxWxK
+        # silhouettes = silhouettes.permute([0, 3, 1, 2]) # NxKxHxW
     else:
         silhouettes = None
 
     return rgb_map, depth_map, weights_norm, mask_map, transmittance_cam0, silhouettes
+
+#
+# def raw2outputs(raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, uvw=None, wuv=None, KNDHW=None,
+#                 return_transmittance_cam0=False, input_transmittance_cam0=None, return_silhouettes=None,
+#                 transmittance_samples=None, masks=None):
+#     """Transforms model's predictions to semantically meaningful values.
+#     Args:
+#         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+#         z_vals: [num_rays, num_samples along ray]. Integration time.
+#         rays_d: [num_rays, 3]. Direction of each ray in cam coor.
+#     Returns:
+#         rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
+#         depth_map: [num_rays]. Estimated distance to object.
+#     """
+#     # uvw: 1x(NxDxHxW)x3
+#     # raw: (NxHxW)xDx4
+#
+#     raw2alpha = lambda x, y: 1. - torch.exp(-x * y)
+#     device = raw.device
+#
+#     dists = z_vals[..., 1:] - z_vals[..., :-1]
+#     dists = torch.cat([dists, torch.tensor([1e-2], device=device).expand(dists[..., :1].shape)], -1)  # [N_rays, N_samples] # add dist 0 in the end
+#
+#     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
+#
+#     weights = raw[..., 3]#raw2alpha(raw[..., 3], dists)
+#
+#     # alpha = raw2alpha(raw[..., 3], dists)  # [N_rays, N_samples]
+#     # transmittance = torch.cumprod(
+#     #     torch.cat([torch.ones((alpha.shape[0], 1), device=device), 1. - alpha + 1e-10], dim=-1)
+#     #     , dim=-1)[:,:-1]
+#     # weights = alpha * transmittance # [N_rays, N_samples]
+#
+#     if weight_pixelfeat:
+#         K, N, D, H, W = KNDHW
+#         if input_transmittance_cam0 is not None:
+#             transmittance_cam0 = input_transmittance_cam0
+#         else:
+#             transmittance_cam0 = transmittance.view(N, H, W, D)[0] #HxWxD
+#             transmittance_cam0 = transmittance_cam0.permute([2, 0, 1]).unsqueeze(0).unsqueeze(0) # 1x1xDxHxW
+#
+#         uvw = uvw.unsqueeze(2).unsqueeze(3)  # (1, (NxDxHxW), 1, 1, 3)
+#         # self.latent(B, L, H, W)
+#         transmittance_samples = F.grid_sample(
+#             transmittance_cam0,
+#             uvw,
+#             # align_corners=True,
+#             mode='bilinear',
+#             padding_mode='zeros',
+#         ) # 1x1x(NxDxHxW)x1x1
+#
+#         transmittance_samples = transmittance_samples[0, 0, :, 0, 0] # (NxDxHxW)
+#         transmittance_samples = transmittance_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2) # (NxHxW)xD
+#
+#         # print(weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean(), 'weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean()')
+#         weights_pixel = weights * transmittance_samples
+#         weights_slot = weights * (1.- transmittance_samples)
+#         rgb_pixel = raw[..., :3]
+#         rgb_slot = raws_slot[..., :3]
+#         rgb_map = torch.sum(weights_pixel[..., None] * rgb_pixel + weights_slot[..., None] * rgb_slot, -2)
+#
+#     else:
+#         rgb = raw[..., :3]
+#         rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+#         transmittance_cam0 = None
+#         transmittance_samples = None
+#
+#     # at_home
+#     # weights_norm = weights.detach() + 1e-5
+#     weights_norm = weights + 1e-5
+#     weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
+#     depth_map = torch.sum(weights_norm * z_vals, -1)
+#
+#     if render_mask:
+#         density = raw[..., 3]  # [N_rays, N_samples]
+#         mask_map = torch.sum(weights * density, dim=1)  # [N_rays,]
+#     else:
+#         mask_map = None
+#
+#     if return_silhouettes is not None:
+#         masks = return_silhouettes # [K, N, D, H, W]
+#         masks = masks.permute([1, 3, 4, 2, 0]) # [N, H, W, D, K]
+#         weights_silhouettes = weights.view([masks.shape[0], masks.shape[1], masks.shape[2], masks.shape[3]]).unsqueeze(-1) # (NxHxW)xD -> NxHxWxDx1
+#         # print("no masking")
+#         silhouettes = torch.sum(weights_silhouettes, dim=-2) # NxHxWxK
+#         silhouettes = silhouettes.permute([0, 3, 1, 2]) # NxKxHxW
+#     else:
+#         silhouettes = None
+#
+#     return rgb_map, depth_map, weights_norm, mask_map, transmittance_cam0, silhouettes
+
+#
+# def raw2outputs(raw, unmasked_raw, z_vals, rays_d, render_mask=False, weight_pixelfeat=None, raws_slot=None, uvw=None, wuv=None, KNDHW=None,
+#                 return_transmittance_cam0=False, input_transmittance_cam0=None, return_silhouettes=None,
+#                 transmittance_samples=None, masks=None):
+#     """Transforms model's predictions to semantically meaningful values.
+#     Args:
+#         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+#         z_vals: [num_rays, num_samples along ray]. Integration time.
+#         rays_d: [num_rays, 3]. Direction of each ray in cam coor.
+#     Returns:
+#         rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
+#         depth_map: [num_rays]. Estimated distance to object.
+#     """
+#     # uvw: 1x(NxDxHxW)x3
+#     # raw: (NxHxW)xDx4
+#
+#     raw2alpha = lambda x, y: 1. - torch.exp(-x * y)
+#     device = raw.device
+#
+#     dists = z_vals[..., 1:] - z_vals[..., :-1]
+#     dists = torch.cat([dists, torch.tensor([1e-2], device=device).expand(dists[..., :1].shape)], -1)  # [N_rays, N_samples] # add dist 0 in the end
+#
+#     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
+#
+#     # weights = raw2alpha(raw[..., 3], dists)
+#
+#     alpha = raw2alpha(raw[..., 3], dists)  # [N_rays, N_samples]
+#
+#     alpha_slots = [] #[K, N_rays, N_samples]
+#     for raw_slot in unmasked_raw:
+#         alpha_slots.append(raw2alpha(raw_slot[..., 3], dists))
+#
+#     alpha_slots = torch.stack(alpha_slots, 0)
+#
+#     transmittance = torch.cumprod(
+#         torch.cat([torch.ones((alpha.shape[0], 1), device=device), 1. - alpha + 1e-10], dim=-1)
+#         , dim=-1)[:,:-1]
+#     weights = alpha * transmittance # [N_rays, N_samples]
+#
+#     if weight_pixelfeat:
+#         K, N, D, H, W = KNDHW
+#         if input_transmittance_cam0 is not None:
+#             transmittance_cam0 = input_transmittance_cam0
+#         else:
+#             transmittance_cam0 = transmittance.view(N, H, W, D)[0] #HxWxD
+#             transmittance_cam0 = transmittance_cam0.permute([2, 0, 1]).unsqueeze(0).unsqueeze(0) # 1x1xDxHxW
+#
+#         uvw = uvw.unsqueeze(2).unsqueeze(3)  # (1, (NxDxHxW), 1, 1, 3)
+#         # self.latent(B, L, H, W)
+#         transmittance_samples = F.grid_sample(
+#             transmittance_cam0,
+#             uvw,
+#             # align_corners=True,
+#             mode='bilinear',
+#             padding_mode='zeros',
+#         ) # 1x1x(NxDxHxW)x1x1
+#
+#         transmittance_samples = transmittance_samples[0, 0, :, 0, 0] # (NxDxHxW)
+#         transmittance_samples = transmittance_samples.view(N, D, H, W).permute([0, 2, 3, 1]).flatten(0, 2) # (NxHxW)xD
+#
+#         # print(weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean(), 'weights_samples.max(), weights_samples.min(), weights_samples.median(), weights_samples.mean()')
+#         weights_pixel = weights * transmittance_samples
+#         weights_slot = weights * (1.- transmittance_samples)
+#         rgb_pixel = raw[..., :3]
+#         rgb_slot = raws_slot[..., :3]
+#         rgb_map = torch.sum(weights_pixel[..., None] * rgb_pixel + weights_slot[..., None] * rgb_slot, -2)
+#
+#     else:
+#         rgb = raw[..., :3]
+#         rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+#         transmittance_cam0 = None
+#         transmittance_samples = None
+#
+#     # at_home
+#     # weights_norm = weights.detach() + 1e-5
+#     weights_norm = weights + 1e-5
+#     weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
+#     depth_map = torch.sum(weights_norm * z_vals, -1)
+#
+#     if render_mask:
+#         density = raw[..., 3]  # [N_rays, N_samples]
+#         mask_map = torch.sum(weights * density, dim=1)  # [N_rays,]
+#     else:
+#         mask_map = None
+#
+#     if return_silhouettes is not None:
+#         # print("alpha slots")
+#         masks = return_silhouettes # [K, N, D, H, W]
+#
+#         alpha_slots = alpha_slots.view(alpha_slots.shape[0], masks.shape[1], masks.shape[3], masks.shape[4], masks.shape[2]) #[K, N, H, W, D]
+#         #normalized densities
+#         masks = masks.permute([1, 3, 4, 2, 0]) # [N, H, W, D, K]
+#         weights_silhouettes = weights.view([masks.shape[0], masks.shape[1], masks.shape[2], masks.shape[3]]).unsqueeze(-1) # (NxHxW)xD -> NxHxWxDx1
+#         # print("no masking")
+#
+#         transmittance_silhouettes = transmittance.view([masks.shape[0], masks.shape[1], masks.shape[2], masks.shape[3]]).unsqueeze(
+#             0)  # (NxHxW)xD -> 1xNxHxWxD
+#         silhouettes = torch.sum(transmittance_silhouettes*alpha_slots, dim=-1) # KxNxHxW
+#         silhouettes = silhouettes.permute([1, 0, 2, 3]) # NxKxHxW
+#
+#
+#         # silhouettes = torch.sum(transmittance_silhouettes*alpha_slots, dim=-2) # NxHxWxK
+#         # silhouettes = silhouettes.permute([0, 3, 1, 2]) # NxKxHxW
+#     else:
+#         silhouettes = None
+#
+#     return rgb_map, depth_map, weights_norm, mask_map, transmittance_cam0, silhouettes
 
 def raw2transmittances(raw, z_vals, rays_d, uvw, KNDHW, masks):
     """Transforms model's predictions to semantically meaningful values.
@@ -1346,3 +1432,163 @@ class PositionalEncoding(torch.nn.Module):
             conf.get_float("freq_factor", np.pi),
             conf.get_bool("include_input", True),
         )
+
+class CentroidDecoder(nn.Module):
+    def __init__(self, input_dim, z_dim, cam2pixel, world2nss, near, far, small_latent=False, n_layers=3):
+        """
+        input_dim: pos emb dim + slot dim
+        z_dim: network latent dim
+        n_layers: #layers before/after skip connection.
+        """
+        super().__init__()
+
+        latent_dim = z_dim // 2 if small_latent else z_dim
+
+        # [Create centroid decoder]
+        before_skip = [nn.Linear(input_dim, latent_dim), nn.ReLU(True)]
+        after_skip = [nn.Linear(latent_dim + input_dim, latent_dim), nn.ReLU(True)]
+        for i in range(n_layers - 1):
+            before_skip.append(nn.Linear(latent_dim, latent_dim))
+            before_skip.append(nn.ReLU(True))
+            after_skip.append(nn.Linear(latent_dim, latent_dim))
+            after_skip.append(nn.ReLU(True))
+
+        self.p_before = nn.Sequential(*before_skip)
+        self.p_after = nn.Sequential(*after_skip)
+        self.p_after_latent = nn.Linear(latent_dim, latent_dim)
+        self.p_pos = nn.Sequential(nn.Linear(latent_dim, latent_dim // 4),
+                                     nn.ReLU(True),
+                                     nn.Linear(latent_dim // 4, 3))
+
+        # [Set attributes]
+        self.cam2pixel = cam2pixel
+        self.world2nss = world2nss
+        self.near = near
+        self.far = far
+        self.frustum_size = None
+        self.cam2world = None
+
+    def forward(self, p_slots):
+
+        assert p_slots is not None
+        p_fg = p_slots[1:]  # (K-1)xC
+        tmp = self.p_before(p_fg)
+        tmp = self.p_after(torch.cat([p_fg, tmp], dim=1))
+        latent = self.p_after_latent(tmp)
+        fg_pos = self.p_pos(latent)
+        fg_pos = fg_pos.sigmoid() # (K-1)x3
+
+        cam02world = self.cam2world[0]  # 4x4
+        world2cam = self.cam2world.inverse()  # Nx4x4
+        cam2pixel = self.cam2pixel[None]  # 1x4x4
+        pixel2cam = self.cam2pixel.inverse()  # 1x4x4
+
+        frustum_size = self.frustum_size
+
+        # [Project predicted centroid]
+        z_cam = fg_pos[..., -1] * (self.far - self.near) + self.near  # (K-1)
+        fg_pos = fg_pos * (frustum_size.unsqueeze(0) - 1)  # [0, 1] -> [0, frustum_size]
+
+        unorm_fg_pos = torch.zeros_like(fg_pos)  # (K-1)x3
+        unorm_fg_pos[..., 0:2] = fg_pos[..., 0:2] * z_cam.unsqueeze(-1)
+        unorm_fg_pos[..., 2] = z_cam
+
+        fg_pixel0_pos = torch.cat([unorm_fg_pos, torch.ones_like(fg_pos[:, 0:1])], dim=-1)  # (K-1)x4
+        fg_pixel0_pos = fg_pixel0_pos.permute(1, 0)  # 4x(K-1)
+        fg_cam0_pos = torch.matmul(pixel2cam, fg_pixel0_pos)  # 4x4, 4x(K-1) -> 4x(K-1)
+        fg_centroid_world = torch.matmul(cam02world, fg_cam0_pos)  # 4x4, 4x(K-1) -> 4x(K-1)
+        fg_centroid_cam = torch.matmul(world2cam, fg_centroid_world)  # Nx4x4,4x(K-1) -> Nx4x(K-1)
+        fg_centroid_pixel = torch.matmul(cam2pixel, fg_centroid_cam)  # 1x4x4, Nx4x(K-1) -> Nx4x(K-1)
+        fg_centroid_pixel = fg_centroid_pixel.permute(0, 2, 1)  # Nx(K-1)x4
+
+        fg_centroid_pixel = fg_centroid_pixel[:, :, 0:2] / fg_centroid_pixel[:, :, 2:3]  # Nx(K-1)x2
+        fg_centroid_pixel = torch.flip(fg_centroid_pixel, dims=(-1,))
+
+        fg_centroid_nss = torch.matmul(self.world2nss, fg_centroid_world)  # 1x4x4, 4x(K-1) -> 1x4x(K-1)
+
+        fg_centroid_world = fg_centroid_world.permute(1, 0) # (K-1)x4
+        fg_centroid_nss = fg_centroid_nss[0].permute(1, 0)  # (K-1)x4
+
+        return fg_centroid_world, fg_centroid_nss, fg_centroid_pixel
+
+    def transform_coords(self, coords, centroids):
+        # coords: (K-1)xPx3,  cenroids: (K-1)x4
+        centroids = centroids[:, 0:3].unsqueeze(1)  # (K-1)x1x3
+        return coords - centroids  # (K-1)xPx3
+
+    def centroid_loss(self, centroid_pixel, margin, segment_centers, segment_masks, epoch):
+        # Target centroid positions
+        target_pos = segment_centers[:, 1:]  # Nx(K-1)x2
+        segment_area = segment_masks[:, 1:].sum(-1)  # Nx(K-1)x1
+        loss_mask = (segment_area > 0).float().detach()
+
+        # Normalize coordinates:
+        pixel_pos = centroid_pixel / self.frustum_size[0:2].view(1, 1, 2)
+        target_pos = target_pos / self.frustum_size[0:2].view(1, 1, 2)
+
+        # Loss as the euclidean distance between the predicted and target centroid positions
+        distance = ((pixel_pos - target_pos) ** 2).sum(-1) ** 0.5
+        self.loss_centroid_raw = (distance - margin).clamp(min=0.) * loss_mask
+        self.loss_centroid = ((distance - margin).clamp(min=0.) * loss_mask).sum()
+
+        # [Visualization]
+        if not os.path.exists('tmp/%d.png' % epoch):
+            self.visualize_centroid(pixel_pos, target_pos, segment_masks, epoch=epoch)
+
+        return self.loss_centroid
+
+    def visualize_centroid(self, pred_center, target_center, segment_masks, epoch, savedir=None):
+        if True:
+            pass
+        else:
+            fig, axs = plt.subplots(segment_masks.shape[0], segment_masks.shape[1], figsize=(5, 5))  # Nx3
+
+            center_x = target_center[..., 0] * self.frustum_size[0]  # Nx3
+            center_y = target_center[..., 1] * self.frustum_size[1]  # Nx3
+
+            pred_x = pred_center[..., 0] * self.frustum_size[0]  # Nx3
+            pred_y = pred_center[..., 1] * self.frustum_size[1]  # Nx3
+
+            for i in range(segment_masks.shape[0]):
+                _x = ((self.x[i] + 1) / 2).clone()
+
+                axs[i, 0].imshow(_x.permute(1, 2, 0).cpu())
+                axs[i, 0].set_axis_off()
+                for j in range(1, segment_masks.shape[1]):
+                    axs[i, j].imshow(segment_masks[i, j].cpu().reshape([int(self.frustum_size[0]), int(self.frustum_size[1])]))
+                    center = [center_y[i, j - 1], center_x[i, j - 1]]
+                    pred = [pred_y[i, j - 1], pred_x[i, j - 1]]
+                    axs[i, j].add_patch(plt.Circle(center, 2.0, color='g'))
+                    axs[i, j].add_patch(plt.Circle(pred, 2.0, color='r'))
+                    axs[i, j].set_axis_off()
+                    axs[i, j].set_title('dist: %.2f' % self.loss_centroid_raw[i, j-1], fontsize=10)
+            plt.show()
+            fig.suptitle('Centroid loss: %.3f' % self.loss_centroid)
+            if savedir is None:
+                plt.savefig('tmp/%d.png' % epoch, bbox_inches='tight')
+            else:
+                plt.savefig('tmp/%s.png' % savedir, bbox_inches='tight')
+
+            plt.close()
+
+        # Save data for visualization
+        # data = {
+        #     'img': (self.x + 1) / 2,
+        #     'world_pos': world_pos,
+        #     'segment': segment_masks
+        # }
+        # print('Save data to ', './save_tensor/%d.pt' % epoch)
+        # torch.save(data, './save_tensor/%d.pt' % epoch)
+
+        # Visualize the line of projection with varying depth
+        # if epoch > 100000:
+        #
+        #     num = 20
+        #     interval = 1.0 / num
+        #     temp_pos = save_fg_pos.clone()
+        #
+        #     for i in range(num):
+        #         temp_pos[:, -1] = i * interval
+        #         temp_uv = project_pos(temp_pos)
+        #         plot(temp_uv, savedir='%d-%d' % (epoch, i))
+        #     breakpoint()

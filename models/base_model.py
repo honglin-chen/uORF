@@ -102,7 +102,7 @@ class BaseModel(ABC):
         """
         with torch.no_grad():
             self.forward()
-            self.compute_visuals()
+            # self.compute_visuals()
 
     def compute_visuals(self):
         """Calculate additional output images for visdom and HTML visualization"""
@@ -118,7 +118,8 @@ class BaseModel(ABC):
             if self.opt.lr_policy == 'plateau':
                 scheduler.step(self.metric)
             else:
-                scheduler.step()
+                pass
+                # scheduler.step()
 
         # lr = self.optimizers[0].param_groups[0]['lr']
         # print('learning rate = %.7f' % lr)

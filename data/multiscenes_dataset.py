@@ -139,6 +139,8 @@ class MultiscenesDataset(BaseDataset):
                 onehot_labels = mask_flat[:, None] == greyscale_dict  # HWx8, one-hot
                 onehot_labels = onehot_labels.type(torch.uint8)
                 mask_idx = onehot_labels.argmax(dim=1)  # HW
+
+                #TODO: do not do this. It causes unexpected behavior for someone who doesn't know about this codebase.
                 bg_color = greyscale_dict[0] if 'tdw' in mask_path else greyscale_dict[1]
                 fg_idx = mask_flat != bg_color  # HW
                 ret['mask_idx'] = mask_idx

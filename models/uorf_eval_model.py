@@ -5,10 +5,13 @@ from torch import nn
 import torch.nn.functional as F
 from .base_model import BaseModel
 from . import networks
+from termcolor import colored
 import os
 import time
+# from .projection import Projection
 from .projection import Projection
-from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder, raw2transmittances, raw2colors
+from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder, raw2transmittances, raw2colors, CentroidDecoder
+from .position_encoding import position_encoding_image
 import pdb
 from util import util
 # from .model import Encoder, Decoder, SlotAttention, raw2outputs
@@ -17,6 +20,30 @@ from sklearn.metrics import adjusted_rand_score
 import lpips
 from piq import ssim as compute_ssim
 from piq import psnr as compute_psnr
+
+def positionalencoding2d(d_model, height, width):
+    """
+    :param d_model: dimension of the model
+    :param height: height of the positions
+    :param width: width of the positions
+    :return: d_model*height*width position matrix
+    """
+    if d_model % 4 != 0:
+        raise ValueError("Cannot use sin/cos positional encoding with "
+                         "odd dimension (got dim={:d})".format(d_model))
+    pe = torch.zeros(d_model, height, width)
+    # Each dimension use half of d_model
+    d_model = int(d_model / 2)
+    div_term = torch.exp(torch.arange(0., d_model, 2) *
+                         -(math.log(10000.0) / d_model))
+    pos_w = torch.arange(0., width).unsqueeze(1)
+    pos_h = torch.arange(0., height).unsqueeze(1)
+    pe[0:d_model:2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[1:d_model:2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[d_model::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+    pe[d_model + 1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+
+    return pe
 
 class DiceLoss(nn.Module):
     def __init__(self, weight=None, size_average=True):
@@ -119,6 +146,28 @@ class uorfEvalModel(BaseModel):
         parser.add_argument('--combine_masks', action='store_true', help='combine all the masks for pixel nerf')
         parser.add_argument('--weight_pixel_slot_mask', action='store_true')
 
+        parser.add_argument('--silhouette_loss_nobackprop', action='store_true',
+                            help='only compute but do not back propagate silhouette loss')
+        parser.add_argument('--bg_no_silhouette_loss', action='store_true',
+                            help='do not include bg in the silhouette loss')
+        parser.add_argument('--silhouette_epoch', type=int, default=100)
+        parser.add_argument('--mask_div_by_mean', action='store_true')
+        parser.add_argument('--only_make_silhouette_not_delete', action='store_true')
+        parser.add_argument('--weight_silhouette_loss', action='store_true')
+        parser.add_argument('--threshold_silhouette_loss', action='store_true')
+        parser.add_argument('--mask_image_slot', action='store_true')
+        parser.add_argument('--nearest_interp', action='store_true', help='put nearest interp for pixel and so on')
+        parser.add_argument('--slot_positional_encoding', action='store_true', help='put 2d positional encoding')
+        parser.add_argument('--mask_image_feature_slot', action='store_true')
+        parser.add_argument('--predict_centroid', action='store_true')
+        parser.add_argument('--learn_only_centroid', action='store_true',
+                            help='loss function contains only centroid loss')
+
+        parser.add_argument('--loss_centroid_margin', type=float, default=0.05, help='max margin for the centroid loss')
+        parser.add_argument('--progressive_silhouette', action='store_true',
+                            help='epoch 0-10: learn only fg silhouette, epoch 10-20: learn silhouette and rgb, epoch 20- rgb')
+        parser.add_argument('--learn_fg_first', action='store_true')
+
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -174,11 +223,60 @@ class uorfEvalModel(BaseModel):
             self.nets.append(self.netEncoder)
             self.model_names.append('Encoder')
 
+        if self.opt.slot_positional_encoding:
+            # [Position encoding]
+            p_dim = z_dim
+            if self.opt.resnet_encoder:
+                self.pos_emb = position_encoding_image(size=[opt.input_size // 2, opt.input_size // 2],
+                                                       num_pos_feats=p_dim // 2).to(
+                    self.device)
+            else:
+                self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size],
+                                                       num_pos_feats=p_dim // 2).to(self.device)
+            slot_in_dim = z_dim + p_dim
+            slot_slot_dim = p_dim
+        else:
+            slot_in_dim = z_dim
+            slot_slot_dim = z_dim
+
+        if self.opt.predict_centroid:
+            p_dim = z_dim
+            self.netSlotAttention_pos = networks.init_net(
+                SlotAttention(num_slots=opt.num_slots, in_dim=p_dim + z_dim, slot_dim=p_dim, iters=opt.attn_iter,
+                              gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
+            self.nets.append(self.netSlotAttention_pos)
+            self.parameters.append(self.netSlotAttention_pos.parameters())
+            self.model_names.append('SlotAttention_pos')
+
+            self.netCentroidDecoder = networks.init_net(
+                CentroidDecoder(input_dim=p_dim,
+                                z_dim=p_dim,
+                                cam2pixel=self.projection.cam2spixel,
+                                world2nss=self.projection.world2nss,
+                                near=self.projection.near,
+                                far=self.projection.far,
+                                small_latent=self.opt.small_latent,
+                                n_layers=opt.n_layer),
+                gpu_ids=self.gpu_ids, init_type='xavier')
+            self.parameters.append(self.netCentroidDecoder.parameters())
+            self.nets.append(self.netCentroidDecoder)
+            self.model_names.append('CentroidDecoder')
+
+            if not self.opt.slot_positional_encoding:
+
+                if self.opt.resnet_encoder:
+                    self.pos_emb = position_encoding_image(size=[opt.input_size // 2, opt.input_size // 2],
+                                                           num_pos_feats=p_dim // 2).to(self.device)
+                else:
+                    self.pos_emb = position_encoding_image(size=[opt.input_size, opt.input_size],
+                                                           num_pos_feats=p_dim // 2).to(self.device)
+
         # [Slot attention]
         self.num_slots = opt.num_slots
         if not self.opt.without_slot_feature:
+
             self.netSlotAttention = networks.init_net(
-                SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter,
+                SlotAttention(num_slots=opt.num_slots, in_dim=slot_in_dim, slot_dim=slot_slot_dim, iters=opt.attn_iter,
                               gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
             self.nets.append(self.netSlotAttention)
             self.parameters.append(self.netSlotAttention.parameters())
@@ -186,6 +284,7 @@ class uorfEvalModel(BaseModel):
 
         # [Pixel Encoder]
         if not self.opt.uorf:
+            colored("pix enc", 'red')
             self.netPixelEncoder = networks.init_net(
                 PixelEncoder(mask_image=self.opt.mask_image, mask_image_feature=self.opt.mask_image_feature),
                 gpu_ids=self.gpu_ids, init_type='None')
@@ -252,16 +351,16 @@ class uorfEvalModel(BaseModel):
         self.LPIPS_loss = lpips.LPIPS().cuda()
         self.dice_loss = DiceLoss()
 
-        # [Extract Mesh]
-        if self.opt.extract_mesh:
-            self.opt.gt_seg = True
-            self.opt.pixel_encoder = True
-            self.opt.mask_image_feature = True
-            self.opt.mask_image = True
-            self.opt.use_ray_dir = True
-            self.opt.silhouette_loss = True
-            self.opt.weight_pixelfeat = True
-            self.opt.bg_no_pixel = True
+        # # [Extract Mesh]
+        # if self.opt.extract_mesh:
+        #     self.opt.gt_seg = True
+        #     self.opt.pixel_encoder = True
+        #     self.opt.mask_image_feature = False
+        #     self.opt.mask_image = True
+        #     self.opt.use_ray_dir = True
+        #     self.opt.silhouette_loss = True
+        #     self.opt.weight_pixelfeat = False
+        #     self.opt.bg_no_pixel = True
 
     def setup(self, opt):
         """Load and print networks; create schedulers
@@ -294,7 +393,7 @@ class uorfEvalModel(BaseModel):
             self.obj_idxs = input['obj_idxs']  # NxKxHxW
 
         if 'masks' in input.keys():
-            bg_masks = input['bg_mask'][0:1].to(self.device)
+            bg_masks = input['bg_mask'][0:1].to(self.device)*0
             obj_masks = input['obj_masks'][0:1].to(self.device)
             masks = torch.cat([bg_masks, obj_masks], dim=1)
             if self.opt.combine_masks:
@@ -316,7 +415,7 @@ class uorfEvalModel(BaseModel):
             masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode='nearest')
             self.masks = masks.flatten(2, 3)
 
-            bg_masks = input['bg_mask'].to(self.device)
+            bg_masks = input['bg_mask'].to(self.device)*0
             obj_masks = input['obj_masks'].to(self.device)
             masks = torch.cat([bg_masks, obj_masks], dim=1)
             if self.opt.combine_masks:
@@ -331,7 +430,6 @@ class uorfEvalModel(BaseModel):
             masks = F.interpolate(masks.float(), size=[64, 64], mode=mode_)
             self.silhouette_masks = masks
 
-
     def forward(self, epoch=0, frus_nss_coor=None):
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
         dev = self.x[0:1].device
@@ -343,13 +441,16 @@ class uorfEvalModel(BaseModel):
             attn_bg, attn_fg = masks[:, 0:1], masks[:, 1:]
             attn = torch.cat([attn_bg, attn_fg], dim=1)
 
-        if self.opt.resnet_encoder:
-            attn = attn.view([1, self.opt.num_slots, self.opt.input_size, self.opt.input_size])
-            attn = attn.transpose(0, 1)
-            attn = F.interpolate(attn, size=self.opt.input_size//2, mode='nearest')
-            attn = attn.transpose(0, 1).flatten(2, 3)
-
         # Encoding images
+        if self.opt.mask_image_slot or self.opt.mask_image_feature_slot:
+            assert self.opt.resnet_encoder
+            if self.opt.resnet_encoder:
+                masks_slot = attn
+            else:
+                masks_slot = self.masks.squeeze(0)
+        else:
+            masks_slot = None
+
         feature_map = self.netEncoder(F.interpolate(self.x[0:1], size=self.opt.input_size, mode='bilinear', align_corners=False))  # BxCxHxW
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
@@ -379,16 +480,23 @@ class uorfEvalModel(BaseModel):
 
         # Get rays and coordinates
         cam2world = self.cam2world
+        print("cam2world.shape", cam2world.shape)
         N = cam2world.shape[0]
         W, H, D = self.projection.frustum_size
         scale = H // self.opt.render_size
         if self.opt.extract_mesh:
-            frus_nss_coor, z_vals, ray_dir = self.projection_mesh.construct_sampling_coor(cam2world, partitioned=True)
+            frus_nss_coor, z_vals, ray_dir, frus_nss_coor_orig, frus_world_coor_orig = self.projection_mesh.construct_sampling_coor(cam2world, partitioned=True)
         else:
-            frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world, partitioned=True)
+            frus_nss_coor, z_vals, ray_dir, frus_nss_coor_orig, frus_world_coor_orig = self.projection.construct_sampling_coor(cam2world, partitioned=True)
+
+        # print(nss2cam0.shape, frus_world_coor_orig.shape)
+        #
+        # frus_world_coor_orig = torch.matmul(nss2cam0[0],\
+        #                                     frus_world_coor_orig[0, :3])
         # 4x(NxDx(H/2)x(W/2))x3, 4x(Nx(H/2)x(W/2))xD, 4x(Nx(H/2)x(W/2))x3
         x = self.x
         x_recon = torch.zeros([N, 3, H, W], device=dev)
+        depth_rendered = torch.zeros([N, H, W], device=dev)
         rendered = torch.zeros([N, 3, H, W], device=dev)
         masked_raws = torch.zeros([K, N, D, H, W, 4], device=dev)
         unmasked_raws = torch.zeros([K, N, D, H, W, 4], device=dev)
@@ -404,18 +512,22 @@ class uorfEvalModel(BaseModel):
         silhouettes = torch.zeros([N, K, H, W], device=dev)
 
         # if self.opt.extract_mesh:
-        #     raw_masks_density = torch.zeros([K, N, D, H, W, 1])
+        raw_masks_density = torch.zeros([K, N, D, H, W, 1])
 
         # print(K, N, D, H, W, 'K, N, D, H, W')
 
         raw_masks_density_list = []
         pixel_feat_list = []
 
+        # print("frus_nss_coor", frus_nss_coor.shape, z_vals.shape, ray_dir.shape)
 
         for (j, (frus_nss_coor_, z_vals_, ray_dir_)) in enumerate(zip(frus_nss_coor, z_vals, ray_dir)):
             # print(j, 'j')
             h, w = divmod(j, scale)
+            # print("h, w", h, w, "frus_nss_coor_", frus_nss_coor_.shape)
             H_, W_ = H // scale, W // scale
+
+            #exapnd for each obj
             sampling_coor_fg_ = frus_nss_coor_[None, ...].expand(K - 1, -1, -1)  # (K-1)xPx3
             sampling_coor_bg_ = frus_nss_coor_  # Px3
 
@@ -464,25 +576,22 @@ class uorfEvalModel(BaseModel):
 
                     uvw[:, :, :, h::scale, w::scale, :] = uvw_.view([1, N, D, H_, W_, 3])
 
-                if self.opt.mask_image or self.opt.mask_image_feature:
-                    uv_ = uv_.expand(K, -1, -1)  # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
-                    pixel_feat_ = self.netPixelEncoder.index(uv_)  # Kx(NxDxHxW)x2 -> KxCx(NxDxHxW)
-                    pixel_feat_ = pixel_feat_.transpose(1, 2)
+                if self.opt.pixel_encoder:
+                    if self.opt.mask_image or self.opt.mask_image_feature:
+                        uv_ = uv_.expand(K, -1, -1)  # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
+                        uv_ind, pixel_feat_ = self.netPixelEncoder.index(uv_)  # Kx(NxDxHxW)x2 -> KxCx(NxDxHxW)
+                        pixel_feat_ = pixel_feat_.transpose(1, 2)
+                    else:
+                        pixel_feat_ = self.netPixelEncoder.index(uv_)  # 1x(NxDxHxW)x2 -> 1xCx(NxDxHxW)
+                        pixel_feat_ = pixel_feat_.transpose(1, 2)  # 1x(NxDxHxW)xC
+                        pixel_feat_ = pixel_feat_.expand(K, -1, -1)  # Kx(NxDxHxW)xC
+                        uv_ = uv_.expand(K, -1, -1)
                 else:
-                    pixel_feat_ = self.netPixelEncoder.index(uv_)  # 1x(NxDxHxW)x2 -> 1xCx(NxDxHxW)
-                    pixel_feat_ = pixel_feat_.transpose(1, 2)  # 1x(NxDxHxW)xC
-                    pixel_feat_ = pixel_feat_.expand(K, -1, -1)  # Kx(NxDxHxW)xC
                     uv_ = uv_.expand(K, -1, -1)
 
-                if self.opt.mask_as_decoder_input or self.opt.weight_pixel_slot_mask:
-                    silhouette0 = self.silhouette_masks[0:1].transpose(0, 1)  # Kx1xHxW
-                    # uv = uv.unsqueeze(1)  # Kx1x(NxDxHxW)x2
-                    silhouettes_for_density_ = F.grid_sample(silhouette0, uv_.unsqueeze(1), mode='bilinear',
-                                                            padding_mode='zeros', )  # Kx1(C)x1x(NxDxHxW)
-                    silhouettes_for_density_ = silhouettes_for_density_.flatten(0, 3).view(K, N, D, H_, W_).permute(
-                        [1, 2, 0, 3, 4])  # NxDxKxHxW  # NxDxKxHxW
-                else:
-                    silhouettes_for_density_ = None
+                # uv_ind
+
+                silhouettes_for_density_ = None
 
                 if self.opt.unified_decoder:
                     if self.opt.debug2:
@@ -506,222 +615,40 @@ class uorfEvalModel(BaseModel):
                     rgb_map_, depth_map_, _, _, _, silhouettes_ = raw2outputs(raws_, z_vals_, ray_dir_,
                                                                            return_silhouettes=masks_for_silhouette_)
                     rendered_ = rgb_map_.view(N, H_, W_, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+                    depth_rendered_ = depth_map_.view(N, H_, W_)#.permute([0, 3, 1, 2])  # Nx3xHxW
                     x_recon_ = rendered_ * 2 - 1
+                    # print("depth_map_.shape", depth_map_.shape, "rgb_map_", rgb_map_.shape)
                     x_recon[..., h::scale, w::scale] = x_recon_
+                    depth_rendered[..., h::scale, w::scale] = depth_rendered_
                     silhouettes[..., h::scale, w::scale] = silhouettes_ # NxKxHxW
+                    # if self.opt.extract_mesh:
                     raw_masks_density_list.append(masked_raws_[..., -1:])
-
-                else:
-                    raws_density_, masked_raws_density_, unmasked_raws_density_, masks_for_silhouette_density_, raw_masks_density_ = \
-                        self.netDensityDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat_,
-                                               ray_dir_input=ray_dir_input_, decoder_type='density')
-
-                    raws_density_ = raws_density_.view([N, D, H_, W_, 4])
-                    masks_for_silhouette_density_ = masks_for_silhouette_density_.view([K, N, D, H_, W_])
-                    raws_density[:, :, h::scale, w::scale, :] = raws_density_
-                    masks_for_silhouette_density[:, :, :, h::scale, w::scale] = masks_for_silhouette_density_
-
-                    raw_masks_density_list.append(raw_masks_density_)
-                    if not self.opt.extract_mesh:
-                        pixel_feat_list.append(pixel_feat_)
-                        z_vals_not_partitioned[:, h::scale, w::scale, :] = z_vals_.view([N, H_, W_, D])
-                        ray_dir_not_partitioned[:, h::scale, w::scale, :] = ray_dir_.view([N, H_, W_, 3])
-                    # raw_masks_density[:, :, :, h::scale, w::scale, :] = raw_masks_density_.view(K, N, D, H_, W_, 1)
+                    raw_masks_density[:, :, :, h::scale, w::scale, :] = masked_raws_[..., -1:].view(K, N, D, H_, W_, 1)
 
         if self.opt.extract_mesh:
-            return raw_masks_density_list
-        if self.opt.unified_decoder:
-            pass
+            strin = 'mesh_' + str(self.opt.skip) + '_'
         else:
-            raws_density = raws_density.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-            uvw = uvw.view([1, N, D, H, W, 3]).flatten(1, 4)
-            uv = uvw[..., 0:2].expand(K, -1, -1)
+            strin = str(self.opt.skip) + '_'
 
-            z_vals_not_partitioned = z_vals_not_partitioned.flatten(0, 2)
-            ray_dir_not_partitioned = ray_dir_not_partitioned.flatten(0, 2)
+        # if self.opt.extract_mesh:
+        print(raw_masks_density.shape, 'raw_masks_density.shape', "self.opt.skip", self.opt.skip)
 
-            weights, transmittance_samples, silhouettes = \
-                raw2transmittances(raws_density, z_vals_not_partitioned, ray_dir_not_partitioned, uvw=uvw, KNDHW=(K, N, D, H, W),
-                                   masks=masks_for_silhouette_density)
-
-            transmittance_samples = transmittance_samples.view([N, H, W, D]).permute([0, 3, 1, 2]).flatten(0, 3)[
-                None, ..., None]  # 1x(NxDxHxW)x1
-
-            silhouette0 = silhouettes[0:1].transpose(0, 1)  # Kx1xHxW
-            uv = uv.unsqueeze(1)  # Kx1x(NxDxHxW)x2
-            silhouettes_for_color = F.grid_sample(silhouette0, uv, mode='bilinear',
-                                                  padding_mode='zeros', )  # Kx1(C)x1x(NxDxHxW)
-            silhouettes_for_color = silhouettes_for_color.flatten(0, 3).view(K, N, D, H, W).permute(
-                [1, 2, 0, 3, 4])  # NxDxKxHxW
-
-            for (j, (frus_nss_coor_, z_vals_, ray_dir_)) in enumerate(zip(frus_nss_coor, z_vals, ray_dir)):
-                h, w = divmod(j, scale)
-                H_, W_ = H // scale, W // scale
-                sampling_coor_fg_ = frus_nss_coor_[None, ...].expand(K - 1, -1, -1)  # (K-1)xPx3
-                sampling_coor_bg_ = frus_nss_coor_  # Px3
-
-                if self.opt.use_ray_dir:
-                    ray_dir_input_ = ray_dir_.view([N, H_, W_, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
-                    ray_dir_input_ = ray_dir_input_.flatten(0, 3)
-                else:
-                    ray_dir_input_ = None
-
-                pixel_feat_ = pixel_feat_list[j]
-                raw_masks_density_ = raw_masks_density_list[j]
-                # raw_masks_density_ = raw_masks_density[:, :, :, h::scale, w::scale, :].flatten(1, 4)
-                silhouettes_for_color_ = silhouettes_for_color[:, :, :, h::scale, w::scale] # NxDxKxHxW
-                transmittance_samples_ = transmittance_samples.view([N, D, H, W])[:, :, h::scale, w::scale].flatten(0, 3)[
-                None, ..., None]
-
-                raws_color_, masked_raws_color_, unmasked_raws_color_, masks_for_silhouette_color_ = \
-                    self.netColorDecoder(sampling_coor_bg_, sampling_coor_fg_, z_slots, nss2cam0, pixel_feat=pixel_feat_,
-                                         ray_dir_input=ray_dir_input_, transmittance_samples=transmittance_samples_,
-                                         raw_masks_density=raw_masks_density_,
-                                         silhouettes=silhouettes_for_color_,
-                                         decoder_type='color')
-
-                raws_ = raws_color_.view([N, D, H_, W_, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0,
-                                                                                         end_dim=2)  # (NxHxW)xDx4
-                masked_raws_ = masked_raws_color_.view([K, N, D, H_, W_, 4])
-                unmasked_raws_ = unmasked_raws_color_.view([K, N, D, H_, W_, 4])
-                masked_raws[..., h::scale, w::scale, :] = masked_raws_
-                unmasked_raws[..., h::scale, w::scale, :] = unmasked_raws_
-                masks_for_silhouette_ = masks_for_silhouette_color_.view([K, N, D, H_, W_])
-
-                weights_ = weights.view([N, H, W, D])[:, h::scale, w::scale, :] # [N_rays, N_samples]
-                weights_ = weights_.flatten(0, 2)
-
-                rgb_map_, _, _, _, = raw2colors(raws_, weights_, z_vals_)
-
-                rendered_ = rgb_map_.view(N, H_, W_, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                x_recon_ = rendered_ * 2 - 1
-                x_recon[..., h::scale, w::scale] = x_recon_
-
-        x_recon_novel, x_novel = x_recon[1:], F.interpolate(x[1:], size=[self.opt.frustum_size, self.opt.frustum_size], mode='bilinear')
-        self.loss_recon = self.L2_loss(x_recon_novel, x_novel)
-        self.loss_lpips = self.LPIPS_loss(x_recon_novel, x_novel).mean()
-        self.loss_psnr = compute_psnr(x_recon_novel / 2 + 0.5, x_novel / 2 + 0.5, data_range=1.)
-        self.loss_ssim = compute_ssim(x_recon_novel / 2 + 0.5, x_novel / 2 + 0.5, data_range=1.)
-
-        if self.opt.silhouette_loss:
-            if self.opt.dice_loss:
-                self.loss_silhouette = self.dice_loss(self.silhouette_masks_fine, silhouettes) # NxKxHxW # 128x128
-                print('dice_loss : ', self.loss_silhouette)
-            else:
-                self.loss_silhouette = self.L1_loss(self.silhouette_masks_fine, silhouettes) # NxKxHxW
-                print('L1_loss : ', self.loss_silhouette)
-
-
-        with torch.no_grad():
-            for i in range(self.opt.n_img_each_scene):
-                setattr(self, 'x_rec{}'.format(i), x_recon[i])
-                if i == 0:
-                    setattr(self, 'input_image', F.interpolate(x[i].unsqueeze(0), size=[self.opt.frustum_size, self.opt.frustum_size], mode='bilinear').squeeze(0))
-                else:
-                    setattr(self, 'gt_novel_view{}'.format(i), F.interpolate(x[i].unsqueeze(0), size=[self.opt.frustum_size, self.opt.frustum_size], mode='bilinear').squeeze(0))
-            setattr(self, 'masked_raws', masked_raws.detach())
-            setattr(self, 'unmasked_raws', unmasked_raws.detach())
-
-
-    def compute_visuals(self):
-        with torch.no_grad():
-            cam2world = self.cam2world[:self.opt.n_img_each_scene]
-            _, N, D, H, W, _ = self.masked_raws.shape
-            masked_raws = self.masked_raws  # KxNxDxHxWx4
-            mask_maps = []
-            for k in range(self.num_slots):
-                raws = masked_raws[k]  # NxDxHxWx4
-                _, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
-                raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                rgb_map, depth_map, _, mask_map, _, _ = raw2outputs(raws, z_vals, ray_dir, render_mask=True)
-                mask_maps.append(mask_map.view(N, H, W))
-                rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                x_recon = rendered * 2 - 1
-                for i in range(self.opt.n_img_each_scene):
-                    setattr(self, 'slot{}_view{}'.format(k, i), x_recon[i])
-
-            mask_maps = torch.stack(mask_maps)  # KxNxHxW
-            mask_idx = mask_maps.cpu().argmax(dim=0)  # NxHxW
-            predefined_colors = []
-            obj_idxs = self.obj_idxs  # Kx1xHxW
-            gt_mask0 = self.gt_masks[0]  # 3xHxW
-            for k in range(self.num_slots):
-                mask_idx_this_slot = mask_idx[0:1] == k  # 1xHxW
-                iou_this_slot = []
-                for kk in range(self.num_slots):
-                    try:
-                        obj_idx = obj_idxs[kk, ...]  # 1xHxW
-                    except IndexError:
-                        break
-                    iou = (obj_idx & mask_idx_this_slot).type(torch.float).sum() / (obj_idx | mask_idx_this_slot).type(torch.float).sum()
-                    iou_this_slot.append(iou)
-                target_obj_number = torch.tensor(iou_this_slot).argmax()
-                target_obj_idx = obj_idxs[target_obj_number, ...].squeeze()  # HxW
-                obj_first_pixel_pos = target_obj_idx.nonzero()[0]  # 2
-                obj_color = gt_mask0[:, obj_first_pixel_pos[0], obj_first_pixel_pos[1]]
-                predefined_colors.append(obj_color)
-            predefined_colors = torch.stack(predefined_colors).permute([1,0])
-            mask_visuals = predefined_colors[:, mask_idx]  # 3xNxHxW
-
-            nvari_meter = AverageMeter()
-            for i in range(N):
-                setattr(self, 'render_mask{}'.format(i), mask_visuals[:, i, ...])
-                setattr(self, 'gt_mask{}'.format(i), self.gt_masks[i])
-                this_mask_idx = mask_idx[i].flatten(start_dim=0)
-                gt_mask_idx = self.mask_idx[i]  # HW
-                fg_idx = self.fg_idx[i]
-                fg_idx_map = fg_idx.view([self.opt.frustum_size, self.opt.frustum_size])[None, ...]
-                fg_map = mask_visuals[0:1, i, ...].clone()
-                fg_map[fg_idx_map] = -1.
-                fg_map[~fg_idx_map] = 1.
-                setattr(self, 'bg_map{}'.format(i), fg_map)
-                if i == 0:
-                    ari_score = adjusted_rand_score(gt_mask_idx, this_mask_idx)
-                    fg_ari = adjusted_rand_score(gt_mask_idx[fg_idx], this_mask_idx[fg_idx])
-                    self.loss_ari = ari_score
-                    self.loss_fgari = fg_ari
-                else:
-                    ari_score = adjusted_rand_score(gt_mask_idx, this_mask_idx)
-                    nvari_meter.update(ari_score)
-                self.loss_nvari = nvari_meter.val
-
-    def backward(self):
-        pass
-
-    def optimize_parameters(self, ret_grad=False, epoch=0):
-        """Update network weights; it will be called in every training iteration."""
-        self.forward(epoch)
-        for opm in self.optimizers:
-            opm.zero_grad()
-        self.backward()
-        avg_grads = []
-        layers = []
-        if ret_grad:
-            for n, p in chain(self.netEncoder.named_parameters(), self.netSlotAttention.named_parameters(), self.netDecoder.named_parameters()):
-                if p.grad is not None and "bias" not in n:
-                    with torch.no_grad():
-                        layers.append(n)
-                        avg_grads.append(p.grad.abs().mean().cpu().item())
-        for opm in self.optimizers:
-            opm.step()
-        return layers, avg_grads
-
-    def save_networks(self, surfix):
-        """Save all the networks to the disk.
-
-        Parameters:
-            surfix (int or str) -- current epoch; used in the file name '%s_net_%s.pth' % (epoch, name)
-        """
-        super().save_networks(surfix)
-        for i, opm in enumerate(self.optimizers):
-            save_filename = '{}_optimizer_{}.pth'.format(surfix, i)
-            save_path = os.path.join(self.save_dir, save_filename)
-            torch.save(opm.state_dict(), save_path)
-
-        for i, sch in enumerate(self.schedulers):
-            save_filename = '{}_lr_scheduler_{}.pth'.format(surfix, i)
-            save_path = os.path.join(self.save_dir, save_filename)
-            torch.save(sch.state_dict(), save_path)
+        # strin += '_' +
+        import numpy as np
+        if not os.path.exists('../results'):
+            os.makedirs("../results")
+        np.save("../results/" + strin + "uv_.npy", uv_.detach().cpu().numpy())
+        np.save("../results/" + strin + "cam2spixel.npy", self.cam2spixel.detach().cpu().numpy())
+        np.save("../results/" + strin + "world2cam0.npy", cam2world.detach().cpu().numpy())
+        np.save("../results/" + strin + "depth.npy", depth_rendered.detach().cpu().numpy())
+        np.save("../results/" + strin + "frus_nss_coor.npy", frus_nss_coor_orig.detach().cpu().numpy())
+        np.save("../results/" + strin + "frus_world_coor.npy", frus_world_coor_orig.detach().cpu().numpy())
+        np.save("../results/" + strin + "test_mesh.npy", raws.detach().cpu().numpy())
+        np.save("../results/" + strin + "x.npy", self.x.detach().cpu().numpy())
+        np.save("../results/" + strin + "rendered.npy", x_recon.detach().cpu().numpy())
+        np.save("../results/" + strin + "silhouettes.npy", silhouettes.detach().cpu().numpy())
+        np.save("../results/" + strin + "silhouettes_gt.npy", self.silhouette_masks.detach().cpu().numpy())
+        exit(0)
 
     def load_networks(self, surfix):
         """Load all the networks from the disk.
@@ -745,6 +672,25 @@ class uorfEvalModel(BaseModel):
                 print('loading the lr scheduler from %s' % load_path)
                 state_dict = torch.load(load_path, map_location=str(self.device))
                 sch.load_state_dict(state_dict)
+
+    def optimize_parameters(self, ret_grad=False, epoch=0):
+        """Update network weights; it will be called in every training iteration."""
+        self.forward(epoch)
+        for opm in self.optimizers:
+            opm.zero_grad()
+        self.backward()
+        avg_grads = []
+        layers = []
+        if ret_grad:
+            # for n, p in chain(self.netEncoder.named_parameters(), self.netSlotAttention.named_parameters(), self.netDecoder.named_parameters()):
+            for n, p in chain(*[x.named_parameters() for x in self.nets]):
+                if p.grad is not None and "bias" not in n:
+                    with torch.no_grad():
+                        layers.append(n)
+                        avg_grads.append(p.grad.abs().mean().cpu().item())
+        for opm in self.optimizers:
+            opm.step()
+        return layers, avg_grads
 
 
 if __name__ == '__main__':

@@ -9,10 +9,12 @@ import os
 import time
 from .projection import Projection
 from torchvision.transforms import Normalize
-from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, PixelDecoder, raw2transmittances, raw2colors, ImageEncoder
+from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs, PixelEncoder, raw2transmittances, raw2colors, ImageEncoder
 import pdb
 from util import util
-
+import numpy as np
+from skimage.transform import resize
+import scipy.ndimage as ndimage
 
 class DiceLoss(nn.Module):
     def __init__(self, weight=None, size_average=True):
@@ -120,6 +122,7 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--mask_div_by_max', action='store_true')
         parser.add_argument('--kldiv_loss', action='store_true')
         parser.add_argument('--silhouette_l2_loss', action='store_true')
+        parser.add_argument('--silhouette_l2_loss_masked', action='store_true')
         parser.add_argument('--combine_masks', action='store_true', help='combine all the masks for pixel nerf')
         parser.add_argument('--weight_pixel_slot_mask', action='store_true')
 
@@ -316,6 +319,19 @@ class uorfTrainModel(BaseModel):
             masks = F.interpolate(masks.float(), size=[64, 64], mode=mode_)
             self.silhouette_masks = masks
 
+            def dilate_silhouttes(sil):
+                all_sils = []
+                for kk in sil.reshape(-1, sil.shape[-2], sil.shape[-1]):
+                    sil_up = ndimage.binary_dilation(kk, iterations=3)
+                    all_sils.append(sil_up)
+                all_sils = np.stack(all_sils, 0).reshape(sil.shape)
+                return all_sils
+
+            masks_ = dilate_silhouttes(masks.detach().cpu().numpy())
+            silhoutte_masks_dilated = dilate_silhouttes(masks_)
+            self.silhoutte_masks_dilated = torch.tensor(silhoutte_masks_dilated).to(self.device)
+
+
 
     def forward(self, epoch=0):
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
@@ -374,7 +390,7 @@ class uorfTrainModel(BaseModel):
 
         if self.opt.stage == 'coarse':
             W, H, D = self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp
-            frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
+            frus_nss_coor, z_vals, ray_dir, _, _ = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             x = F.interpolate(self.x, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
             x_op = F.interpolate(self.x_op, size=self.opt.supervision_size, mode='bilinear', align_corners=False)
@@ -383,7 +399,7 @@ class uorfTrainModel(BaseModel):
             W, H, D = self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp
             start_range = self.opt.frustum_size_fine - self.opt.render_size
             rs = self.opt.render_size
-            frus_nss_coor, z_vals, ray_dir = self.projection_fine.construct_sampling_coor(cam2world)
+            frus_nss_coor, z_vals, ray_dir, _, _ = self.projection_fine.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor.view([N, D, H, W, 3]), z_vals.view([N, H, W, D]), ray_dir.view([N, H, W, 3])
             H_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
@@ -463,6 +479,10 @@ class uorfTrainModel(BaseModel):
         else:
             silhouettes_for_density = None
 
+        # pixel_feat *= 0
+
+        # print("no pixel feat")
+
         if self.opt.debug2:
             pixel_feat *= 0
         if self.opt.uorf:
@@ -483,11 +503,13 @@ class uorfTrainModel(BaseModel):
             raws = raws.view([N, D, H, W, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
             masked_raws = masked_raws.view([K, N, D, H, W, 4])
             unmasked_raws = unmasked_raws.view([K, N, D, H, W, 4])
+
+            unmasked_raws_flat = unmasked_raws.permute([0, 1, 3, 4, 2, 5]).flatten(start_dim=1, end_dim=3)# # (KxNxHxW)xDx4
             masks_for_silhouette = masks_for_silhouette.view([K, N, D, H, W])
 
             z_vals, ray_dir = self.z_vals, self.ray_dir
             # raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-            rgb_map, depth_map, _, _, _, silhouettes = raw2outputs(raws, z_vals, ray_dir, return_silhouettes=masks_for_silhouette)
+            rgb_map, depth_map, _, _, _, silhouettes = raw2outputs(raws, unmasked_raws_flat, z_vals, ray_dir, return_silhouettes=masks_for_silhouette)
             self.silhouettes = silhouettes
 
         else:
@@ -557,7 +579,21 @@ class uorfTrainModel(BaseModel):
                 targets = self.silhouette_masks
                 inputs = self.silhouettes
             elif self.opt.silhouette_l2_loss:
-                self.loss_silhouette = self.L2_loss(self.silhouette_masks, self.silhouettes) # NxKxHxW
+                np.save('x_op.npy', self.x_op.detach().cpu().numpy())
+                np.save('sil_gt.npy', self.silhouettes.detach().cpu().numpy())
+                np.save('sil_pred.npy', self.silhouette_masks.detach().cpu().numpy())
+                exit(0)
+                self.loss_silhouette = self.L2_loss(self.silhouette_masks[0:1], self.silhouettes[0:1]) # NxKxHxW
+                # print("silhouette_masks", self.silhouette_masks.max(), self.silhouettes.max())
+                # exit(0)
+            elif self.opt.silhouette_l2_loss_masked:
+                # print("maksed")
+                self.loss_silhouette_inside = self.L2_loss(self.silhouette_masks[self.silhoutte_masks_dilated], self.silhouettes[self.silhoutte_masks_dilated])
+
+                self.loss_silhouette_outside = self.L2_loss(self.silhouette_masks[~self.silhoutte_masks_dilated],self.silhouettes[~self.silhoutte_masks_dilated])
+
+                self.loss_silhouette = 0.75*self.loss_silhouette_inside + 0.25*self.loss_silhouette_outside
+                
             else:
                 self.loss_silhouette = self.L1_loss(self.silhouette_masks, self.silhouettes) # NxKxHxW
 
@@ -581,11 +617,12 @@ class uorfTrainModel(BaseModel):
             masked_raws = self.masked_raws  # KxNxDxHxWx4
             unmasked_raws = self.unmasked_raws  # KxNxDxHxWx4
             silhouttes = self.silhouettes #NxKxHxW ??
+            unmasked_raws_flat = unmasked_raws.permute([0, 1, 3, 4, 2, 5]).flatten(start_dim=1, end_dim=3)  # # (KxNxHxW)xDx4
             for k in range(self.num_slots):
                 raws = masked_raws[k]  # NxDxHxWx4
                 z_vals, ray_dir = self.z_vals, self.ray_dir
                 raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                rgb_map, depth_map, _, _, _, _ = raw2outputs(raws, z_vals, ray_dir)
+                rgb_map, depth_map, _, _, _, _ = raw2outputs(raws,unmasked_raws_flat, z_vals, ray_dir)
                 rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
                 x_recon = rendered * 2 - 1
                 for i in range(self.opt.n_img_each_scene):
@@ -593,7 +630,7 @@ class uorfTrainModel(BaseModel):
 
                 raws = unmasked_raws[k]  # (NxDxHxW)x4
                 raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                rgb_map, depth_map, _, _, _, _ = raw2outputs(raws, z_vals, ray_dir)
+                rgb_map, depth_map, _, _, _, _ = raw2outputs(raws, unmasked_raws_flat, z_vals, ray_dir)
                 rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
                 x_recon = rendered * 2 - 1
                 for i in range(self.opt.n_img_each_scene):
@@ -610,7 +647,7 @@ class uorfTrainModel(BaseModel):
 
     def backward(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
-        loss = self.loss_silhouette + self.loss_recon #+ self.loss_perc
+        loss =  self.loss_silhouette# self.loss_recon # +  #+ self.loss_perc
         # if self.opt.silhouette_loss:
         #     loss += self.loss_silhouette
         # if self.opt.rgb_loss_density_decoder:

@@ -81,6 +81,7 @@ class CustomDatasetDataLoader():
             dataset_class = ret
         self.dataset = dataset_class(opt)
         print("dataset [%s] was created" % type(self.dataset).__name__)
+        print("shuffle true")
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
             batch_size=opt.batch_size,
