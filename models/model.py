@@ -434,7 +434,7 @@ class Decoder(nn.Module):
                                      nn.Linear(latent_dim//4, 3))
         if pixel_dim != None and bg_no_pixel and not no_concatenate and not color_after_density:
             input_dim += -pixel_dim
-        if bg_no_pixel:
+        if bg_no_pixel and not ray_after_density and use_ray_dir:
             input_dim += -3
         before_skip = [nn.Linear(input_dim, latent_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(latent_dim + input_dim, latent_dim), nn.ReLU(True)]
