@@ -120,17 +120,19 @@ class uorfNoGanModel(BaseModel):
         Parameters:
             input: a dictionary that contains the data itself and its metadata information.
         """
-        x = input['img_data'].to(self.device)
-        cam2world = input['cam2world'].to(self.device)
+        NS, NV = self.opt.batch_size, self.opt.n_img_each_scene
+        load_size = self.opt.load_size
+        x = input['img_data'].to(self.device).view(NS, NV, 3, load_size, load_size)
+        cam2world = input['cam2world'].to(self.device).view(NS, NV, 4, 4)
         if not self.opt.fixed_locality:
-            cam2world_azi = input['azi_rot'].to(self.device)
+            cam2world_azi = input['azi_rot'].to(self.device).view(NS, NV, 3, 3)
 
         return x, cam2world, cam2world_azi
 
-    def forward(self, x, cam2world, cam2world_azi, epoch=0):
-
+    def forward(self, x, cam2world, cam2world_azi, epoch=0, iter=0):
         B, NV, C, H, W = x.shape
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
+        vis_dict = None
         self.weight_percept = self.opt.weight_percept if epoch >= self.opt.percept_in else 0
         self.loss_recon = 0
         self.loss_perc = 0
@@ -145,15 +147,12 @@ class uorfNoGanModel(BaseModel):
         # Slot Attention
         z_slots, attn = self.netSlotAttention(feat)  # BxKxC, BxKxN
         K = attn.shape[1]
-
-        # cam2world = cam2world
         N = cam2world.shape[1]
         if self.opt.stage == 'coarse':
             frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
             x = F.interpolate(x.flatten(0, 1), size=self.opt.supervision_size, mode='bilinear', align_corners=False)
             x = x.reshape(B, NV, 3, self.opt.supervision_size, self.opt.supervision_size)
-
             self.z_vals, self.ray_dir = z_vals, ray_dir
         else:
             W, H, D = self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp
@@ -166,42 +165,46 @@ class uorfNoGanModel(BaseModel):
             W_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             frus_nss_coor_, z_vals_, ray_dir_ = frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(0, 3), z_vals_.flatten(0, 2), ray_dir_.flatten(0, 2)
-            x = x[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
+            x = x[:, :, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.z_vals, self.ray_dir = z_vals, ray_dir
 
-        sampling_coor_fg = frus_nss_coor[:, None, ...].expand(B, K - 1, -1, -1)  # (K-1)xPx3
+        sampling_coor_fg = frus_nss_coor[:, None, ...].expand(-1, K - 1, -1, -1)  # (K-1)xPx3
         sampling_coor_bg = frus_nss_coor  # BxPx3
 
         W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
-        raws, masked_raws, unmasked_raws, masks = self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0)  # (NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x4, Kx(NxDxHxW)x1
-        raws = raws.view([N, D, H, W, 4]).permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-        masked_raws = masked_raws.view([K, N, D, H, W, 4])
-        unmasked_raws = unmasked_raws.view([K, N, D, H, W, 4])
+        raws, masked_raws, unmasked_raws, masks = self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0)  # Bx(NxDxHxW)x4, BxKx(NxDxHxW)x4, BxKx(NxDxHxW)x4, BxKx(NxDxHxW)x1
+        raws = raws.view([B, N, D, H, W, 4]).permute([0, 1, 3, 4, 2, 5]).flatten(start_dim=1, end_dim=3)  # Bx(NxHxW)xDx4
+        masked_raws = masked_raws.view([B, K, N, D, H, W, 4])
+        unmasked_raws = unmasked_raws.view([B, K, N, D, H, W, 4])
         rgb_map, _, _ = raw2outputs(raws, z_vals, ray_dir)
-        # (NxHxW)x3, (NxHxW)
-        rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+        # Bx(NxHxW)x3, Bx(NxHxW)
+
+        rendered = rgb_map.view(B, N, H, W, 3).permute([0, 1, 4, 2, 3])  # BxNx3xHxW
         x_recon = rendered * 2 - 1
 
         self.loss_recon = self.L2_loss(x_recon, x)
-        x_norm, rendered_norm = self.vgg_norm((x + 1) / 2), self.vgg_norm(rendered)
+        x_norm, rendered_norm = self.vgg_norm((x.flatten(0, 1) + 1) / 2), self.vgg_norm(rendered.flatten(0, 1))
         rendered_feat, x_feat = self.perceptual_net(rendered_norm), self.perceptual_net(x_norm)
         self.loss_perc = self.weight_percept * self.L2_loss(rendered_feat, x_feat)
 
         with torch.no_grad():
-            attn = attn.detach().cpu()  # KxN
-            H_, W_ = feature_map.shape[2], feature_map.shape[3]
+            attn = attn[0].detach()  # KxN, only the first in batch
+            H_, W_ = feature_map[0:1].shape[2], feature_map.shape[3]
             attn = attn.view(self.opt.num_slots, 1, H_, W_)
             if H_ != H:
                 attn = F.interpolate(attn, size=[H, W], mode='bilinear')
             for i in range(self.opt.n_img_each_scene):
-                setattr(self, 'x_rec{}'.format(i), x_recon[i])
-                setattr(self, 'x{}'.format(i), x[i])
-            setattr(self, 'masked_raws', masked_raws.detach())
-            setattr(self, 'unmasked_raws', unmasked_raws.detach())
+                setattr(self, 'x_rec{}'.format(i), x_recon[0:1, i]) # only the first in batch
+                setattr(self, 'x{}'.format(i), x[0:1, i]) # only the first in batch
+            setattr(self, 'masked_raws', masked_raws[0].detach()) # only the first in batch
+            setattr(self, 'unmasked_raws', unmasked_raws[0].detach()) # only the first in batch
             setattr(self, 'attn', attn)
 
-        loss = self.loss_recon + self.loss_perc
-        return loss
+        if iter % self.opt.display_freq == 0:
+            self.compute_visuals()
+            vis_dict = self.get_current_visuals()
+
+        return self.loss_recon, self.loss_perc, vis_dict
 
     def compute_visuals(self):
         with torch.no_grad():
@@ -210,33 +213,26 @@ class uorfNoGanModel(BaseModel):
             unmasked_raws = self.unmasked_raws  # KxNxDxHxWx4
             for k in range(self.num_slots):
                 raws = masked_raws[k]  # NxDxHxWx4
-                z_vals, ray_dir = self.z_vals, self.ray_dir
+                z_vals, ray_dir = self.z_vals[0:1], self.ray_dir[0:1]
                 raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
+                rgb_map, depth_map, _ = raw2outputs(raws.unsqueeze(0), z_vals, ray_dir)
                 rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
                 x_recon = rendered * 2 - 1
                 for i in range(self.opt.n_img_each_scene):
-                    setattr(self, 'slot{}_view{}'.format(k, i), x_recon[i])
+                    setattr(self, 'slot{}_view{}'.format(k, i), x_recon[i].unsqueeze(0))
 
                 raws = unmasked_raws[k]  # (NxDxHxW)x4
                 raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir)
+                rgb_map, depth_map, _ = raw2outputs(raws.unsqueeze(0), z_vals, ray_dir)
                 rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
                 x_recon = rendered * 2 - 1
                 for i in range(self.opt.n_img_each_scene):
-                    setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i])
+                    setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i].unsqueeze(0))
 
-                setattr(self, 'slot{}_attn'.format(k), self.attn[k] * 2 - 1)
-
-    # def backward(self):
-    #     """Calculate losses, gradients, and update network weights; called in every training iteration"""
-    #
-    #     loss.backward()
-    #     self.loss_perc = self.loss_perc / self.weight_percept if self.weight_percept > 0 else self.loss_perc
+                setattr(self, 'slot{}_attn'.format(k), self.attn[k].unsqueeze(0) * 2 - 1)
 
     def optimize_parameters(self, loss, ret_grad=False, epoch=0):
         """Update network weights; it will be called in every training iteration."""
-        # self.forward(epoch)
         for opm in self.optimizers:
             opm.zero_grad()
         loss.backward()

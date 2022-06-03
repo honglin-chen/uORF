@@ -39,7 +39,8 @@ if __name__ == '__main__':
             epoch_iter += opt.batch_size
 
             x, cam2world, cam2azi = model.module.set_input(data)         # unpack data from dataset and apply preprocessing
-            loss = model(x[None].expand(2, -1, -1, -1, -1), cam2world[None].expand(2, -1, -1, -1), cam2azi[None].expand(2, -1, -1, -1)) # feedforward and calculate loss
+            loss_recon, loss_perc, vis = model(x, cam2world, cam2azi, epoch=epoch, iter=total_iters) # feedforward and calculate loss
+            loss = loss_recon.mean() + loss_perc.mean()
             layers, avg_grad = model.module.optimize_parameters(loss, opt.display_grad, epoch)   # get gradients, update network weights
 
             if opt.custom_lr and opt.stage == 'coarse':
@@ -47,12 +48,15 @@ if __name__ == '__main__':
 
             if total_iters % opt.display_freq == 0:   # display images on visdom and save images to a HTML file
                 save_result = total_iters % opt.update_html_freq == 0
-                model.module.compute_visuals()
-                if opt.display_grad:
-                    visualizer.display_grad(layers, avg_grad)
-                visualizer.display_current_results(model.module.get_current_visuals(), epoch, save_result)
+                # model.module.compute_visuals()
+                # if opt.display_grad:
+                #     visualizer.display_grad(layers, avg_grad)
 
-            losses = model.module.get_current_losses()
+                # display first only
+                visualizer.display_current_results({k: v[0] for k, v in vis.items()}, epoch, save_result)
+
+            # losses = model.module.get_current_losses()
+            losses = {'recon': loss_recon.mean().item(), 'perc': loss_perc.mean().item()}
             for loss_name in model.module.loss_names:
                 meters_trn[loss_name].update(float(losses[loss_name]))
                 losses[loss_name] = meters_trn[loss_name].avg

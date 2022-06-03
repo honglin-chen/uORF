@@ -66,7 +66,7 @@ class BaseModel(torch.nn.Module):
         pass
 
     @abstractmethod
-    def forward(self):
+    def forward(self, **kwarga):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
         pass
 

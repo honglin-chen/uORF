@@ -48,6 +48,10 @@ class MultiscenesDataset(BaseDataset):
             scene_filenames = [x for x in filenames if 'sc{:04d}'.format(i) in x]
             self.scenes.append(scene_filenames)
 
+        # todo: debugging room_chair_train only, set the flag to False for TDW dataset
+        self.disable_load_mask = True
+        if 'tdw' in scene_filenames[0]:
+            assert not self.disable_load_mask, "this flag is for debugging room_chair_train only, set the flag to False for TDW dataset"
     def _transform(self, img):
         img = TF.resize(img, (self.opt.load_size, self.opt.load_size))
         img = TF.to_tensor(img)
@@ -98,7 +102,7 @@ class MultiscenesDataset(BaseDataset):
             else:
                 ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot}
             mask_path = path.replace('.png', '_mask.png')
-            if os.path.isfile(mask_path):
+            if os.path.isfile(mask_path) and not self.disable_load_mask:
                 mask = Image.open(mask_path).convert('RGB')
                 mask_l = mask.convert('L')
                 mask = self._transform_mask(mask)

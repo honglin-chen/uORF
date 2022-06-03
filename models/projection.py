@@ -1,24 +1,25 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
+import torch.nn as nn
 
 
-class Projection(object):
+class Projection(nn.Module):
     def __init__(self, focal_ratio=(350. / 320., 350. / 240.),
                  near=5, far=16, frustum_size=[128, 128, 128], device='cpu',
                  nss_scale=7, render_size=(64, 64)):
+        super(Projection, self).__init__()
         self.render_size = render_size
-        self.device = device
         self.focal_ratio = focal_ratio
         self.near = near
         self.far = far
         self.frustum_size = frustum_size
 
         self.nss_scale = nss_scale
-        self.world2nss = torch.tensor([[1/nss_scale, 0, 0, 0],
+        self.register_buffer('world2nss', torch.tensor([[1/nss_scale, 0, 0, 0],
                                         [0, 1/nss_scale, 0, 0],
                                         [0, 0, 1/nss_scale, 0],
-                                        [0, 0, 0, 1]]).unsqueeze(0).to(device)
+                                        [0, 0, 0, 1]]).unsqueeze(0).cuda())
         focal_x = self.focal_ratio[0] * self.frustum_size[0]
         focal_y = self.focal_ratio[1] * self.frustum_size[1]
         bias_x = (self.frustum_size[0] - 1.) / 2.
@@ -27,20 +28,20 @@ class Projection(object):
                                       [0, focal_y, bias_y, 0],
                                       [0, 0, 1, 0],
                                       [0, 0, 0, 1]])
-        self.cam2spixel = intrinsic_mat.to(self.device)
-        self.spixel2cam = intrinsic_mat.inverse().to(self.device)
+        self.register_buffer('cam2spixel', intrinsic_mat.cuda())
+        self.register_buffer('spixel2cam', intrinsic_mat.inverse().cuda())
 
     def construct_frus_coor(self):
         x = torch.arange(self.frustum_size[0])
         y = torch.arange(self.frustum_size[1])
         z = torch.arange(self.frustum_size[2])
         x, y, z = torch.meshgrid([x, y, z])
-        x_frus = x.flatten().to(self.device)
-        y_frus = y.flatten().to(self.device)
-        z_frus = z.flatten().to(self.device)
+        x_frus = x.flatten().to(self.cam2spixel.device)
+        y_frus = y.flatten().to(self.cam2spixel.device)
+        z_frus = z.flatten().to(self.cam2spixel.device)
         # project frustum points to vol coord
         depth_range = torch.linspace(self.near, self.far, self.frustum_size[2])
-        z_cam = depth_range[z_frus].to(self.device)
+        z_cam = depth_range[z_frus].to(self.cam2spixel.device)
 
         x_unnorm_pix = x_frus * z_cam
         y_unnorm_pix = y_frus * z_cam
@@ -88,7 +89,6 @@ class Projection(object):
             else:
                 frus_nss_coor = frus_nss_coor.flatten(start_dim=0, end_dim=3)  # (NxDxHxW)x3
 
-
         z_vals = (frus_cam_coor[2] - self.near) / (self.far - self.near)  # (WxHxD) range=[0,1]
         z_vals = z_vals.expand(N, W * H * D)  # Nx(WxHxD)
         if partitioned:
@@ -110,7 +110,7 @@ class Projection(object):
         y = torch.arange(self.frustum_size[1])
         X, Y = torch.meshgrid([x, y])
         Z = torch.ones_like(X)
-        pix_coor = torch.stack([Y, X, Z]).to(self.device)  # 3xHxW, 3=xyz
+        pix_coor = torch.stack([Y, X, Z]).to(self.cam2spixel.device)  # 3xHxW, 3=xyz
         cam_coor = torch.matmul(self.spixel2cam[:3, :3], pix_coor.flatten(start_dim=1).float())  # 3x(HxW)
         ray_dir = cam_coor.permute([1, 0])  # (HxW)x3
         ray_dir = ray_dir.view(H, W, 3)
