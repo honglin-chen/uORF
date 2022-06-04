@@ -493,7 +493,10 @@ class Decoder(nn.Module):
             sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx4x1
             sampling_coor_fg = sampling_coor_fg.squeeze(-1)[:, :, :3]  # (K-1)xPx3
         else:
-            sampling_coor_fg = torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx3x1
+            # print("samp shape", sampling_coor_fg.shape)
+            sampling_coor_fg = sampling_coor_fg[..., None]#torch.matmul(fg_transform[None, ...], sampling_coor_fg[..., None])  # (K-1)xPx3x1
+            # print("samp shape after", sampling_coor_fg.shape)
+            print("no fg tf")
             sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # (K-1)xPx3
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # (K-1)xP
             z_out_idx_fg = torch.any(sampling_coor_fg[..., 2:3] < 0.1, dim=-1)
@@ -639,7 +642,7 @@ class Decoder(nn.Module):
         masked_raws = torch.cat([masked_rgb, raw_sigma], dim=2)
         # at_home
         # masked_raws = unmasked_raws * masks
-        raws = masked_raws.mean(dim=0)
+        raws = masked_raws.max(dim=0)[0]
 
         if decoder_type=='density':
             return raws, masked_raws, unmasked_raws, masks, raw_masks
@@ -802,10 +805,13 @@ def raw2outputs(raw, unmasked_raw, z_vals, rays_d, render_mask=False, weight_pix
     alpha = raw[..., 3] #raw2alpha(raw[..., 3], dists)  # [N_rays, N_samples]
 
     alpha_slots = [] #[K, N_rays, N_samples]
+    color_slots = []
     for raw_slot in unmasked_raw:
         alpha_slots.append(raw_slot[..., 3])
+        color_slots.append(raw_slot[..., 0])
 
     alpha_slots = torch.stack(alpha_slots, 0)
+    color_slots = torch.stack(color_slots, 0)
 
     transmittance = torch.cumprod(
         torch.cat([torch.ones((alpha.shape[0], 1), device=device), 1. - alpha + 1e-10], dim=-1)
@@ -862,6 +868,8 @@ def raw2outputs(raw, unmasked_raw, z_vals, rays_d, render_mask=False, weight_pix
         # print("alpha slots")
         masks = return_silhouettes # [K, N, D, H, W]
 
+        rgb_color = color_slots.view(color_slots.shape[0], masks.shape[1], masks.shape[3], masks.shape[4], masks.shape[2])
+
         alpha_slots = alpha_slots.view(alpha_slots.shape[0], masks.shape[1], masks.shape[3], masks.shape[4], masks.shape[2]) #[K, N, H, W, D]
         #normalized densities
         masks = masks.permute([1, 3, 4, 2, 0]) # [N, H, W, D, K]
@@ -870,7 +878,7 @@ def raw2outputs(raw, unmasked_raw, z_vals, rays_d, render_mask=False, weight_pix
 
         transmittance_silhouettes = transmittance.view([masks.shape[0], masks.shape[1], masks.shape[2], masks.shape[3]]).unsqueeze(
             0)  # (NxHxW)xD -> 1xNxHxWxD
-        silhouettes = torch.sum(transmittance_silhouettes*alpha_slots, dim=-1) # KxNxHxW
+        silhouettes = torch.sum(transmittance_silhouettes*alpha_slots*rgb_color, dim=-1) # KxNxHxW
         silhouettes = silhouettes.permute([1, 0, 2, 3]) # NxKxHxW
 
 

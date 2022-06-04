@@ -36,7 +36,12 @@ class Projection(object):
     def construct_frus_coor(self):
         x = torch.arange(self.frustum_size[0]) + 0.5
         y = torch.arange(self.frustum_size[1]) + 0.5
-        z = torch.arange(self.frustum_size[2]) + 0.5
+        z = torch.arange(self.frustum_size[2]) + 0.0
+
+        #noise
+        z = z.float() + torch.rand(len(z))
+
+
         x, y, z = torch.meshgrid([x, y, z])
         x_frus = x.flatten().to(self.device)
         y_frus = y.flatten().to(self.device)
@@ -151,7 +156,8 @@ class Projection(object):
             frus_nss_coor = frus_nss_coor.flatten(start_dim=0, end_dim=3)  # (NxDxHxW)x3
             # print("frus_nss_coor", frus_nss_coor.shape)
 
-        z_vals = frus_cam_coor[2] #(frus_cam_coor[2] - self.near) / (self.far - self.near)  # (WxHxD) range=[0,1]
+        # z_vals = frus_cam_coor[2] #(frus_cam_coor[2] - self.near) / (self.far - self.near)  # (WxHxD) range=[0,1]
+        z_vals = (frus_cam_coor[2] - self.near) / (self.far - self.near)  # (WxHxD) range=[0,1]
         z_vals = z_vals.expand(N, W * H * D)  # Nx(WxHxD)
         if partitioned:
             z_vals = z_vals.view(N, W, H, D).permute([0, 2, 1, 3])  # NxHxWxD

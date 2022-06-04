@@ -126,7 +126,7 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--combine_masks', action='store_true', help='combine all the masks for pixel nerf')
         parser.add_argument('--weight_pixel_slot_mask', action='store_true')
 
-        parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
+        parser.set_defaults(batch_size=1, lr=1e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=2000, custom_lr=True, lr_policy='warmup')
 
         parser.set_defaults(exp_id='run-{}'.format(time.strftime('%Y-%m-%d-%H-%M-%S')))
@@ -255,7 +255,7 @@ class uorfTrainModel(BaseModel):
             opt (Option class) -- stores all the experiment flags; needs to be a subclass of BaseOptions
         """
         if self.isTrain:
-            self.schedulers = [networks.get_scheduler(optimizer, opt) for optimizer in self.optimizers]
+            self.schedulers = []#[networks.get_scheduler(optimizer, opt) for optimizer in self.optimizers]
         if not self.isTrain or opt.continue_train:
             load_suffix = 'iter_{}'.format(opt.load_iter) if opt.load_iter > 0 else opt.epoch
             self.load_networks(load_suffix)
@@ -587,12 +587,20 @@ class uorfTrainModel(BaseModel):
                 # print("silhouette_masks", self.silhouette_masks.max(), self.silhouettes.max())
                 # exit(0)
             elif self.opt.silhouette_l2_loss_masked:
-                # print("maksed")
-                self.loss_silhouette_inside = self.L2_loss(self.silhouette_masks[self.silhoutte_masks_dilated], self.silhouettes[self.silhoutte_masks_dilated])
+                # print("max, min", self.silhouettes.max(), self.silhouettes.min())
+                # self.loss_silhouette_inside = self.L2_loss(self.silhouette_masks[0:1][self.silhoutte_masks_dilated[0:1]], self.silhouettes[0:1][self.silhoutte_masks_dilated[0:1]])
+                #
+                # self.loss_silhouette_outside = self.L2_loss(self.silhouette_masks[0:1][~self.silhoutte_masks_dilated[0:1]],self.silhouettes[0:1][~self.silhoutte_masks_dilated[0:1]])
 
-                self.loss_silhouette_outside = self.L2_loss(self.silhouette_masks[~self.silhoutte_masks_dilated],self.silhouettes[~self.silhoutte_masks_dilated])
+                self.loss_silhouette_inside = self.L2_loss(
+                    self.silhouette_masks[self.silhoutte_masks_dilated],
+                    self.silhouettes[self.silhoutte_masks_dilated])
 
-                self.loss_silhouette = 0.75*self.loss_silhouette_inside + 0.25*self.loss_silhouette_outside
+                self.loss_silhouette_outside = self.L2_loss(
+                    self.silhouette_masks[~self.silhoutte_masks_dilated],
+                    self.silhouettes[~self.silhoutte_masks_dilated])
+
+                self.loss_silhouette = 0.5*self.loss_silhouette_inside + 0.5*self.loss_silhouette_outside
                 
             else:
                 self.loss_silhouette = self.L1_loss(self.silhouette_masks, self.silhouettes) # NxKxHxW
@@ -638,7 +646,7 @@ class uorfTrainModel(BaseModel):
 
                 setattr(self, 'slot{}_attn'.format(k), self.attn[k] * 2 - 1)
 
-                sil = silhouttes[:, k]  # (NxKxHxW)
+                sil = silhouttes[:, k]*2 - 1  # (NxKxHxW)
 
                 for i in range(self.opt.n_img_each_scene):
                     setattr(self, 'silhoutte_slot{}_view{}'.format(k, i), sil[i].expand(3, sil[i].shape[0], sil[i].shape[1]))

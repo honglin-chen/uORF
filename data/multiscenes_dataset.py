@@ -97,6 +97,7 @@ class MultiscenesDataset(BaseDataset):
         if self.opt.isTrain and not self.opt.no_shuffle:
             filenames = random.sample(scene_filenames, self.n_img_each_scene)
         else:
+            print("no shuffle")
             filenames = scene_filenames[:self.n_img_each_scene]
         rets = []
         for path in filenames:
