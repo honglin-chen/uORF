@@ -1,8 +1,8 @@
 from torch import nn
 from models.base_classes import End2end
-from models.morf.encoder import PixelNerfEncoder
-from models.morf.decoder import UorfDecoder
-from models.morf.Renderer import UorfRenderer
+from models.morf.encoder.encoder_wrapper import Encoder
+from models.morf.decoder.uorf_decoder import UorfDecoder
+from models.morf.renderer.uorf_renderer import UorfRenderer
 
 class MorfEnd2end(End2end):
     def __init__(self):
@@ -25,15 +25,18 @@ class MorfEnd2end(End2end):
 
         input_encoder = {'input_img': input_end2end['input_img'],
                          'input_mask': input_end2end['input_mask']}
-        self.encoder(input_encoder)
+        output_encoder = self.encoder(input_encoder)
 
         input_renderer = {'encoder_obj': self.encoder,
                           'decoder_obj': self.decoder,
                           'cam2world': input_end2end['cam2world'],
-                          'input_img': input_end2end['input_img']}
-        output_renderer = self.renderer(input_renderer)
+                          'cam2world_azi': input_end2end['cam2world_azi'],
+                          'input_img': input_end2end['input_img'],
+                          'input_mask': input_end2end['input_mask']}
+        output_renderer = self.renderer.render(input_renderer)
 
         output_end2end = output_renderer
+        output_end2end['output_mask'] = output_encoder['output_mask']
         return output_end2end
 
 

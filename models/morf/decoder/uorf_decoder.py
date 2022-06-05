@@ -60,9 +60,8 @@ class UorfDecoder(Decoder):
         sampling_coor_bg = input_decoder['coor_bg']
         sampling_coor_fg = input_decoder['coor_fg']
         z_slots = input_decoder['slot_feat']
-        cam2world = input_decoder['cam2world']
-        cam2world_azi = input_decoder['cam2world_azi']
-        fg_transform = cam2world[:, 0:1].inverse() if self.opt.fixed_locality else cam2world_azi[:, 0:1].inverse()
+        fg_transform = input_decoder['fg_transform']
+
 
         B, K, C = z_slots.shape
         P = sampling_coor_bg.shape[1]
