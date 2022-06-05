@@ -76,28 +76,14 @@ class uorfNoGanModel(BaseModel):
                             ['slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['unmasked_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
-        self.model_names = ['Encoder', 'SlotAttention', 'Decoder']
+        self.model_names = ['MorfEnd2end']
         self.perceptual_net = get_perceptual_net().cuda()
         self.vgg_norm = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        render_size = (opt.render_size, opt.render_size)
-        frustum_size = [self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp]
-        self.projection = Projection(device=self.device, nss_scale=opt.nss_scale,
-                                     frustum_size=frustum_size, near=opt.near_plane, far=opt.far_plane, render_size=render_size)
-        frustum_size_fine = [self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp]
-        self.projection_fine = Projection(device=self.device, nss_scale=opt.nss_scale,
-                                          frustum_size=frustum_size_fine, near=opt.near_plane, far=opt.far_plane, render_size=render_size)
-        z_dim = opt.z_dim
-        self.num_slots = opt.num_slots
-        self.netEncoder = networks.init_net(Encoder(3, z_dim=z_dim, bottom=opt.bottom),
-                                            gpu_ids=self.gpu_ids, init_type='normal')
-        self.netSlotAttention = networks.init_net(
-            SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter), gpu_ids=self.gpu_ids, init_type='normal')
-        self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                                                    locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
+        self.netEnd2end = MorfEnd2end(opt)
 
         if self.isTrain:  # only defined during training time
             self.optimizer = optim.Adam(chain(
-                self.netEncoder.parameters(), self.netSlotAttention.parameters(), self.netDecoder.parameters()
+                self.netEnd2end.parameters()
             ), lr=opt.lr)
             self.optimizers = [self.optimizer]
 
@@ -130,15 +116,24 @@ class uorfNoGanModel(BaseModel):
 
         return x, cam2world, cam2world_azi
 
-    def forward(self, x, cam2world, cam2world_azi, epoch=0, iter=0):
+    def forward(self, x, cam2world, cam2world_azi, mask=None, epoch=0, iter=0):
         B, NV, C, H, W = x.shape
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
         vis_dict = None
         self.weight_percept = self.opt.weight_percept if epoch >= self.opt.percept_in else 0
         self.loss_recon = 0
         self.loss_perc = 0
+
+        input_end2end = {'input_img': x,
+                         'input_mask': mask,
+                         'cam2world': cam2world}
+
+        output_end2end = self.netEnd2end(input_end2end)
+
+
         dev = x[:, 0:1].device
         nss2cam0 = cam2world[:, 0:1].inverse() if self.opt.fixed_locality else cam2world_azi[:, 0:1].inverse()
+
 
         # Encoding images
         feature_map = self.netEncoder(F.interpolate(x[:, 0:1].flatten(0, 1), size=self.opt.input_size,
