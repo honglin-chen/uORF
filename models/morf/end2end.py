@@ -1,13 +1,13 @@
 from torch import nn
 from models.base_classes import End2end
-from models.morf.encoder.encoder_wrapper import Encoder
+from models.morf.encoder.encoder_wrapper import EncoderWrapper
 from models.morf.decoder.uorf_decoder import UorfDecoder
 from models.morf.renderer.uorf_renderer import UorfRenderer
 
 class MorfEnd2end(End2end):
     def __init__(self):
         super().__init__(self, opt)
-        self.encoder = PixelNerfEncoder(opt)
+        self.encoder = EncoderWrapper(opt)
         self.decoder = UorfDecoder(opt)
         self.renderer = UorfRenderer(opt)
 
