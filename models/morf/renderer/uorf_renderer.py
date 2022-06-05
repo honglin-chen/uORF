@@ -53,14 +53,6 @@ class UorfRenderer(Renderer):
         sampling_coor_fg = frus_nss_coor[:, None, ...].expand(-1, K - 1, -1, -1)  # (K-1)xPx3
         sampling_coor_bg = frus_nss_coor  # BxPx3
 
-        # Encoding images
-        feature_map = self.netEncoder(F.interpolate(x[:, 0:1].flatten(0, 1), size=self.opt.input_size,
-                                                    mode='bilinear', align_corners=False))  # BxCxHxW
-        feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
-
-        # Slot Attention
-        z_slots, attn = self.netSlotAttention(feat)  # BxKxC, BxKxN
-
         uv = None
         xyz = None
         coor_feature = {'uv': uv,
