@@ -111,3 +111,61 @@ class UorfDecoder(Decoder):
         raws = masked_raws.sum(dim=1)
 
         return raws, masked_raws, unmasked_raws, masks
+
+
+def sin_emb(x, n_freq=5, keep_ori=True):
+    """
+    create sin embedding for 3d coordinates
+    input:
+        x: Px3
+        n_freq: number of raised frequency
+    """
+    embedded = []
+    if keep_ori:
+        embedded.append(x)
+    emb_fns = [torch.sin, torch.cos]
+    freqs = 2. ** torch.linspace(0., n_freq - 1, steps=n_freq)
+    for freq in freqs:
+        for emb_fn in emb_fns:
+            embedded.append(emb_fn(freq * x))
+    embedded_ = torch.cat(embedded, dim=-1)
+    return embedded_
+
+def raw2outputs(raw, z_vals, rays_d, render_mask=False):
+    """Transforms model's predictions to semantically meaningful values.
+    Args:
+        raw: [bsz, num_rays, num_samples along ray, 4]. Prediction from model.
+        z_vals: [bsz, num_rays, num_samples along ray]. Integration time.
+        rays_d: [bsz, num_rays, 3]. Direction of each ray in cam coor.
+    Returns:
+        rgb_map: [bsz, num_rays, 3]. Estimated RGB color of a ray.
+        depth_map: [bsz, num_rays]. Estimated distance to object.
+    """
+    assert len(raw.shape) == 4 and len(z_vals.shape) == 3 and len(rays_d.shape) == 3
+    assert raw.shape[0] == z_vals.shape[0] == rays_d.shape[0]
+
+    raw2alpha = lambda x, y: 1. - torch.exp(-x * y)
+    device = raw.device
+
+    dists = z_vals[..., 1:] - z_vals[..., :-1]
+    dists = torch.cat([dists, torch.tensor([1e-2], device=device).expand(dists[..., :1].shape)], -1)  # [B, N_rays, N_samples]
+
+    dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
+
+    rgb = raw[..., :3]
+
+    alpha = raw2alpha(raw[..., 3], dists)  # [B, N_rays, N_samples]
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], alpha.shape[1], 1), device=device), 1. - alpha + 1e-10], -1), -1)[:,:, :-1]
+
+    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [B, N_rays, 3]
+
+    weights_norm = weights.detach() + 1e-5
+    weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
+    depth_map = torch.sum(weights_norm * z_vals, -1)
+
+    if render_mask:
+        density = raw[..., 3]  # [B, N_rays, N_samples]
+        mask_map = torch.sum(weights * density, dim=-1)  # [B, N_rays,]
+        return rgb_map, depth_map, weights_norm, mask_map
+
+    return rgb_map, depth_map, weights_norm

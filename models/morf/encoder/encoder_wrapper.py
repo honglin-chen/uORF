@@ -21,5 +21,5 @@ class EncoderWrapper(Encoder):
         feature = {'slot_feat': self.slot_encoder.get_feature(coor_feature),
                    'pixel_feat': self.pixel_encoder.get_feature(coor_feature),
                    'voxel_feat': None
-        }
+                   }
         return feature

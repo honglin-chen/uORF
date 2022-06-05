@@ -124,7 +124,7 @@ class uorfNoGanModel(BaseModel):
         self.loss_recon = 0
         self.loss_perc = 0
 
-        input_end2end = {'input_img': x,
+        input_end2end = {'input_img': x[:, 0:1, ...],
                          'input_mask': mask,
                          'cam2world': cam2world}
 
