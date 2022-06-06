@@ -50,6 +50,13 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--far_plane', type=float, default=20)
         parser.add_argument('--fixed_locality', action='store_true', help='enforce locality in world space instead of transformed view space')
 
+        parser.add_argument('--mask_image', action='store_true')
+        parser.add_argument('--mask_image_feature', action='store_true')
+        parser.add_argument('--use_ray_dir', action='store_true')
+        parser.add_argument('--use_slot_feat', action='store_true')
+        parser.add_argument('--use_pixel_feat', action='store_true')
+        parser.add_argument('--use_voxel_feat', action='store_true')
+
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
 
@@ -75,6 +82,8 @@ class uorfNoGanModel(BaseModel):
                             ['x_rec{}'.format(i) for i in range(n)] + \
                             ['slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['unmasked_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
+                            ['silhoutte_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
+                            ['depth_map{}'.format(i) for i in range(n)] + \
                             ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
         self.model_names = ['MorfEnd2end']
         self.perceptual_net = get_perceptual_net().cuda()
@@ -135,6 +144,7 @@ class uorfNoGanModel(BaseModel):
         attn = output_end2end['output_mask']
         masked_raws = output_end2end['weighted_raws']
         unmasked_raws = output_end2end['unweighted_raws']
+        depth_map = output_end2end['depth_map']
 
         self.loss_recon = self.L2_loss(x_recon, x)
         x_norm, rendered_norm = self.vgg_norm((x.flatten(0, 1) + 1) / 2), self.vgg_norm(rendered.flatten(0, 1))
@@ -150,6 +160,7 @@ class uorfNoGanModel(BaseModel):
             for i in range(self.opt.n_img_each_scene):
                 setattr(self, 'x_rec{}'.format(i), x_recon[0:1, i]) # only the first in batch
                 setattr(self, 'x{}'.format(i), x[0:1, i]) # only the first in batch
+                setattr(self, 'depth_map{}'.format(i), depth_map[0:1, i])
             setattr(self, 'masked_raws', masked_raws[0].detach()) # only the first in batch
             setattr(self, 'unmasked_raws', unmasked_raws[0].detach()) # only the first in batch
             setattr(self, 'attn', attn)
@@ -185,6 +196,11 @@ class uorfNoGanModel(BaseModel):
 
                 setattr(self, 'slot{}_attn'.format(k), self.attn[k].unsqueeze(0) * 2 - 1)
 
+                sil = silhouttes[:, k]  # (NxKxHxW)
+                for i in range(self.opt.n_img_each_scene):
+                    setattr(self, 'silhoutte_slot{}_view{}'.format(k, i),
+                            sil[i].expand(3, sil[i].shape[0], sil[i].shape[1]))
+
     def optimize_parameters(self, loss, ret_grad=False, epoch=0):
         """Update network weights; it will be called in every training iteration."""
         for opm in self.optimizers:
@@ -193,7 +209,7 @@ class uorfNoGanModel(BaseModel):
         avg_grads = []
         layers = []
         if ret_grad:
-            for n, p in chain(self.netEncoder.named_parameters(), self.netSlotAttention.named_parameters(), self.netDecoder.named_parameters()):
+            for n, p in chain(self.netEnd2end.parameters()):
                 if p.grad is not None and "bias" not in n:
                     with torch.no_grad():
                         layers.append(n)
