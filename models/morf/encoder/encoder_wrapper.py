@@ -2,11 +2,13 @@ from torch import nn
 from models.base_classes import Encoder
 from .uorf_encoder import SlotEncoder
 from .pixel_encoder import PixelEncoder
+from models import networks
 
 class EncoderWrapper(Encoder):
     def __init__(self, opt):
         super().__init__(opt)
-        self.slot_encoder = SlotEncoder(opt) if self.opt.use_slot_feat else None
+        self.gpu_ids = opt.gpu_ids
+        self.slot_encoder = networks.init_net(SlotEncoder(opt), gpu_ids=self.gpu_ids, init_type=None) if self.opt.use_slot_feat else None
         self.pixel_encoder = PixelEncoder(opt) if self.opt.use_pixel_feat else None
 
     def forward(self, input_encoder):

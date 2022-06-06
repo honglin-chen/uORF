@@ -89,6 +89,8 @@ def init_weights(net, init_type='normal', init_gain=0.02):
                 init.kaiming_normal_(m.weight.data, mode='fan_out', nonlinearity='relu')
             elif init_type == 'orthogonal':
                 init.orthogonal_(m.weight.data, gain=init_gain)
+            elif init_type == 'None':
+                pass
             else:
                 raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
             if hasattr(m, 'bias') and m.bias is not None:

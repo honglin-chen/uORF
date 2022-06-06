@@ -93,7 +93,9 @@ class uorfTrainModel(BaseModel):
         self.model_names = ['End2end']
         self.perceptual_net = get_perceptual_net().cuda()
         self.vgg_norm = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        self.netEnd2end = MorfEnd2end(opt)
+        self.netEnd2end = networks.init_net(MorfEnd2end(opt), gpu_ids=self.gpu_ids, init_type=None)
+
+        self.device = torch.device('cuda:{}'.format(self.gpu_ids[0])) if self.gpu_ids else torch.device('cpu')
 
         if self.isTrain:  # only defined during training time
             self.optimizer = optim.Adam(chain(
@@ -130,13 +132,15 @@ class uorfTrainModel(BaseModel):
 
         return x, cam2world, cam2world_azi
 
-    def forward(self, x, cam2world, cam2world_azi, mask=None, epoch=0, iter=0):
+    def forward(self, x, cam2world, cam2world_azi, epoch=0, iter=0):
         B, NV, C, H, W = x.shape
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
         vis_dict = None
         self.weight_percept = self.opt.weight_percept if epoch >= self.opt.percept_in else 0
         self.loss_recon = 0
         self.loss_perc = 0
+
+        mask = None
 
         input_end2end = {'input_img': x,
                          'input_mask': mask,

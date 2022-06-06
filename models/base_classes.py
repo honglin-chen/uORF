@@ -69,7 +69,7 @@ class Decoder(ABC, nn.Module):
         '''
         raise NotImplementedError
 
-class Renderer(ABC, object):
+class Renderer(ABC, nn.Module):
     def __init__(self, opt):
         super().__init__()
         self.opt = opt
