@@ -88,7 +88,9 @@ class UorfRenderer(Renderer):
                            'weighted_raws': masked_raws,
                            'unweighted_raws': unmasked_raws,
                            'depth_map': depth_map,
-                           'masks': masks}
+                           'masks': masks,
+                           'occ_silhouettes': None,
+                           'unocc_silhouettes': None}
         return output_renderer
 
     def get_pixel_coor(self, cam2world, frus_nss_coor):
