@@ -1,4 +1,6 @@
 import torch
+from torch import nn
+import torch.nn.functional as F
 from models.base_classes import Renderer
 from .projection import Projection
 
@@ -26,7 +28,7 @@ class UorfRenderer(Renderer):
         mask = input_renderer['input_mask']
 
         B, NV, C, H, W = x.shape
-        K = mask.shape[1]  # if no gt_seg, run mask = attn
+        K = self.opt.num_slots  # if no gt_seg, run mask = attn
         D = self.opt.n_samp
         self.B, self.NV, self.K, self.C, self.D, self.H, self.W = B, NV, K, C, D, H, W
 
@@ -38,6 +40,7 @@ class UorfRenderer(Renderer):
             x = F.interpolate(x.flatten(0, 1), size=self.opt.supervision_size, mode='bilinear', align_corners=False)
             x = x.reshape(B, NV, 3, self.opt.supervision_size, self.opt.supervision_size)
             self.z_vals, self.ray_dir = z_vals, ray_dir
+            W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
         else:
             W, H, D = self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp
             start_range = self.opt.frustum_size_fine - self.opt.render_size
@@ -77,22 +80,24 @@ class UorfRenderer(Renderer):
         raws = output_decoder['raws'] # Bx(NxDxHxW)x4
         masked_raws = output_decoder['weighted_raws'] # BxKx(NxDxHxW)x4
         unmasked_raws = output_decoder['unweighted_raws'] # BxKx(NxDxHxW)x4
-        masks = output_decoder['masks'] # BxKx(NxDxHxW)x1
+        masks = output_decoder['occupancies'] # BxKx(NxDxHxW)x1
 
         raws = raws.view([B, NV, D, H, W, 4]).permute([0, 1, 3, 4, 2, 5]).flatten(1, 3)  # Bx(NxHxW)xDx4
         masked_raws = masked_raws.view([B, K, NV, D, H, W, 4])
         unmasked_raws = unmasked_raws.view([B, K, NV, D, H, W, 4])
         rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir) # Bx(NxHxW)x3, Bx(NxHxW)
-        rendered = rgb_map.view(B, N, H, W, 3).permute([0, 1, 4, 2, 3])  # BxNx3xHxW
+        rendered = rgb_map.view(B, NV, H, W, 3).permute([0, 1, 4, 2, 3])  # BxNx3xHxW
         x_recon = rendered * 2 - 1
+        depth_map = depth_map.view(B, NV, H, W, 1).permute([0, 1, 4, 2, 3])
 
         output_renderer = {'x_recon': x_recon,
                            'weighted_raws': masked_raws,
                            'unweighted_raws': unmasked_raws,
                            'depth_map': depth_map,
-                           'masks': masks,
-                           'occ_silhouettes': None,
-                           'unocc_silhouettes': None}
+                           'occupancies': masks,
+                           'occl_silhouettes': None,
+                           'unoccl_silhouettes': None,
+                           'x_supervision': x}
         return output_renderer
 
     def get_pixel_coor(self, cam2world, frus_nss_coor):
@@ -130,6 +135,16 @@ class UorfRenderer(Renderer):
         ray_dir_input = ray_dir_input.view([B*N, H, W, 3]).unsqueeze(1).expand(-1, D, -1, -1, -1)
         ray_dir_input = ray_dir_input.flatten(0, 3)
         return ray_dir_input
+
+    def compute_visual(self, raws):
+        N, D, H, W = self.opt.n_img_each_scene, self.opt.n_samp, self.opt.supervision_size, self.opt.supervision_size
+        z_vals, ray_dir = self.z_vals[0:1], self.ray_dir[0:1]
+        raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
+        rgb_map, depth_map, _ = raw2outputs(raws.unsqueeze(0), z_vals, ray_dir)
+        rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+        x_recon = rendered * 2 - 1
+
+        return x_recon
 
 
 def raw2outputs(raw, z_vals, rays_d, render_mask=False):

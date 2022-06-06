@@ -16,10 +16,10 @@ class SlotEncoder(Encoder):
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention
-        z_slots, attn = self.netSlotAttention(feat)  # BxKxC, BxKxN
+        z_slots, attn = self.slot_attention(feat)  # BxKxC, BxKxN
         self.feature = z_slots
 
-        output = {'mask': attn}
+        output = {'output_mask': attn}
         return output
 
     def get_feature(self, coor_feature):

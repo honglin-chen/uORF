@@ -2,6 +2,7 @@ from models.base_classes import Decoder
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 class UorfDecoder(Decoder):
     def __init__(self, opt):
@@ -113,7 +114,12 @@ class UorfDecoder(Decoder):
         masked_raws = unmasked_raws * masks
         raws = masked_raws.sum(dim=1)
 
-        return raws, masked_raws, unmasked_raws, masks
+        output_decoder = {'raws': raws,
+                          'weighted_raws': masked_raws,
+                          'unweighted_raws': unmasked_raws,
+                          'occupancies': masks}
+
+        return output_decoder
 
 
 def sin_emb(x, n_freq=5, keep_ori=True):
