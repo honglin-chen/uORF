@@ -14,12 +14,15 @@ class UorfDecoder(Decoder):
         locality_ratio: if locality, what value is the boundary to clamp?
         fixed_locality: if True, compute locality in world space instead of in transformed view space
         """
-        super().__init__(self, opt)
+        super().__init__(opt)
         self.n_freq = opt.n_freq
-        self.locality = opt.locality
-        self.locality_ratio = opt.locality_ratio
+        self.locality = False
+        self.locality_ratio = 4/7
         self.fixed_locality = opt.fixed_locality
-        self.out_ch = opt.out_ch
+        self.out_ch = 4
+        input_dim = 33 + 64
+        z_dim = 64
+        n_layers = 3
 
         before_skip = [nn.Linear(input_dim, z_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(z_dim + input_dim, z_dim), nn.ReLU(True)]

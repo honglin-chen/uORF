@@ -9,11 +9,11 @@ import os
 import time
 from .projection import Projection
 from torchvision.transforms import Normalize
-from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs
+from .model import get_perceptual_net
 from models.morf.end2end import MorfEnd2end
 
 
-class uorfNoGanModel(BaseModel):
+class uorfTrainModel(BaseModel):
 
     @staticmethod
     def modify_commandline_options(parser, is_train=True):
@@ -57,7 +57,7 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--use_pixel_feat', action='store_true')
         parser.add_argument('--use_voxel_feat', action='store_true')
 
-        parser.add_argument('--silhouette_loss', action='store_true')
+        parser.add_argument('--use_silhouette_loss', action='store_true')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -67,7 +67,7 @@ class uorfNoGanModel(BaseModel):
         return parser
 
     def __init__(self, opt):
-        super(uorfNoGanModel).__init__()
+        super().__init__(opt)
         """Initialize this model class.
 
         Parameters:
@@ -87,7 +87,7 @@ class uorfNoGanModel(BaseModel):
                             ['silhoutte_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['depth_map{}'.format(i) for i in range(n)] + \
                             ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
-        self.model_names = ['MorfEnd2end']
+        self.model_names = ['End2end']
         self.perceptual_net = get_perceptual_net().cuda()
         self.vgg_norm = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         self.netEnd2end = MorfEnd2end(opt)

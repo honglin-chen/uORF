@@ -5,21 +5,23 @@ from .pixel_encoder import PixelEncoder
 
 class EncoderWrapper(Encoder):
     def __init__(self, opt):
-        super().__init__(self, opt)
-        self.slot_encoder = SlotEncoder(opt)
-        self.pixel_encoder = PixelEncoder(opt)
+        super().__init__(opt)
+        self.slot_encoder = SlotEncoder(opt) if self.opt.use_slot_feat else None
+        self.pixel_encoder = PixelEncoder(opt) if self.opt.use_pixel_feat else None
 
     def forward(self, input_encoder):
-        output_slot_encoder = self.slot_encoder(input_encoder)
-        output_pixel_encoder = self.pixel_encoder(input_encoder)
+        output_slot_encoder = self.slot_encoder(input_encoder) if self.opt.use_slot_feat else None
+        output_pixel_encoder = self.pixel_encoder(input_encoder) if self.opt.use_pixel_feat else None
 
         output_encoder = {'mask': output_slot_encoder['mask'],
                           }
         return output_encoder
 
     def get_feature(self, coor_feature):
-        feature = {'slot_feat': self.slot_encoder.get_feature(coor_feature),
-                   'pixel_feat': self.pixel_encoder.get_feature(coor_feature),
+        slot_feat = self.slot_encoder.get_feature(coor_feature) if self.opt.use_slot_feat else None
+        pixel_feat = self.pixel_encoder.get_feature(coor_feature) if self.opt.use_pixel_feat else None
+        feature = {'slot_feat': slot_feat,
+                   'pixel_feat': pixel_feat,
                    'voxel_feat': None
                    }
         return feature

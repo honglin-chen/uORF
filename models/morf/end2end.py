@@ -5,8 +5,8 @@ from models.morf.decoder.uorf_decoder import UorfDecoder
 from models.morf.renderer.uorf_renderer import UorfRenderer
 
 class MorfEnd2end(End2end):
-    def __init__(self):
-        super().__init__(self, opt)
+    def __init__(self, opt):
+        super().__init__(opt)
         self.encoder = EncoderWrapper(opt)
         self.decoder = UorfDecoder(opt)
         self.renderer = UorfRenderer(opt)

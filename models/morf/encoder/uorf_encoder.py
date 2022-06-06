@@ -1,12 +1,13 @@
 from models.base_classes import Encoder
 import torch
 from torch import nn
+from torch.nn import init
 import torch.nn.functional as F
 
 
 class SlotEncoder(Encoder):
     def __init__(self, opt):
-        super().__init__(self, opt)
+        super().__init__(opt)
         self.encoder = SimpleEncoder(input_nc=3, z_dim=64)
         self.slot_attention = SlotAttention(num_slots=opt.num_slots, in_dim=64, slot_dim=64, iters=3, eps=1e-8, hidden_dim=128)
 

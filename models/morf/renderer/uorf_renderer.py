@@ -4,9 +4,11 @@ from .projection import Projection
 
 class UorfRenderer(Renderer):
     def __init__(self, opt):
-        super().__init__(self, opt):
+        super().__init__(opt)
         render_size = (opt.render_size, opt.render_size)
         frustum_size = [self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp]
+        self.gpu_ids = opt.gpu_ids
+        self.device = torch.device('cuda:{}'.format(self.gpu_ids[0])) if self.gpu_ids else torch.device('cpu')  # get device name: CPU or GPU
         self.projection = Projection(device=self.device, nss_scale=opt.nss_scale,
                                      frustum_size=frustum_size, near=opt.near_plane, far=opt.far_plane,
                                      render_size=render_size)

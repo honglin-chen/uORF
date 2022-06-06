@@ -10,7 +10,7 @@ import torch.autograd.profiler as profiler
 
 class PixelEncoder(Encoder):
     def __init__(self, opt):
-        super().__init__(self, opt)
+        super().__init__(opt)
         self.pixel_encoder = PixelNerfEncoder(mask_image=self.opt.mask_image_slot,
                                               mask_image_feature=self.opt.mask_image_feature_slot,
                                               index_interp=self.opt.interp_mode)
