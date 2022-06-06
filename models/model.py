@@ -7,7 +7,6 @@ from torch.nn import init
 from torchvision.models import vgg16
 from torch import autograd
 
-
 def get_perceptual_net(layer=4):
     assert layer > 0
     idx_set = [None, 4, 9, 16, 23, 30]
