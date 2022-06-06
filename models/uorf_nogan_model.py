@@ -48,6 +48,7 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--near_plane', type=float, default=6)
         parser.add_argument('--far_plane', type=float, default=20)
         parser.add_argument('--fixed_locality', action='store_true', help='enforce locality in world space instead of transformed view space')
+        parser.add_argument('--gt_seg', action='store_true', help='use GT segments')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -90,7 +91,7 @@ class uorfNoGanModel(BaseModel):
         self.netEncoder = networks.init_net(Encoder(3, z_dim=z_dim, bottom=opt.bottom),
                                             gpu_ids=self.gpu_ids, init_type='normal')
         self.netSlotAttention = networks.init_net(
-            SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter), gpu_ids=self.gpu_ids, init_type='normal')
+            SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter, gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
         self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
                                                     locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
 
@@ -121,15 +122,26 @@ class uorfNoGanModel(BaseModel):
             input: a dictionary that contains the data itself and its metadata information.
         """
         NS, NV = self.opt.batch_size, self.opt.n_img_each_scene
-        load_size = self.opt.load_size
-        x = input['img_data'].to(self.device).view(NS, NV, 3, load_size, load_size)
+        H = W = self.opt.load_size
+        K = self.opt.num_slots
+        ## Process Input image and camera parameters
+        x = input['img_data'].to(self.device).view(NS, NV, 3, H, W)
         cam2world = input['cam2world'].to(self.device).view(NS, NV, 4, 4)
+
         if not self.opt.fixed_locality:
             cam2world_azi = input['azi_rot'].to(self.device).view(NS, NV, 3, 3)
 
-        return x, cam2world, cam2world_azi
+        ## Process segmentation masks of the input view
+        if 'masks' in input.keys():
+            bg_masks = input['bg_mask'].to(self.device) # [NSxNV, 1, h, w]
+            obj_masks = input['obj_masks'].to(self.device) # [NSxNV, K-1, h, w]
+            bg_masks = bg_masks.view(NS, NV, 1, H, W)[:, 0]  # [NS, 1, h, w]
+            obj_masks = obj_masks.view(NS, NV, K-1, H, W)[:, 0] # [NS, K-1, h, w]
+            masks = torch.cat([bg_masks, obj_masks], dim=1) # [NS, K, h, w]
+            masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode='nearest')
+        return x, cam2world, cam2world_azi, masks
 
-    def forward(self, x, cam2world, cam2world_azi, epoch=0, iter=0):
+    def forward(self, x, cam2world, cam2world_azi, masks=None, epoch=0, iter=0):
         B, NV, C, H, W = x.shape
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
         vis_dict = None
@@ -145,7 +157,7 @@ class uorfNoGanModel(BaseModel):
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention
-        z_slots, attn = self.netSlotAttention(feat)  # BxKxC, BxKxN
+        z_slots, attn = self.netSlotAttention(feat, masks=masks)  # BxKxC, BxKxN
         K = attn.shape[1]
         N = cam2world.shape[1]
         if self.opt.stage == 'coarse':
@@ -160,11 +172,11 @@ class uorfNoGanModel(BaseModel):
             rs = self.opt.render_size
             frus_nss_coor, z_vals, ray_dir = self.projection_fine.construct_sampling_coor(cam2world)
             # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
-            frus_nss_coor, z_vals, ray_dir = frus_nss_coor.view([N, D, H, W, 3]), z_vals.view([N, H, W, D]), ray_dir.view([N, H, W, 3])
+            frus_nss_coor, z_vals, ray_dir = frus_nss_coor.view([B, N, D, H, W, 3]), z_vals.view([B, N, H, W, D]), ray_dir.view([B, N, H, W, 3])
             H_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             W_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
             frus_nss_coor_, z_vals_, ray_dir_ = frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(0, 3), z_vals_.flatten(0, 2), ray_dir_.flatten(0, 2)
+            frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(1, 4), z_vals_.flatten(1, 3), ray_dir_.flatten(1, 3)
             x = x[:, :, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.z_vals, self.ray_dir = z_vals, ray_dir
 

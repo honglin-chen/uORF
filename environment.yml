@@ -5,9 +5,9 @@ channels:
   - defaults
 dependencies:
   - python=3.8.8=hdb3f193_4
-  - pytorch=1.7.1=py3.8_cuda11.0.221_cudnn8.0.5_0
-  - torchvision=0.8.2=py38_cu110
-  - cudatoolkit=11.0.221=h6bb024c_0
+  - pytorch=1.11.0=py3.8_cuda11.3_cudnn8.2.0_0
+  - torchvision=0.12.0=py38_cu113
+  - cudatoolkit=11.3.1=h2bc3f7f_2
   - numpy
   - pillow
   - pip=21.0.1=py38h06a4308_0

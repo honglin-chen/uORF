@@ -5,6 +5,7 @@ from models import create_model
 from util.visualizer import Visualizer
 from util.util import AverageMeter, set_seed
 import torch.nn as nn
+import torch
 
 
 if __name__ == '__main__':
@@ -13,6 +14,9 @@ if __name__ == '__main__':
     dataset_size = len(dataset)    # get the number of images in the dataset.
     print('The number of training images = %d' % dataset_size)
 
+    device_count = torch.cuda.device_count()
+    print('Number of GPUs, Batch size: %d, %d' % (device_count, opt.batch_size))
+    assert opt.batch_size % device_count == 0, "Expect batch size to be an integer multiple of the number of GPUs"
     model = create_model(opt)      # create a model given opt.model and other options
     model.setup(opt)               # regular setup: load and print networks; create schedulers
     model = nn.DataParallel(model)
@@ -38,8 +42,8 @@ if __name__ == '__main__':
             total_iters += opt.batch_size
             epoch_iter += opt.batch_size
 
-            x, cam2world, cam2azi = model.module.set_input(data)         # unpack data from dataset and apply preprocessing
-            loss_recon, loss_perc, vis = model(x, cam2world, cam2azi, epoch=epoch, iter=total_iters) # feedforward and calculate loss
+            x, cam2world, cam2azi, masks = model.module.set_input(data)         # unpack data from dataset and apply preprocessing
+            loss_recon, loss_perc, vis = model(x, cam2world, cam2azi, masks, epoch=epoch, iter=total_iters) # feedforward and calculate loss
             loss = loss_recon.mean() + loss_perc.mean()
             layers, avg_grad = model.module.optimize_parameters(loss, opt.display_grad, epoch)   # get gradients, update network weights
 
