@@ -9,11 +9,11 @@ import os
 import time
 from .projection import Projection
 from torchvision.transforms import Normalize
-from .model import Encoder, Decoder, SlotAttention, get_perceptual_net, raw2outputs
+from .model import get_perceptual_net
 from models.morf.end2end import MorfEnd2end
 
 
-class uorfNoGanModel(BaseModel):
+class uorfTrainModel(BaseModel):
 
     @staticmethod
     def modify_commandline_options(parser, is_train=True):
@@ -49,7 +49,16 @@ class uorfNoGanModel(BaseModel):
         parser.add_argument('--near_plane', type=float, default=6)
         parser.add_argument('--far_plane', type=float, default=20)
         parser.add_argument('--fixed_locality', action='store_true', help='enforce locality in world space instead of transformed view space')
-        parser.add_argument('--gt_seg', action='store_true', help='use GT segments')
+
+        parser.add_argument('--mask_image', action='store_true')
+        parser.add_argument('--mask_image_feature', action='store_true')
+        parser.add_argument('--use_ray_dir_world', action='store_true')
+        parser.add_argument('--use_slot_feat', action='store_true')
+        parser.add_argument('--visualize_silhouette', action='store_true')
+
+        parser.add_argument('--use_pixel_feat', action='store_true')
+        parser.add_argument('--use_voxel_feat', action='store_true')
+        parser.add_argument('--use_silhouette_loss', action='store_true')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -59,7 +68,7 @@ class uorfNoGanModel(BaseModel):
         return parser
 
     def __init__(self, opt):
-        super(uorfNoGanModel).__init__()
+        super().__init__(opt)
         """Initialize this model class.
 
         Parameters:
@@ -75,30 +84,22 @@ class uorfNoGanModel(BaseModel):
         self.visual_names = ['x{}'.format(i) for i in range(n)] + \
                             ['x_rec{}'.format(i) for i in range(n)] + \
                             ['slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
-                            ['unmasked_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
-                            ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
-        self.model_names = ['Encoder', 'SlotAttention', 'Decoder']
+                            ['unmasked_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)]
+        if self.opt.visualize_silhouette:
+            self.visual_names += ['occl_silhouette_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)]
+        # self.visual_names += ['depth_map{}'.format(i) for i in range(n)] + \
+        #                      ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
+        # print('You will visualize these images \n', self.visual_names)
+        self.model_names = ['End2end']
         self.perceptual_net = get_perceptual_net().cuda()
         self.vgg_norm = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        render_size = (opt.render_size, opt.render_size)
-        frustum_size = [self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp]
-        self.projection = Projection(device=self.device, nss_scale=opt.nss_scale,
-                                     frustum_size=frustum_size, near=opt.near_plane, far=opt.far_plane, render_size=render_size)
-        frustum_size_fine = [self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp]
-        self.projection_fine = Projection(device=self.device, nss_scale=opt.nss_scale,
-                                          frustum_size=frustum_size_fine, near=opt.near_plane, far=opt.far_plane, render_size=render_size)
-        z_dim = opt.z_dim
-        self.num_slots = opt.num_slots
-        self.netEncoder = networks.init_net(Encoder(3, z_dim=z_dim, bottom=opt.bottom),
-                                            gpu_ids=self.gpu_ids, init_type='normal')
-        self.netSlotAttention = networks.init_net(
-            SlotAttention(num_slots=opt.num_slots, in_dim=z_dim, slot_dim=z_dim, iters=opt.attn_iter, gt_seg=opt.gt_seg), gpu_ids=self.gpu_ids, init_type='normal')
-        self.netDecoder = networks.init_net(Decoder(n_freq=opt.n_freq, input_dim=6*opt.n_freq+3+z_dim, z_dim=opt.z_dim, n_layers=opt.n_layer,
-                                                    locality_ratio=opt.obj_scale/opt.nss_scale, fixed_locality=opt.fixed_locality), gpu_ids=self.gpu_ids, init_type='xavier')
+        self.netEnd2end = networks.init_net(MorfEnd2end(opt), gpu_ids=self.gpu_ids, init_type=None)
+
+        self.device = torch.device('cuda:{}'.format(self.gpu_ids[0])) if self.gpu_ids else torch.device('cpu')
 
         if self.isTrain:  # only defined during training time
             self.optimizer = optim.Adam(chain(
-                self.netEncoder.parameters(), self.netSlotAttention.parameters(), self.netDecoder.parameters()
+                self.netEnd2end.parameters(),
             ), lr=opt.lr)
             self.optimizers = [self.optimizer]
 
@@ -123,77 +124,39 @@ class uorfNoGanModel(BaseModel):
             input: a dictionary that contains the data itself and its metadata information.
         """
         NS, NV = self.opt.batch_size, self.opt.n_img_each_scene
-        H = W = self.opt.load_size
-        K = self.opt.num_slots
-        ## Process Input image and camera parameters
-        x = input['img_data'].to(self.device).view(NS, NV, 3, H, W)
+        load_size = self.opt.load_size
+        x = input['img_data'].to(self.device).view(NS, NV, 3, load_size, load_size)
         cam2world = input['cam2world'].to(self.device).view(NS, NV, 4, 4)
-
         if not self.opt.fixed_locality:
             cam2world_azi = input['azi_rot'].to(self.device).view(NS, NV, 3, 3)
 
-        ## Process segmentation masks of the input view
-        if 'masks' in input.keys():
-            bg_masks = input['bg_mask'].to(self.device) # [NSxNV, 1, h, w]
-            obj_masks = input['obj_masks'].to(self.device) # [NSxNV, K-1, h, w]
-            bg_masks = bg_masks.view(NS, NV, 1, H, W)[:, 0]  # [NS, 1, h, w]
-            obj_masks = obj_masks.view(NS, NV, K-1, H, W)[:, 0] # [NS, K-1, h, w]
-            masks = torch.cat([bg_masks, obj_masks], dim=1) # [NS, K, h, w]
-            masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode='nearest')
-        return x, cam2world, cam2world_azi, masks
+        return x, cam2world, cam2world_azi
 
-    def forward(self, x, cam2world, cam2world_azi, masks=None, epoch=0, iter=0):
+    def forward(self, x, cam2world, cam2world_azi, epoch=0, iter=0):
         B, NV, C, H, W = x.shape
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
         vis_dict = None
         self.weight_percept = self.opt.weight_percept if epoch >= self.opt.percept_in else 0
         self.loss_recon = 0
         self.loss_perc = 0
-        dev = x[:, 0:1].device
-        nss2cam0 = cam2world[:, 0:1].inverse() if self.opt.fixed_locality else cam2world_azi[:, 0:1].inverse()
 
-        # Encoding images
-        feature_map = self.netEncoder(F.interpolate(x[:, 0:1].flatten(0, 1), size=self.opt.input_size,
-                                                    mode='bilinear', align_corners=False))  # BxCxHxW
-        feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
+        mask = None
 
-        # Slot Attention
-        z_slots, attn = self.netSlotAttention(feat, masks=masks)  # BxKxC, BxKxN
-        K = attn.shape[1]
-        N = cam2world.shape[1]
-        if self.opt.stage == 'coarse':
-            frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
-            # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
-            x = F.interpolate(x.flatten(0, 1), size=self.opt.supervision_size, mode='bilinear', align_corners=False)
-            x = x.reshape(B, NV, 3, self.opt.supervision_size, self.opt.supervision_size)
-            self.z_vals, self.ray_dir = z_vals, ray_dir
-        else:
-            W, H, D = self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp
-            start_range = self.opt.frustum_size_fine - self.opt.render_size
-            rs = self.opt.render_size
-            frus_nss_coor, z_vals, ray_dir = self.projection_fine.construct_sampling_coor(cam2world)
-            # (NxDxHxW)x3, (NxHxW)xD, (NxHxW)x3
-            frus_nss_coor, z_vals, ray_dir = frus_nss_coor.view([B, N, D, H, W, 3]), z_vals.view([B, N, H, W, D]), ray_dir.view([B, N, H, W, 3])
-            H_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
-            W_idx = torch.randint(low=0, high=start_range, size=(1,), device=dev)
-            frus_nss_coor_, z_vals_, ray_dir_ = frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
-            frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(1, 4), z_vals_.flatten(1, 3), ray_dir_.flatten(1, 3)
-            x = x[:, :, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
-            self.z_vals, self.ray_dir = z_vals, ray_dir
+        input_end2end = {'input_img': x,
+                         'input_mask': mask,
+                         'cam2world': cam2world,
+                         'cam2world_azi': cam2world_azi}
 
-        sampling_coor_fg = frus_nss_coor[:, None, ...].expand(-1, K - 1, -1, -1)  # (K-1)xPx3
-        sampling_coor_bg = frus_nss_coor  # BxPx3
+        output_end2end = self.netEnd2end(input_end2end)
 
-        W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
-        raws, masked_raws, unmasked_raws, masks = self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0)  # Bx(NxDxHxW)x4, BxKx(NxDxHxW)x4, BxKx(NxDxHxW)x4, BxKx(NxDxHxW)x1
-        raws = raws.view([B, N, D, H, W, 4]).permute([0, 1, 3, 4, 2, 5]).flatten(start_dim=1, end_dim=3)  # Bx(NxHxW)xDx4
-        masked_raws = masked_raws.view([B, K, N, D, H, W, 4])
-        unmasked_raws = unmasked_raws.view([B, K, N, D, H, W, 4])
-        rgb_map, _, _ = raw2outputs(raws, z_vals, ray_dir)
-        # Bx(NxHxW)x3, Bx(NxHxW)
-
-        rendered = rgb_map.view(B, N, H, W, 3).permute([0, 1, 4, 2, 3])  # BxNx3xHxW
-        x_recon = rendered * 2 - 1
+        x_recon = output_end2end['x_recon']
+        rendered = (x_recon + 1) / 2
+        attn = output_end2end['output_mask']
+        masked_raws = output_end2end['weighted_raws']
+        unmasked_raws = output_end2end['unweighted_raws']
+        depth_map = output_end2end['depth_map']
+        occl_silhouettes = output_end2end['occl_silhouettes']
+        x = output_end2end['x_supervision']
 
         self.loss_recon = self.L2_loss(x_recon, x)
         x_norm, rendered_norm = self.vgg_norm((x.flatten(0, 1) + 1) / 2), self.vgg_norm(rendered.flatten(0, 1))
@@ -202,13 +165,15 @@ class uorfNoGanModel(BaseModel):
 
         with torch.no_grad():
             attn = attn[0].detach()  # KxN, only the first in batch
-            H_, W_ = feature_map[0:1].shape[2], feature_map.shape[3]
+            H_, W_ = self.opt.input_size, self.opt.input_size
             attn = attn.view(self.opt.num_slots, 1, H_, W_)
             if H_ != H:
                 attn = F.interpolate(attn, size=[H, W], mode='bilinear')
             for i in range(self.opt.n_img_each_scene):
                 setattr(self, 'x_rec{}'.format(i), x_recon[0:1, i]) # only the first in batch
                 setattr(self, 'x{}'.format(i), x[0:1, i]) # only the first in batch
+                setattr(self, 'depth_map{}'.format(i), depth_map[0:1, i])
+            setattr(self, 'occl_silhouettes', occl_silhouettes[0].detach() if self.opt.visualize_silhouette else None)
             setattr(self, 'masked_raws', masked_raws[0].detach()) # only the first in batch
             setattr(self, 'unmasked_raws', unmasked_raws[0].detach()) # only the first in batch
             setattr(self, 'attn', attn)
@@ -224,25 +189,23 @@ class uorfNoGanModel(BaseModel):
             _, N, D, H, W, _ = self.masked_raws.shape
             masked_raws = self.masked_raws  # KxNxDxHxWx4
             unmasked_raws = self.unmasked_raws  # KxNxDxHxWx4
-            for k in range(self.num_slots):
-                raws = masked_raws[k]  # NxDxHxWx4
-                z_vals, ray_dir = self.z_vals[0:1], self.ray_dir[0:1]
-                raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                rgb_map, depth_map, _ = raw2outputs(raws.unsqueeze(0), z_vals, ray_dir)
-                rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                x_recon = rendered * 2 - 1
+            occl_silhouettes = self.occl_silhouettes
+            for k in range(self.opt.num_slots):
+                x_recon = self.netEnd2end.renderer.compute_visual(masked_raws[k])
                 for i in range(self.opt.n_img_each_scene):
                     setattr(self, 'slot{}_view{}'.format(k, i), x_recon[i].unsqueeze(0))
 
-                raws = unmasked_raws[k]  # (NxDxHxW)x4
-                raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-                rgb_map, depth_map, _ = raw2outputs(raws.unsqueeze(0), z_vals, ray_dir)
-                rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-                x_recon = rendered * 2 - 1
+                x_recon = self.netEnd2end.renderer.compute_visual(unmasked_raws[k])
                 for i in range(self.opt.n_img_each_scene):
                     setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i].unsqueeze(0))
 
                 setattr(self, 'slot{}_attn'.format(k), self.attn[k].unsqueeze(0) * 2 - 1)
+
+                if self.opt.visualize_silhouette:
+                    occl_sil = occl_silhouettes[:, k]  # (NxKxHxW)
+                    for i in range(self.opt.n_img_each_scene):
+                        setattr(self, 'occl_silhouette_slot{}_view{}'.format(k, i),
+                                occl_sil[i].expand(3, occl_sil[i].shape[0], occl_sil[i].shape[1]))
 
     def optimize_parameters(self, loss, ret_grad=False, epoch=0):
         """Update network weights; it will be called in every training iteration."""
@@ -252,7 +215,7 @@ class uorfNoGanModel(BaseModel):
         avg_grads = []
         layers = []
         if ret_grad:
-            for n, p in chain(self.netEncoder.named_parameters(), self.netSlotAttention.named_parameters(), self.netDecoder.named_parameters()):
+            for n, p in chain(self.netEnd2end.named_parameters(),):
                 if p.grad is not None and "bias" not in n:
                     with torch.no_grad():
                         layers.append(n)
