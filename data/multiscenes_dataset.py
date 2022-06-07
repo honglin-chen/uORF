@@ -1,6 +1,7 @@
 import os
 
 import torchvision.transforms.functional as TF
+from torchvision.transforms import InterpolationMode
 
 from data.base_dataset import BaseDataset
 from PIL import Image
@@ -72,7 +73,7 @@ class MultiscenesDataset(BaseDataset):
 
     def _transform(self, img):
         if self.opt.dataset_nearest_interp:
-            img = TF.resize(img, (self.opt.load_size, self.opt.load_size), Image.NEAREST)
+            img = TF.resize(img, (self.opt.load_size, self.opt.load_size), InterpolationMode.NEAREST)
         else:
             img = TF.resize(img, (self.opt.load_size, self.opt.load_size))
 
@@ -95,7 +96,7 @@ class MultiscenesDataset(BaseDataset):
         return img
 
     def _transform_mask(self, img):
-        img = TF.resize(img, (self.opt.mask_size, self.opt.mask_size), Image.NEAREST)
+        img = TF.resize(img, (self.opt.mask_size, self.opt.mask_size), InterpolationMode.NEAREST)
         img = TF.to_tensor(img)
         img = TF.normalize(img, [0.5] * img.shape[0], [0.5] * img.shape[0])  # [0,1] -> [-1,1]
         return img

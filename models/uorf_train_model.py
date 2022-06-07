@@ -52,14 +52,15 @@ class uorfTrainModel(BaseModel):
 
         parser.add_argument('--mask_image', action='store_true')
         parser.add_argument('--mask_image_feature', action='store_true')
-        parser.add_argument('--use_ray_dir_world', action='store_true')
         parser.add_argument('--use_slot_feat', action='store_true')
-        parser.add_argument('--visualize_silhouette', action='store_true')
-
         parser.add_argument('--use_pixel_feat', action='store_true')
+        parser.add_argument('--gt_seg', action='store_true', help='use GT segments')
+        parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
+
+        parser.add_argument('--use_ray_dir_world', action='store_true')
+        parser.add_argument('--visualize_silhouette', action='store_true')
         parser.add_argument('--use_voxel_feat', action='store_true')
         parser.add_argument('--use_silhouette_loss', action='store_true')
-        parser.add_argument('--gt_seg', action='store_true', help='use GT segments')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')

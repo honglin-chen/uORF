@@ -10,6 +10,7 @@ class Projection(nn.Module):
                  nss_scale=7, render_size=(64, 64)):
         super(Projection, self).__init__()
         self.render_size = render_size
+        focal_ratio = [float(i) for i in focal_ratio]
         self.focal_ratio = focal_ratio
         self.near = near
         self.far = far

@@ -11,11 +11,11 @@ class UorfRenderer(Renderer):
         frustum_size = [self.opt.frustum_size, self.opt.frustum_size, self.opt.n_samp]
         self.gpu_ids = opt.gpu_ids
         self.device = torch.device('cuda:{}'.format(self.gpu_ids[0])) if self.gpu_ids else torch.device('cpu')  # get device name: CPU or GPU
-        self.projection = Projection(device=self.device, nss_scale=opt.nss_scale,
+        self.projection = Projection(device=self.device, nss_scale=opt.nss_scale, focal_ratio=opt.focal_ratio,
                                      frustum_size=frustum_size, near=opt.near_plane, far=opt.far_plane,
                                      render_size=render_size)
         frustum_size_fine = [self.opt.frustum_size_fine, self.opt.frustum_size_fine, self.opt.n_samp]
-        self.projection_fine = Projection(device=self.device, nss_scale=opt.nss_scale,
+        self.projection_fine = Projection(device=self.device, nss_scale=opt.nss_scale, focal_ratio=opt.focal_ratio,
                                           frustum_size=frustum_size_fine, near=opt.near_plane, far=opt.far_plane,
                                           render_size=render_size)
         self.register_buffer('frustum_size', torch.tensor([i * 1.0 for i in self.projection.frustum_size]).cuda())

@@ -96,3 +96,7 @@ for the codebase and textures of the Room Diverse dataset.
 
 In ``/image_generation/scripts`` run ``generate_1200shape_50bg.sh`` and then ``render_1200_shapes.sh``.
 Don't forget to change the root directory in both scripts.
+
+
+## Training options
+- not yet documented

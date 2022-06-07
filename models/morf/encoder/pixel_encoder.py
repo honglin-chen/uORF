@@ -180,6 +180,7 @@ class PixelNerfEncoder(nn.Module):
             x = F.interpolate(
                 x,
                 scale_factor=self.feature_scale,
+                mode='bilinear', align_corners=False
                 # mode=self.index_interp,
                 # mode="bilinear" if self.feature_scale > 1.0 else "area",
                 # align_corners=True if self.feature_scale > 1.0 else None,
