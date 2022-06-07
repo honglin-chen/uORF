@@ -59,6 +59,7 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--use_pixel_feat', action='store_true')
         parser.add_argument('--use_voxel_feat', action='store_true')
         parser.add_argument('--use_silhouette_loss', action='store_true')
+        parser.add_argument('--gt_seg', action='store_true', help='use GT segments')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -124,15 +125,25 @@ class uorfTrainModel(BaseModel):
             input: a dictionary that contains the data itself and its metadata information.
         """
         NS, NV = self.opt.batch_size, self.opt.n_img_each_scene
+        H = W = self.opt.load_size
+        K = self.opt.num_slots
         load_size = self.opt.load_size
         x = input['img_data'].to(self.device).view(NS, NV, 3, load_size, load_size)
         cam2world = input['cam2world'].to(self.device).view(NS, NV, 4, 4)
         if not self.opt.fixed_locality:
             cam2world_azi = input['azi_rot'].to(self.device).view(NS, NV, 3, 3)
 
-        return x, cam2world, cam2world_azi
+        ## Process segmentation masks of the input view
+        if 'masks' in input.keys():
+            bg_masks = input['bg_mask'].to(self.device)  # [NSxNV, 1, h, w]
+            obj_masks = input['obj_masks'].to(self.device)  # [NSxNV, K-1, h, w]
+            bg_masks = bg_masks.view(NS, NV, 1, H, W)[:, 0]  # [NS, 1, h, w]
+            obj_masks = obj_masks.view(NS, NV, K - 1, H, W)[:, 0]  # [NS, K-1, h, w]
+            masks = torch.cat([bg_masks, obj_masks], dim=1)  # [NS, K, h, w]
+            masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode='nearest')
+        return x, cam2world, cam2world_azi, masks
 
-    def forward(self, x, cam2world, cam2world_azi, epoch=0, iter=0):
+    def forward(self, x, cam2world, cam2world_azi, masks, epoch=0, iter=0):
         B, NV, C, H, W = x.shape
         """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
         vis_dict = None
@@ -140,10 +151,8 @@ class uorfTrainModel(BaseModel):
         self.loss_recon = 0
         self.loss_perc = 0
 
-        mask = None
-
         input_end2end = {'input_img': x,
-                         'input_mask': mask,
+                         'input_mask': masks,
                          'cam2world': cam2world,
                          'cam2world_azi': cam2world_azi}
 

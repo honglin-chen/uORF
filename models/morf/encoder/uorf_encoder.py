@@ -9,14 +9,15 @@ class SlotEncoder(Encoder):
     def __init__(self, opt):
         super().__init__(opt)
         self.encoder = SimpleEncoder(input_nc=3, z_dim=64)
-        self.slot_attention = SlotAttention(num_slots=opt.num_slots, in_dim=64, slot_dim=64, iters=3, eps=1e-8, hidden_dim=128)
+        self.slot_attention = SlotAttention(num_slots=opt.num_slots, in_dim=64, slot_dim=64, iters=3, eps=1e-8,
+                                            hidden_dim=128, gt_seg=opt.gt_seg)
 
     def forward(self, input_encoder):
         feature_map = self.encoder(input_encoder['input_img']) # BxCxHxW
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention
-        z_slots, attn = self.slot_attention(feat)  # BxKxC, BxKxN
+        z_slots, attn = self.slot_attention(feat, masks=input_encoder['input_mask'])  # BxKxC, BxKxN
         self.feature = z_slots
 
         output = {'output_mask': attn}
@@ -81,12 +82,13 @@ class SimpleEncoder(nn.Module):
 
 
 class SlotAttention(nn.Module):
-    def __init__(self, num_slots, in_dim=64, slot_dim=64, iters=3, eps=1e-8, hidden_dim=128):
+    def __init__(self, num_slots, in_dim=64, slot_dim=64, iters=3, eps=1e-8, hidden_dim=128, gt_seg=False):
         super().__init__()
         self.num_slots = num_slots
         self.iters = iters
         self.eps = eps
         self.scale = slot_dim ** -0.5
+        self.gt_seg = gt_seg
 
         self.slots_mu = nn.Parameter(torch.randn(1, 1, slot_dim))
         self.slots_logsigma = nn.Parameter(torch.zeros(1, 1, slot_dim))
@@ -121,7 +123,7 @@ class SlotAttention(nn.Module):
         self.norm_feat = nn.LayerNorm(in_dim)
         self.slot_dim = slot_dim
 
-    def forward(self, feat, num_slots=None):
+    def forward(self, feat, num_slots=None, masks=None):
         """
         input:
             feat: visual feature with position information, BxNxC
@@ -129,6 +131,8 @@ class SlotAttention(nn.Module):
         """
         B, _, _ = feat.shape
         K = num_slots if num_slots is not None else self.num_slots
+        if masks is not None:
+            masks = masks.flatten(2, 3) # [B, K, N]
 
         mu = self.slots_mu.expand(B, K-1, -1)
         sigma = self.slots_logsigma.exp().expand(B, K-1, -1)
@@ -151,10 +155,18 @@ class SlotAttention(nn.Module):
             dots_fg = torch.einsum('bid,bjd->bij', q_fg, k) * self.scale
             dots_bg = torch.einsum('bid,bjd->bij', q_bg, k) * self.scale
             dots = torch.cat([dots_bg, dots_fg], dim=1)  # BxKxN
-            attn = dots.softmax(dim=1) + self.eps  # BxKxN
-            attn_bg, attn_fg = attn[:, 0:1, :], attn[:, 1:, :]  # Bx1xN, Bx(K-1)xN
-            attn_weights_bg = attn_bg / attn_bg.sum(dim=-1, keepdim=True)  # Bx1xN
-            attn_weights_fg = attn_fg / attn_fg.sum(dim=-1, keepdim=True)  # Bx(K-1)xN
+
+            if self.gt_seg is not None:
+                # Replace slot attention with GT segmentations
+                attn_bg, attn_fg = masks[:, 0:1], masks[:, 1:]
+                attn = torch.cat([attn_bg, attn_fg], dim=1)
+            else:
+                attn = dots.softmax(dim=1) + self.eps  # BxKxN
+                attn_bg, attn_fg = attn[:, 0:1, :], attn[:, 1:, :]  # Bx1xN, Bx(K-1)xN
+
+            # Add small epsilon to prevent division by zero
+            attn_weights_bg = attn_bg / (attn_bg.sum(dim=-1, keepdim=True) + 1e-12)  # Bx1xN
+            attn_weights_fg = attn_fg / (attn_fg.sum(dim=-1, keepdim=True) + 1e-12)  # Bx(K-1)xN
 
             updates_bg = torch.einsum('bjd,bij->bid', v, attn_weights_bg)
             updates_fg = torch.einsum('bjd,bij->bid', v, attn_weights_fg)

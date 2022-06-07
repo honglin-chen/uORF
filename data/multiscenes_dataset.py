@@ -65,7 +65,7 @@ class MultiscenesDataset(BaseDataset):
             self.color_transform = transforms.ColorJitter(0.4, 0.4, 0.4, 0.4)
 
         # todo: debugging room_chair_train only, set the flag to False for TDW dataset
-        self.disable_load_mask = True
+        self.disable_load_mask = False
 
         if 'tdw' in self.scenes[0][0]:
             assert not self.disable_load_mask, "this flag is for debugging room_chair_train only, set the flag to False for TDW dataset"
