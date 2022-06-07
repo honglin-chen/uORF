@@ -11,7 +11,7 @@ class MorfEnd2end(End2end):
         self.gpu_ids = opt.gpu_ids
         self.encoder = EncoderWrapper(opt)
         self.decoder = networks.init_net(UorfDecoder(opt), gpu_ids=self.gpu_ids, init_type='xavier')
-        self.renderer = UorfRenderer(opt)
+        self.renderer = networks.init_net(UorfRenderer(opt), gpu_ids=self.gpu_ids, init_type=None)
 
     def forward(self, input_end2end):
         '''

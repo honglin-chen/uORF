@@ -15,7 +15,12 @@ class EncoderWrapper(Encoder):
         output_slot_encoder = self.slot_encoder(input_encoder) if self.opt.use_slot_feat else None
         output_pixel_encoder = self.pixel_encoder(input_encoder) if self.opt.use_pixel_feat else None
 
-        output_encoder = {'output_mask': output_slot_encoder['output_mask'],
+        if self.opt.use_slot_feat:
+            output_mask = output_slot_encoder['output_mask']
+        elif self.opt.use_pixel_feat:
+            output_mask = output_pixel_encoder['output_mask']
+
+        output_encoder = {'output_mask': output_mask,
                           }
         return output_encoder
 

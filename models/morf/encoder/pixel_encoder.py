@@ -2,41 +2,47 @@ from models.base_classes import Encoder
 import torch
 from torch import nn
 import torch.nn.functional as F
-
+import functools
 import torchvision
 # from model.custom_encoder import ConvEncoder
 import torch.autograd.profiler as profiler
 
+# Now, pixel encoder does not work if you have more than one batch per gpu
 
 class PixelEncoder(Encoder):
     def __init__(self, opt):
         super().__init__(opt)
-        self.pixel_encoder = PixelNerfEncoder(mask_image=self.opt.mask_image_slot,
-                                              mask_image_feature=self.opt.mask_image_feature_slot,
-                                              index_interp=self.opt.interp_mode)
+        self.pixel_encoder = PixelNerfEncoder(mask_image=self.opt.mask_image,
+                                              mask_image_feature=self.opt.mask_image_feature,
+                                              index_interp='bilinear')
 
     def forward(self, input_encoder):
-        masks = input_encoder['input_mask'] # (BxK)xHxWx3
+        masks = input_encoder['input_mask'] # BxKxHxW
+        # print('pixel encoder', 'masks.shape', masks.shape)
         masks = masks.squeeze(0) if self.opt.mask_image or self.opt.mask_image_feature else None
-        feature_map_pixel = self.pixel_encoder(input['input_img'], masks=masks)
-        return masks
+        feature_map_pixel = self.pixel_encoder(input_encoder['input_img'], masks=masks)
+        output = {'output_mask': input_encoder['input_mask']}
+        return output
 
     def get_feature(self, coor_feature):
+
         if not self.opt.use_pixel_feat:
             return None
-        uv = coor_feature['pixel_coor']
-        B, K = self.opt.batch_size, self.opt.num_slots
+        uv = coor_feature['uv']
+        B, P, _ = uv.shape # BxPx2
+        K = self.opt.num_slots
 
         if self.opt.mask_image or self.opt.mask_image_feature:
-            uv = uv.expand(B*K, -1, -1) # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
-            pixel_feat = self.pixel_encoder.index(uv)  # Kx(NxDxHxW)x2 -> KxCx(NxDxHxW)
+            uv = uv.expand(B*K, -1, -1) # Bx(NxDxHxW)x2 -> (BxK)x(NxDxHxW)x2
+            pixel_feat = self.pixel_encoder.index(uv)  # (BxK)x(NxDxHxW)x2 -> (BxK)xCx(NxDxHxW)
             pixel_feat = pixel_feat.transpose(1, 2)
         else:
-            pixel_feat = self.pixel_encoder.index(uv)  # 1x(NxDxHxW)x2 -> 1xCx(NxDxHxW)
-            pixel_feat = pixel_feat.transpose(1, 2)  # 1x(NxDxHxW)xC
-            pixel_feat = pixel_feat.expand(K, -1, -1) # Kx(NxDxHxW)xC
-            uv = uv.expand(K, -1, -1)  # 1x(NxDxHxW)x2 -> Kx(NxDxHxW)x2
-        return pixel_feat
+            pixel_feat = self.pixel_encoder.index(uv)  # Bx(NxDxHxW)x2 -> BxCx(NxDxHxW)
+            pixel_feat = pixel_feat.transpose(1, 2)  # BxCx(NxDxHxW) -> Bx(NxDxHxW)xC
+            pixel_feat = pixel_feat.expand(B*K, -1, -1) # (BxK)x(NxDxHxW)xC
+            uv = uv.expand(B*K, -1, -1)  # Bx(NxDxHxW)x2 -> (BxK)x(NxDxHxW)x2
+
+        return pixel_feat.view(B, K, P, -1) # this should be BxKxPxC
 
 
 """
@@ -307,3 +313,26 @@ class ImageEncoder(nn.Module):
             pretrained=conf.get_bool("pretrained", True),
             latent_size=conf.get_int("latent_size", 128),
         )
+
+def get_norm_layer(norm_type="instance", group_norm_groups=32):
+    """Return a normalization layer
+    Parameters:
+        norm_type (str) -- the name of the normalization layer: batch | instance | none
+    For BatchNorm, we use learnable affine parameters and track running statistics (mean/stddev).
+    For InstanceNorm, we do not use learnable affine parameters. We do not track running statistics.
+    """
+    if norm_type == "batch":
+        norm_layer = functools.partial(
+            nn.BatchNorm2d, affine=True, track_running_stats=True
+        )
+    elif norm_type == "instance":
+        norm_layer = functools.partial(
+            nn.InstanceNorm2d, affine=False, track_running_stats=False
+        )
+    elif norm_type == "group":
+        norm_layer = functools.partial(nn.GroupNorm, group_norm_groups)
+    elif norm_type == "none":
+        norm_layer = None
+    else:
+        raise NotImplementedError("normalization layer [%s] is not found" % norm_type)
+    return norm_layer

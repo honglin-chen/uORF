@@ -21,9 +21,14 @@ class UorfDecoder(Decoder):
         self.locality_ratio = 4/7
         self.fixed_locality = opt.fixed_locality
         self.out_ch = 4
-        input_dim = 33 + 64
-        z_dim = 64
+        input_dim = 33 # this is coor dimension
         n_layers = 3
+        z_dim = 64  # this is not self.opt.z_dim
+        self.C = 0
+        self.C += 64 if self.opt.use_pixel_feat else 0 # make this configurable
+        self.C += 64 if self.opt.use_slot_feat else 0 # make this configurable
+        self.C += 3 if self.opt.use_ray_dir_world else 0
+        input_dim += self.C
 
         before_skip = [nn.Linear(input_dim, z_dim), nn.ReLU(True)]
         after_skip = [nn.Linear(z_dim + input_dim, z_dim), nn.ReLU(True)]
@@ -64,11 +69,11 @@ class UorfDecoder(Decoder):
         sampling_coor_bg = input_decoder['coor_bg']
         sampling_coor_fg = input_decoder['coor_fg']
         z_slots = input_decoder['slot_feat']
+        pixel_feat = input_decoder['pixel_feat']
         fg_transform = input_decoder['fg_transform']
 
-
-        B, K, C = z_slots.shape
-        P = sampling_coor_bg.shape[1]
+        B, P, _ = sampling_coor_bg.shape
+        K = self.opt.num_slots
 
         if self.fixed_locality:
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # Bx(K-1)xP
@@ -83,15 +88,24 @@ class UorfDecoder(Decoder):
             sampling_coor_fg = sampling_coor_fg.squeeze(-1)  # Bx(K-1)xPx3
             outsider_idx = torch.any(sampling_coor_fg.abs() > self.locality_ratio, dim=-1)  # Bx(K-1)xP
 
-        z_bg = z_slots[:, 0:1, :]  # Bx1xC
-        z_fg = z_slots[:, 1:, :]  # Bx(K-1)xC
-        query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # BxPx60, 60 means increased-freq feat dim
-        input_bg = torch.cat([query_bg, z_bg.expand(-1, P, -1)], dim=-1)  # BxPx(60+C)
-
+        input_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # BxPx60, 60 means increased-freq feat dim
         sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=1, end_dim=2)  # Bx((K-1)xP)x3
-        query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # Bx((K-1)xP)x60
-        z_fg_ex = z_fg[:, :, None, :].expand(-1, -1, P, -1).flatten(start_dim=1, end_dim=2)  # Bx((K-1)xP)xC
-        input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=-1)  # Bx((K-1)xP)x(60+C)
+        input_fg = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # Bx((K-1)xP)x60
+
+        if self.opt.use_slot_feat:
+            z_bg = z_slots[:, 0:1, :]  # Bx1xC
+            z_fg = z_slots[:, 1:, :]  # Bx(K-1)xC
+            z_fg_ex = z_fg[:, :, None, :].expand(-1, -1, P, -1).flatten(start_dim=1, end_dim=2)  # Bx((K-1)xP)xC
+
+            input_bg = torch.cat([input_bg, z_bg.expand(-1, P, -1)], dim=-1)  # BxPx(60+C)
+            input_fg = torch.cat([input_fg, z_fg_ex], dim=-1)  # Bx((K-1)xP)x(60+C)
+
+        if self.opt.use_pixel_feat:
+            pixel_feat_bg = pixel_feat[:, 0, ...] # BxPxC
+            pixel_feat_fg = pixel_feat[:, 1:, ...].flatten(1, 2) # Bx((K-1)xP)xC
+
+            input_bg = torch.cat([pixel_feat_bg, input_bg], dim=-1)
+            input_fg = torch.cat([pixel_feat_fg, input_fg], dim=-1)
 
         tmp = self.b_before(input_bg)
         bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=-1)).view([B, 1, P, self.out_ch])  # BxPx5 -> Bx1xPx5

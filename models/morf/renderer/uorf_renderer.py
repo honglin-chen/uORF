@@ -18,6 +18,7 @@ class UorfRenderer(Renderer):
         self.projection_fine = Projection(device=self.device, nss_scale=opt.nss_scale,
                                           frustum_size=frustum_size_fine, near=opt.near_plane, far=opt.far_plane,
                                           render_size=render_size)
+        self.register_buffer('frustum_size', torch.tensor([i * 1.0 for i in self.projection.frustum_size]).cuda())
 
     def render(self, input_renderer):
         encoder = input_renderer['encoder_obj']
@@ -32,7 +33,7 @@ class UorfRenderer(Renderer):
         D = self.opt.n_samp
         self.B, self.NV, self.K, self.C, self.D, self.H, self.W = B, NV, K, C, D, H, W
 
-        dev = x[:, 0:1].device
+        dev = self.device # this is different from x[:, 0:1].device. I do not know why no error (or why it is needed?)
 
         if self.opt.stage == 'coarse':
             frus_nss_coor, z_vals, ray_dir = self.projection.construct_sampling_coor(cam2world)
@@ -59,9 +60,9 @@ class UorfRenderer(Renderer):
         sampling_coor_fg = frus_nss_coor[:, None, ...].expand(-1, K - 1, -1, -1)  # (K-1)xPx3
         sampling_coor_bg = frus_nss_coor  # BxPx3
 
-        ray_dir_world = get_ray_dir_world(ray_dir.view([B*N, H, W, 3])[0].unsqueeze(0)) if self.opt.use_ray_dir_world else None
-        uv = get_pixel_coor(cam2world, frus_nss_coor) if self.opt.use_pixel_feat else None
-        xyz = get_voxel_coor() if self.opt.use_voxel_feat else None
+        ray_dir_world = self.get_ray_dir_world(ray_dir.view([B*N, H, W, 3])[0].unsqueeze(0)) if self.opt.use_ray_dir_world else None
+        uv = self.get_pixel_coor(cam2world, frus_nss_coor) if self.opt.use_pixel_feat else None
+        xyz = self.get_voxel_coor() if self.opt.use_voxel_feat else None
 
         coor_feature = {'uv': uv,
                          'xyz': xyz}
@@ -103,13 +104,22 @@ class UorfRenderer(Renderer):
     def get_pixel_coor(self, cam2world, frus_nss_coor):
         self.cam2spixel = self.projection.cam2spixel
         self.world2nss = self.projection.world2nss
-        frustum_size = torch.Tensor(self.projection.frustum_size).to(self.device)
+        frustum_size = self.frustum_size
 
         # construct uv in the first image coordinates
-        cam02world = cam2world[0:1]  # 1x4x4
+        '''
+        https://pytorch.org/docs/master/generated/torch.matmul.html#torch.matmul
+        Rule of torch.matmul:
+        (jx1xnxm), (kxmxp) --> (jxkxnxp)
+        '''
+        assert cam2world.shape[0] == 1, f'batch size larger than 1 in each gpu is not implemented yet'
+        cam02world = cam2world[0][0:1]  # 1x4x4
         world2cam0 = cam02world.inverse()  # 1x4x4
         nss2world = self.world2nss.inverse()  # 1x4x4
-        frus_nss_coor = torch.cat([frus_nss_coor, torch.ones_like(frus_nss_coor[:, 0].unsqueeze(1))], dim=-1)  # Px4
+        # print('frus_nss_coor.shape', frus_nss_coor.shape)
+        # print('world2cam0.shape', world2cam0.shape)
+        frus_nss_coor = frus_nss_coor.view(-1, 3)
+        frus_nss_coor = torch.cat([frus_nss_coor, torch.ones_like(frus_nss_coor[:, 0:1])], dim=-1)  # Px4
         frus_world_coor = torch.matmul(nss2world[None, ...], frus_nss_coor[None, ..., None])  # 1xPx4x1
         frus_cam0_coor = torch.matmul(world2cam0[None, ...],
                                       frus_world_coor)  # 1x1x4x4, 1x(BxNxDxHxW)x4x1 -> 1x(BxNxDxHxW)x4x1
