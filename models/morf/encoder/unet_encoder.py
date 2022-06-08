@@ -20,9 +20,11 @@ class UnetEncoder(Encoder):
         obj_feature = obj_feature.flatten(0, 1)
         pixel_feature = self.decoder(obj_feature)
         self.pixel_feature = pixel_feature
+        raise NotImplementedError
 
     def get_feature(self, coor_feature):
         # coor_feature: coordinates from which you want to get features (uv, xyz, ...)
+        raise NotImplementedError
 
 """ Parts of the U-Net model """
 
