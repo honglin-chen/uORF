@@ -58,9 +58,10 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
 
         parser.add_argument('--use_ray_dir_world', action='store_true')
-        parser.add_argument('--visualize_silhouette', action='store_true')
-        parser.add_argument('--use_voxel_feat', action='store_true')
-        parser.add_argument('--use_silhouette_loss', action='store_true')
+        parser.add_argument('--visualize_occl_silhouette', action='store_true', help='occluded silhouette is computed using rendering equation (making white color)')
+        parser.add_argument('--visualize_unoccl_silhouette', action='store_true', help='unoccluded silhouette is computed using uorf raw2output')
+        parser.add_argument('--use_voxel_feat', action='store_true', help='Not implemented yet. This might be preliminary step for instant ngp')
+        parser.add_argument('--use_occl_silhouette_loss', action='store_true')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -87,10 +88,11 @@ class uorfTrainModel(BaseModel):
                             ['x_rec{}'.format(i) for i in range(n)] + \
                             ['slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)] + \
                             ['unmasked_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)]
-        if self.opt.visualize_silhouette:
+        if self.opt.visualize_occl_silhouette:
             self.visual_names += ['occl_silhouette_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)]
-        # self.visual_names += ['depth_map{}'.format(i) for i in range(n)] + \
-        #                      ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
+        self.visual_names += ['render_mask{}'.format(i) for i in range(n)] + \
+                             ['depth_map{}'.format(i) for i in range(n)] + \
+                             ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
         # print('You will visualize these images \n', self.visual_names)
         self.model_names = ['End2end']
         self.perceptual_net = get_perceptual_net().cuda()
@@ -183,7 +185,7 @@ class uorfTrainModel(BaseModel):
                 setattr(self, 'x_rec{}'.format(i), x_recon[0:1, i]) # only the first in batch
                 setattr(self, 'x{}'.format(i), x[0:1, i]) # only the first in batch
                 setattr(self, 'depth_map{}'.format(i), depth_map[0:1, i])
-            setattr(self, 'occl_silhouettes', occl_silhouettes[0].detach() if self.opt.visualize_silhouette else None)
+            setattr(self, 'occl_silhouettes', occl_silhouettes[0].detach() if self.opt.visualize_occl_silhouette else None)
             setattr(self, 'masked_raws', masked_raws[0].detach()) # only the first in batch
             setattr(self, 'unmasked_raws', unmasked_raws[0].detach()) # only the first in batch
             setattr(self, 'attn', attn)
@@ -201,17 +203,20 @@ class uorfTrainModel(BaseModel):
             unmasked_raws = self.unmasked_raws  # KxNxDxHxWx4
             occl_silhouettes = self.occl_silhouettes
             for k in range(self.opt.num_slots):
-                x_recon = self.netEnd2end.renderer.compute_visual(masked_raws[k])
+                output_visual = self.netEnd2end.renderer.compute_visual(masked_raws[k])
+                x_recon = output_visual['x_recon']
                 for i in range(self.opt.n_img_each_scene):
                     setattr(self, 'slot{}_view{}'.format(k, i), x_recon[i].unsqueeze(0))
+                    setattr(self, 'occl_silhouettes'.format)
 
-                x_recon = self.netEnd2end.renderer.compute_visual(unmasked_raws[k])
+                output_visual = self.netEnd2end.renderer.compute_visual(unmasked_raws[k])
+                x_recon = output_visual['x_recon']
                 for i in range(self.opt.n_img_each_scene):
                     setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i].unsqueeze(0))
 
                 setattr(self, 'slot{}_attn'.format(k), self.attn[k].unsqueeze(0) * 2 - 1)
 
-                if self.opt.visualize_silhouette:
+                if self.opt.visualize_occl_silhouette:
                     occl_sil = occl_silhouettes[:, k]  # (NxKxHxW)
                     for i in range(self.opt.n_img_each_scene):
                         setattr(self, 'occl_silhouette_slot{}_view{}'.format(k, i),

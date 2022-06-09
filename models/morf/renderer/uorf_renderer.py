@@ -150,14 +150,22 @@ class UorfRenderer(Renderer):
         N, D, H, W = self.opt.n_img_each_scene, self.opt.n_samp, self.opt.supervision_size, self.opt.supervision_size
         z_vals, ray_dir = self.z_vals[0:1], self.ray_dir[0:1]
         raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-        rgb_map, depth_map, _ = raw2outputs(raws.unsqueeze(0), z_vals, ray_dir)
+        rgb_map, depth_map, _, mask_maps = raw2outputs(raws.unsqueeze(0), z_vals, ray_dir, render_mask=self.opt.)
         rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
         x_recon = rendered * 2 - 1
+        mask_maps = torch.stack(mask_maps) if self.opt.visualize_unoccl_silhouette else None  # KxNxHxW
+        if opt.visualize_occl_silhouette:
+            raise NotImplementedError
 
-        return x_recon
+        output = {'x_recon': x_recon,
+                  'depth_map': depth_map,
+                  'occl_silhouettes': None,
+                  'unoccl_silhouettes': mask_maps}
+
+        return output
 
 
-def raw2outputs(raw, z_vals, rays_d, render_mask=False):
+def raw2outputs(raw, z_vals, rays_d, render_mask=False, render_occl_mask=False):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [bsz, num_rays, num_samples along ray, 4]. Prediction from model.
@@ -189,10 +197,13 @@ def raw2outputs(raw, z_vals, rays_d, render_mask=False):
     weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
     depth_map = torch.sum(weights_norm * z_vals, -1)
 
-    if render_mask:
+    if render_mask: # this is unoccluded mask, and it makes sense if input is individual k_th raws
         density = raw[..., 3]  # [B, N_rays, N_samples]
         mask_map = torch.sum(weights * density, dim=-1)  # [B, N_rays,]
         return rgb_map, depth_map, weights_norm, mask_map
+
+    if render_occl_mask: # this is occluded mask, and it makes sense if input is both total raws and individual k_th raws
+        raise NotImplementedError
 
     return rgb_map, depth_map, weights_norm
 
