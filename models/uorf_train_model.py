@@ -58,10 +58,20 @@ class uorfTrainModel(BaseModel):
         parser.add_argument('--focal_ratio', nargs='+', default=(350. / 320., 350. / 240.), help='set the focal ratio in projection.py')
 
         parser.add_argument('--use_ray_dir_world', action='store_true')
-        parser.add_argument('--visualize_occl_silhouette', action='store_true', help='occluded silhouette is computed using rendering equation (making white color)')
-        parser.add_argument('--visualize_unoccl_silhouette', action='store_true', help='unoccluded silhouette is computed using uorf raw2output')
-        parser.add_argument('--use_voxel_feat', action='store_true', help='Not implemented yet. This might be preliminary step for instant ngp')
-        parser.add_argument('--use_occl_silhouette_loss', action='store_true')
+
+        parser.add_argument('--unisurf_render_eq', action='store_true',
+                            help='use unisurf style rendering equation, and treat the output of decoder as alpha, not density')
+        parser.add_argument('--visualize_occl_silhouette', action='store_true',
+                            help='occluded silhouette is computed at visualization epoch using rendering equation (making white color)')
+        parser.add_argument('--visualize_unoccl_silhouette', action='store_true',
+                            help='unoccluded silhouette is computed at visualization epoch using uorf raw2output')
+        parser.add_argument('--use_occl_silhouette_loss', action='store_true',
+                            help='This will compute the occluded silhouette every epoch, and apply silhouette loss on it')
+        parser.add_argument('--use_unoccl_silhouette_loss', action='store_true',
+                            help='This will compute the unoccluded silhouette every epoch, and apply silhouette loss on it')
+
+        parser.add_argument('--use_voxel_feat', action='store_true',
+                            help='Not implemented yet. This might be preliminary step for instant ngp')
 
         parser.set_defaults(batch_size=1, lr=3e-4, niter_decay=0,
                             dataset_mode='multiscenes', niter=1200, custom_lr=True, lr_policy='warmup')
@@ -205,10 +215,12 @@ class uorfTrainModel(BaseModel):
             for k in range(self.opt.num_slots):
                 output_visual = self.netEnd2end.renderer.compute_visual(masked_raws[k])
                 x_recon = output_visual['x_recon']
+                mask_map = output_visual['mask_map']
                 for i in range(self.opt.n_img_each_scene):
                     setattr(self, 'slot{}_view{}'.format(k, i), x_recon[i].unsqueeze(0))
-                    setattr(self, 'occl_silhouettes'.format)
+                    setattr(self, 'occl_silhouettes{}_view{}'.format(k, i), mask_map.view(N, H, W))
 
+            for k in range(self.opt.num_slots):
                 output_visual = self.netEnd2end.renderer.compute_visual(unmasked_raws[k])
                 x_recon = output_visual['x_recon']
                 for i in range(self.opt.n_img_each_scene):
@@ -221,6 +233,8 @@ class uorfTrainModel(BaseModel):
                     for i in range(self.opt.n_img_each_scene):
                         setattr(self, 'occl_silhouette_slot{}_view{}'.format(k, i),
                                 occl_sil[i].expand(3, occl_sil[i].shape[0], occl_sil[i].shape[1]))
+
+
 
     def optimize_parameters(self, loss, ret_grad=False, epoch=0):
         """Update network weights; it will be called in every training iteration."""

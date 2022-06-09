@@ -98,5 +98,59 @@ In ``/image_generation/scripts`` run ``generate_1200shape_50bg.sh`` and then ``r
 Don't forget to change the root directory in both scripts.
 
 
-## Training options
-- not yet documented
+## Options 
+[Class] / {function}
+
+1. Use of certain feature
+   1. use_slot_feat
+      1. [Encoder] use slot encoder and get object feature
+      
+   2. use_pixel_feat
+      1. [Encoder] use pixel encoder and get pixel feature
+      2. you can use this with use_slot_feat option; encoder wrapper will concatenate features.
+      3. Warning: now this does not work for batch > 1 per gpu
+      
+   3. mask_image
+      1. [Encoder] mask image before putting it into resnet encoder of pixel encoder
+      
+   4. mask_image_feature
+      1. [Encoder] mask image before putting it into resnet encoder of pixel encoder
+
+
+2. Load mask
+   1. gt_seg 
+      1. [Dataloader] load segmentation map
+      2. [Encoder] masking based on loaded seg
+      3. provide mask for spatial sampling
+      
+   2. use_eisen_seg
+      1. [Dataloader] use EISEN segmentation instead of GT segmentation
+
+
+3. Use of certain loss
+   1. use_occl_silhouette_loss
+      1. [train_model] compute the loss functions of occluded silhouette and provided masks
+      2. [Renderer] render: visualize the silhouette using the rendering equation; it consider the transmittance of whole scene for rendering the silhouette, and this silhouette can be used for silhouette loss with our 2d segmentation map
+      
+   2. use_unoccl_silhouette_loss
+      1. [train_model] compute the loss functions of unoccluded silhouette and provided masks; Warning: they are not the same even with GT segmentation and perfectly trained model because GT segmentation can be occluded whereas unoccl_silhouette should be complete object if perfectly trained
+      2. [Renderer] {render}: visualize the silhouette using original uorf raw2outputs; it does not consider the transmittance of whole scene for rendering the silhouette; instead, it uses the transmittance of individual k_th object; this silhouette can be used for regularizing the silhouette and removing artifacts during the early training process, but cannot be used until the end if there is any possibility of occlusion.
+
+
+4. Rendering option
+   1. unisurf_render_eq
+      1. [Renderer] {render}: change the postprocessing after the decoder output; consider decoder output as alpha, instead of sigma {raw2outputs}
+
+
+5. Visualization option
+   1. visualize_occl_silhouette
+      1. [train_model] {compute_visuals}: compute the occluded silhouette
+      2. [Renderer] {compute_visual}: compute the occluded silhouette
+      
+   2. visualize_unoccl_silhouette
+      1. [train_model] {compute_visuals}: compute the unoccluded silhouette
+      2. [Renderer] {compute_visual}: compute the unoccluded silhouette
+      
+   3. visualize_weighted_raws: raise NotImplementedError
+   
+   4. visualize_unweighted_raws: raise NotImplementedError

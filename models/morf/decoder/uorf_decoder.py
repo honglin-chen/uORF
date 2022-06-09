@@ -119,18 +119,8 @@ class UorfDecoder(Decoder):
         fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # Bx(K-1)xPx4
 
         all_raws = torch.cat([bg_raws, fg_raws], dim=1)  # BxKxPx4
-        raw_sigma = F.relu(all_raws[:, :, :, -1:], True)  # BxKxPx1
-        raw_rgb = (all_raws[:, :, :, :3].tanh() + 1) / 2
 
-        unmasked_raws = torch.cat([raw_rgb, raw_sigma], dim=-1)  # BxKxPx4
-        masks = raw_sigma / (raw_sigma.sum(dim=1, keepdim=True) + 1e-5)  # BxKxPx1
-        masked_raws = unmasked_raws * masks
-        raws = masked_raws.sum(dim=1)
-
-        output_decoder = {'raws': raws,
-                          'weighted_raws': masked_raws,
-                          'unweighted_raws': unmasked_raws,
-                          'occupancies': occupancies}
+        output_decoder = {'all_raws': all_raws}
 
         return output_decoder
 

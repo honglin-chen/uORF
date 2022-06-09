@@ -78,15 +78,32 @@ class UorfRenderer(Renderer):
                          }
         output_decoder = decoder(input_decoder)
 
-        raws = output_decoder['raws'] # Bx(NxDxHxW)x4
-        masked_raws = output_decoder['weighted_raws'] # BxKx(NxDxHxW)x4
-        unmasked_raws = output_decoder['unweighted_raws'] # BxKx(NxDxHxW)x4
-        masks = output_decoder['occupancies'] # BxKx(NxDxHxW)x1
+        all_raws = output_decoder['all_raws'] # BxKxPx4
+
+        if not self.opt.unisurf_render_eq:
+            raw_sigma = F.relu(all_raws[:, :, :, -1:], True)  # BxKxPx1
+            raw_rgb = (all_raws[:, :, :, :3].tanh() + 1) / 2
+
+            unmasked_raws = torch.cat([raw_rgb, raw_sigma], dim=-1)  # BxKxPx4
+            weights = raw_sigma / (raw_sigma.sum(dim=1, keepdim=True) + 1e-5)  # BxKxPx1
+            masked_raws = unmasked_raws * weights
+            raws = masked_raws.sum(dim=1)
+        elif self.opt.unisurf_render_eq:
+            raw_alpha = (all_raws[:, :, :, -1:].tanh() + 1) / 2
+            raw_rgb = (all_raws[:, :, :, :3].tanh() + 1) / 2
+
+            unmasked_raws = torch.cat([raw_rgb, raw_alpha], dim=-1)
+            weights = raw_alpha / (raw_alpha.sum(dim=1, keepdim=True) + 1e-5)
+            weighted_rgb = raw_rgb * weights
+            weighted_raws = torch.cat([weighted_rgb, raw_alpha], dim=-1)
+            raws = torch.clip(weighted_raws.sum(dim=1), 0, 1)
 
         raws = raws.view([B, NV, D, H, W, 4]).permute([0, 1, 3, 4, 2, 5]).flatten(1, 3)  # Bx(NxHxW)xDx4
         masked_raws = masked_raws.view([B, K, NV, D, H, W, 4])
         unmasked_raws = unmasked_raws.view([B, K, NV, D, H, W, 4])
-        rgb_map, depth_map, _ = raw2outputs(raws, z_vals, ray_dir) # Bx(NxHxW)x3, Bx(NxHxW)
+        rgb_map, depth_map, _, mask_map = self.raw2outputs(raws, z_vals, ray_dir,
+                                                 render_mask=self.opt.visualize_occl_silhouette,
+                                                 render_occl_mask=self.opt.visualize_unoccl_silhouette) # Bx(NxHxW)x3, Bx(NxHxW)
         rendered = rgb_map.view(B, NV, H, W, 3).permute([0, 1, 4, 2, 3])  # BxNx3xHxW
         x_recon = rendered * 2 - 1
         depth_map = depth_map.view(B, NV, H, W, 1).permute([0, 1, 4, 2, 3])
@@ -95,7 +112,7 @@ class UorfRenderer(Renderer):
                            'weighted_raws': masked_raws,
                            'unweighted_raws': unmasked_raws,
                            'depth_map': depth_map,
-                           'occupancies': masks,
+                           'occupancies': weights,
                            'occl_silhouettes': None,
                            'unoccl_silhouettes': None,
                            'x_supervision': x}
@@ -150,61 +167,68 @@ class UorfRenderer(Renderer):
         N, D, H, W = self.opt.n_img_each_scene, self.opt.n_samp, self.opt.supervision_size, self.opt.supervision_size
         z_vals, ray_dir = self.z_vals[0:1], self.ray_dir[0:1]
         raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-        rgb_map, depth_map, _, mask_maps = raw2outputs(raws.unsqueeze(0), z_vals, ray_dir, render_mask=self.opt.)
+        rgb_map, depth_map, _, mask_map = self.raw2outputs(raws.unsqueeze(0), z_vals, ray_dir,
+                                                            render_mask=self.opt.visualize_unoccl_silhouette)
         rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
         x_recon = rendered * 2 - 1
-        mask_maps = torch.stack(mask_maps) if self.opt.visualize_unoccl_silhouette else None  # KxNxHxW
+
         if opt.visualize_occl_silhouette:
             raise NotImplementedError
 
         output = {'x_recon': x_recon,
                   'depth_map': depth_map,
                   'occl_silhouettes': None,
-                  'unoccl_silhouettes': mask_maps}
+                  'unoccl_silhouettes': mask_map}
 
         return output
 
 
-def raw2outputs(raw, z_vals, rays_d, render_mask=False, render_occl_mask=False):
-    """Transforms model's predictions to semantically meaningful values.
-    Args:
-        raw: [bsz, num_rays, num_samples along ray, 4]. Prediction from model.
-        z_vals: [bsz, num_rays, num_samples along ray]. Integration time.
-        rays_d: [bsz, num_rays, 3]. Direction of each ray in cam coor.
-    Returns:
-        rgb_map: [bsz, num_rays, 3]. Estimated RGB color of a ray.
-        depth_map: [bsz, num_rays]. Estimated distance to object.
-    """
-    assert len(raw.shape) == 4 and len(z_vals.shape) == 3 and len(rays_d.shape) == 3
-    assert raw.shape[0] == z_vals.shape[0] == rays_d.shape[0]
+    def raw2outputs(raw, z_vals, rays_d, render_unoccl_mask=False, render_occl_mask=False, masked_raws=None):
+        """Transforms model's predictions to semantically meaningful values.
+        Args:
+            raw: [bsz, num_rays, num_samples along ray, 4]. Prediction from model.
+            z_vals: [bsz, num_rays, num_samples along ray]. Integration time.
+            rays_d: [bsz, num_rays, 3]. Direction of each ray in cam coor.
+        Returns:
+            rgb_map: [bsz, num_rays, 3]. Estimated RGB color of a ray.
+            depth_map: [bsz, num_rays]. Estimated distance to object.
+        """
+        assert len(raw.shape) == 4 and len(z_vals.shape) == 3 and len(rays_d.shape) == 3
+        assert raw.shape[0] == z_vals.shape[0] == rays_d.shape[0]
 
-    raw2alpha = lambda x, y: 1. - torch.exp(-x * y)
-    device = raw.device
+        raw2alpha = lambda x, y: 1. - torch.exp(-x * y)
+        device = raw.device
 
-    dists = z_vals[..., 1:] - z_vals[..., :-1]
-    dists = torch.cat([dists, torch.tensor([1e-2], device=device).expand(dists[..., :1].shape)], -1)  # [B, N_rays, N_samples]
+        dists = z_vals[..., 1:] - z_vals[..., :-1]
+        dists = torch.cat([dists, torch.tensor([1e-2], device=device).expand(dists[..., :1].shape)], -1)  # [B, N_rays, N_samples]
 
-    dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
+        dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
-    rgb = raw[..., :3]
+        rgb = raw[..., :3]
 
-    alpha = raw2alpha(raw[..., 3], dists)  # [B, N_rays, N_samples]
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], alpha.shape[1], 1), device=device), 1. - alpha + 1e-10], -1), -1)[:,:, :-1]
+        if self.opt.unisurf_render_eq:
+            alpha = raw[..., 3]
+        else:
+            alpha = raw2alpha(raw[..., 3], dists)  # [B, N_rays, N_samples]
+        weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], alpha.shape[1], 1), device=device), 1. - alpha + 1e-10], -1), -1)[:,:, :-1]
 
-    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [B, N_rays, 3]
+        rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [B, N_rays, 3]
 
-    weights_norm = weights.detach() + 1e-5
-    weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
-    depth_map = torch.sum(weights_norm * z_vals, -1)
+        weights_norm = weights.detach() + 1e-5
+        weights_norm /= weights_norm.sum(dim=-1, keepdim=True)
+        depth_map = torch.sum(weights_norm * z_vals, -1)
 
-    if render_mask: # this is unoccluded mask, and it makes sense if input is individual k_th raws
-        density = raw[..., 3]  # [B, N_rays, N_samples]
-        mask_map = torch.sum(weights * density, dim=-1)  # [B, N_rays,]
-        return rgb_map, depth_map, weights_norm, mask_map
+        if render_unoccl_mask: # this is unoccluded mask, and it makes sense if input is individual k_th raws
+            assert render_occl_mask == False
+            density = raw[..., 3]  # [B, N_rays, N_samples]
+            mask_map = torch.sum(weights * density, dim=-1)  # [B, N_rays,]
+            return rgb_map, depth_map, weights_norm, mask_map
 
-    if render_occl_mask: # this is occluded mask, and it makes sense if input is both total raws and individual k_th raws
-        raise NotImplementedError
+        if render_occl_mask: # this is occluded mask, and it makes sense if input is both total raws and individual k_th raws
+            assert masked_raws != None
+            density = raw[..., 3]
 
-    return rgb_map, depth_map, weights_norm
+
+        return rgb_map, depth_map, weights_norm
 
 
