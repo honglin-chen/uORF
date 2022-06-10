@@ -96,12 +96,13 @@ class UorfRenderer(Renderer):
             weights = raw_alpha / (raw_alpha.sum(dim=1, keepdim=True) + 1e-5)
             weighted_rgb = raw_rgb * weights
             weighted_raws = torch.cat([weighted_rgb, raw_alpha], dim=-1)
+            masked_raws = weighted_raws
             raws = torch.clip(weighted_raws.sum(dim=1), 0, 1)
 
         raws = raws.view([B, NV, D, H, W, 4]).permute([0, 1, 3, 4, 2, 5]).flatten(1, 3)  # Bx(NxHxW)xDx4
         masked_raws = masked_raws.view([B, K, NV, D, H, W, 4])
         unmasked_raws = unmasked_raws.view([B, K, NV, D, H, W, 4])
-        input_masked_raws = masked_raws if self.opt.use_occl_silhouette_loss else None
+        input_masked_raws = masked_raws.permute([0, 1, 2, 4, 5, 3, 6]).flatten(2, 4) if self.opt.use_occl_silhouette_loss else None
         output_raw2outputs = self.raw2outputs(raws, z_vals, ray_dir,
                                               render_occl_mask=self.opt.use_occl_silhouette_loss,
                                               masked_raws=input_masked_raws
@@ -110,7 +111,7 @@ class UorfRenderer(Renderer):
         rendered = output_raw2outputs['rgb_map'].view(B, NV, H, W, 3).permute([0, 1, 4, 2, 3])  # BxNx3xHxW
         x_recon = rendered * 2 - 1
         depth_map = output_raw2outputs['depth_map'].view(B, NV, H, W, 1).permute([0, 1, 4, 2, 3])
-        occl_silhouettes = output_raw2outputs['occl_silhouettes'] if self.opt.use_occl_silhouette_loss else None
+        occl_silhouettes = output_raw2outputs['occl_silhouettes'].view(B, K, NV, H, W, 1).permute([0, 1, 2, 5, 3, 4]) if self.opt.use_occl_silhouette_loss else None
 
 
         output_renderer = {'x_recon': x_recon,
@@ -172,23 +173,24 @@ class UorfRenderer(Renderer):
         N, D, H, W = self.opt.n_img_each_scene, self.opt.n_samp, self.opt.supervision_size, self.opt.supervision_size
         z_vals, ray_dir = self.z_vals[0:1], self.ray_dir[0:1]
         raws = raws.permute([0, 2, 3, 1, 4]).flatten(start_dim=0, end_dim=2)  # (NxHxW)xDx4
-        rgb_map, depth_map, _, mask_map = self.raw2outputs(raws.unsqueeze(0), z_vals, ray_dir,
+        output_raw2outputs = self.raw2outputs(raws.unsqueeze(0), z_vals, ray_dir,
                                                             render_unoccl_mask=self.opt.visualize_unoccl_silhouette)
-        rendered = rgb_map.view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
-        x_recon = rendered * 2 - 1
 
-        if opt.visualize_occl_silhouette:
-            raise NotImplementedError
+        rendered = output_raw2outputs['rgb_map'].view(N, H, W, 3).permute([0, 3, 1, 2])  # Nx3xHxW
+        x_recon = rendered * 2 - 1
+        depth_map = output_raw2outputs['depth_map'].view(N, H, W, 1).permute([0, 3, 1, 2])
+        mask_map = output_raw2outputs['unoccl_silhouette'].view(N, H, W, 1).permute(
+            [0, 3, 1, 2]) if self.opt.use_occl_silhouette_loss else None
 
         output = {'x_recon': x_recon,
                   'depth_map': depth_map,
                   'occl_silhouettes': None,
-                  'unoccl_silhouettes': mask_map}
+                  'unoccl_silhouette': mask_map}
 
         return output
 
 
-    def raw2outputs(raw, z_vals, rays_d, render_unoccl_mask=False, render_occl_mask=False, masked_raws=None):
+    def raw2outputs(self, raw, z_vals, rays_d, render_unoccl_mask=False, render_occl_mask=False, masked_raws=None):
         """Transforms model's predictions to semantically meaningful values.
         Args:
             raw: [bsz, num_rays, num_samples along ray, 4]. Prediction from model.
@@ -235,8 +237,9 @@ class UorfRenderer(Renderer):
 
         if render_occl_mask: # this is occluded mask, and it makes sense if input is both total raws and individual k_th raws
             assert masked_raws != None
-            density = raw[..., 3]
-            output['occl_silhouettes']
+            densities = masked_raws[..., 3]
+            mask_maps = torch.sum(weights.unsqueeze(1) * densities, dim=-1)
+            output['occl_silhouettes'] = mask_maps
 
 
         return output

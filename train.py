@@ -38,8 +38,11 @@ if __name__ == '__main__':
             epoch_iter += opt.batch_size
 
             x, cam2world, cam2azi, masks = model.module.set_input(data)  # unpack data from dataset and apply preprocessing
-            loss_recon, loss_perc, vis = model(x, cam2world, cam2azi, masks, epoch=epoch, iter=total_iters)  # feedforward and calculate loss
+            output = model(x, cam2world, cam2azi, masks, epoch=epoch, iter=total_iters)  # feedforward and calculate loss
+            loss_recon, loss_perc, loss_silhouette, vis = \
+                output['loss_recon'], output['loss_perc'], output['loss_silhouette'], output['vis_dict']
             loss = loss_recon.mean() + loss_perc.mean()
+            loss += loss_silhouette.mean() if opt.use_occl_silhouette_loss else 0
             layers, avg_grad = model.module.optimize_parameters(loss, opt.display_grad, epoch)   # get gradients, update network weights
 
             if opt.custom_lr and opt.stage == 'coarse':
@@ -56,6 +59,7 @@ if __name__ == '__main__':
 
             # losses = model.module.get_current_losses()
             losses = {'recon': loss_recon.mean().item(), 'perc': loss_perc.mean().item()}
+            losses['silhouette'] = loss_silhouette.mean().item() if opt.use_occl_silhouette_loss else 0
             for loss_name in model.module.loss_names:
                 meters_trn[loss_name].update(float(losses[loss_name]))
                 losses[loss_name] = meters_trn[loss_name].avg
