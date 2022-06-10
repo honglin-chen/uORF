@@ -16,7 +16,8 @@ if __name__ == '__main__':
 
     device_count = torch.cuda.device_count()
     print('Number of GPUs, Batch size: %d, %d' % (device_count, opt.batch_size))
-    assert opt.batch_size % device_count == 0, "Expect batch size to be an integer multiple of the number of GPUs"
+    assert opt.batch_size % device_count == 0, "Expect batch size to be an integer multiple of #GPUs"
+    assert opt.n_scenes % device_count == 0, "Expect number of scenes to be an integer multiple of #GPUs"
     model = create_model(opt)      # create a model given opt.model and other options
     model.setup(opt)               # regular setup: load and print networks; create schedulers
     model = nn.DataParallel(model)

@@ -67,8 +67,9 @@ class MultiscenesDataset(BaseDataset):
         # todo: debugging room_chair_train only, set the flag to False for TDW dataset
         self.disable_load_mask = True
 
-        if 'tdw' in self.scenes[0][0]:
-            assert not self.disable_load_mask, "this flag is for debugging room_chair_train only, set the flag to False for TDW dataset"
+        if 'tdw' in self.scenes[0][0] or self.opt.gt_seg:
+            self.disable_load_mask = False
+            # assert not self.disable_load_mask, "this flag is for debugging room_chair_train only, set the flag to False for TDW dataset"
 
     def _transform(self, img):
         if self.opt.dataset_nearest_interp:
@@ -157,7 +158,7 @@ class MultiscenesDataset(BaseDataset):
             else:
                 ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot}
             mask_path = path.replace('.png', '_pred_mask.png' if self.use_eisen_seg else '_mask.png')
-            if os.path.isfile(mask_path):
+            if os.path.isfile(mask_path) and not self.disable_load_mask:
                 mask = Image.open(mask_path).convert('RGB')
                 # mask_l = mask.convert('L')
                 mask_l = self._object_id_hash(mask)

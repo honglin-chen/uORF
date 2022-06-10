@@ -133,12 +133,13 @@ class uorfNoGanModel(BaseModel):
 
         ## Process segmentation masks of the input view
         if 'masks' in input.keys():
-            bg_masks = input['bg_mask'].to(self.device) # [NSxNV, 1, h, w]
-            obj_masks = input['obj_masks'].to(self.device) # [NSxNV, K-1, h, w]
-            bg_masks = bg_masks.view(NS, NV, 1, H, W)[:, 0]  # [NS, 1, h, w]
-            obj_masks = obj_masks.view(NS, NV, K-1, H, W)[:, 0] # [NS, K-1, h, w]
-            masks = torch.cat([bg_masks, obj_masks], dim=1) # [NS, K, h, w]
-            masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode='nearest')
+            bg_masks = input['bg_mask'].to(self.device) # [NSxNV, 1, H, W]
+            obj_masks = input['obj_masks'].to(self.device) # [NSxNV, K-1, H, W]
+            bg_masks = bg_masks.view(NS, NV, 1, H, W)[:, 0]  # [NS, 1, H, W]
+            obj_masks = obj_masks.view(NS, NV, K-1, H, W)[:, 0] # [NS, K-1, H, W]
+            masks = torch.cat([bg_masks, obj_masks], dim=1) # [NS, K, H, W]
+        else:
+            masks = None
         return x, cam2world, cam2world_azi, masks
 
     def forward(self, x, cam2world, cam2world_azi, masks=None, epoch=0, iter=0):
@@ -157,7 +158,8 @@ class uorfNoGanModel(BaseModel):
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention
-        z_slots, attn = self.netSlotAttention(feat, masks=masks)  # BxKxC, BxKxN
+        _masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode='nearest')
+        z_slots, attn = self.netSlotAttention(feat, masks=_masks)  # BxKxC, BxKxN
         K = attn.shape[1]
         N = cam2world.shape[1]
         if self.opt.stage == 'coarse':
@@ -178,13 +180,15 @@ class uorfNoGanModel(BaseModel):
             frus_nss_coor_, z_vals_, ray_dir_ = frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(1, 4), z_vals_.flatten(1, 3), ray_dir_.flatten(1, 3)
             x = x[:, :, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
+            masks = masks[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
+
             self.z_vals, self.ray_dir = z_vals, ray_dir
 
         sampling_coor_fg = frus_nss_coor[:, None, ...].expand(-1, K - 1, -1, -1)  # (K-1)xPx3
         sampling_coor_bg = frus_nss_coor  # BxPx3
 
         W, H, D = self.opt.supervision_size, self.opt.supervision_size, self.opt.n_samp
-        raws, masked_raws, unmasked_raws, masks = self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0)  # Bx(NxDxHxW)x4, BxKx(NxDxHxW)x4, BxKx(NxDxHxW)x4, BxKx(NxDxHxW)x1
+        raws, masked_raws, unmasked_raws, masks = self.netDecoder(sampling_coor_bg, sampling_coor_fg, z_slots, nss2cam0, masks=masks, size=[B, K, N, D, H, W])  # Bx(NxDxHxW)x4, BxKx(NxDxHxW)x4, BxKx(NxDxHxW)x4, BxKx(NxDxHxW)x1
         raws = raws.view([B, N, D, H, W, 4]).permute([0, 1, 3, 4, 2, 5]).flatten(start_dim=1, end_dim=3)  # Bx(NxHxW)xDx4
         masked_raws = masked_raws.view([B, K, N, D, H, W, 4])
         unmasked_raws = unmasked_raws.view([B, K, N, D, H, W, 4])

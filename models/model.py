@@ -6,6 +6,9 @@ import torch.nn.functional as F
 from torch.nn import init
 from torchvision.models import vgg16
 from torch import autograd
+from pytorch3d.ops import knn_points, ball_query, add_pointclouds_to_volumes
+from pytorch3d.structures import Pointclouds, Volumes
+from torch_scatter import scatter_add
 
 
 class Encoder(nn.Module):
@@ -103,7 +106,7 @@ class Decoder(nn.Module):
         self.b_before = nn.Sequential(*before_skip)
         self.b_after = nn.Sequential(*after_skip)
 
-    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform):
+    def forward(self, sampling_coor_bg, sampling_coor_fg, z_slots, fg_transform, masks=None, size=None):
         """
         1. pos emb by Fourier
         2. for each slot, decode all points from coord and slot feature
@@ -113,6 +116,98 @@ class Decoder(nn.Module):
             z_slots: BxKxC, K: #slots, C: #feat_dim
             fg_transform: If self.fixed_locality, it is Bx1x4x4 matrix nss2cam0, otherwise it is Bx1x3x3 azimuth rotation of nss2cam0
         """
+
+        if masks is not None:
+            # use masked based sampling
+            B, K, N, D, H, W = size
+
+            input_view_coord_mask = masks[:, 1:].unsqueeze(2).expand(-1, -1, D, -1, -1) # [B, K-1, D, H, W]
+            input_view_coord_mask = input_view_coord_mask.flatten(2, 4).flatten(0, 1) # [Bx(K-1), DxHxW]
+
+            sample_coord_fg_reshape = sampling_coor_fg.view(B, K-1, N, D, H, W, 3)
+            max_bound = sample_coord_fg_reshape.abs().max()
+            sample_coord_fg_reshape = sample_coord_fg_reshape / max_bound # [-1. 1]
+            input_view_coord = sample_coord_fg_reshape[:, :, 0:1].flatten(3, 5).flatten(0, 2) # [Bx(K-1), (DxHxW), 3]
+            other_view_coord = sample_coord_fg_reshape[:, :, 1:].flatten(0, 2) # [Bx(K-1)x(N-1), D, H, W, 3]
+
+            half_size = 32
+            points_list = [input_view_coord[i, input_view_coord_mask[i].bool()] * half_size for i in range(B * (K-1))]
+            pointclouds = Pointclouds(points=points_list, features=[torch.ones_like(i[:, 0:1]) for i in points_list])
+            zero_tensor = torch.zeros(B * (K-1), 1, D, H, W, device=input_view_coord.device)
+            initial_volumes = Volumes(densities=zero_tensor, features=zero_tensor.clone(),
+                              volume_translation=[0, 0, 0], voxel_size=1.)
+
+            updated_volumes = add_pointclouds_to_volumes(pointclouds=pointclouds, initial_volumes=initial_volumes)
+
+            voxel = updated_volumes.densities().expand(-1, N-1, -1, -1, -1).flatten(0, 1).unsqueeze(1) > 0
+            value = torch.nn.functional.grid_sample(voxel.float(), other_view_coord)
+
+            # temp = torch.nn.functional.grid_sample((updated_volumes.densities().flatten(0, 1).unsqueeze(1) > 0).float(), sample_coord_fg_reshape[:, :, 0:1].flatten(0, 2), mode='nearest')
+
+            input_view_coord_mask = input_view_coord_mask.view(B, K - 1, 1, -1)
+            other_view_coord_mask = (value > 0).view(B, K-1, N-1, -1)
+
+            sample_coord_fg_mask = torch.cat([input_view_coord_mask, other_view_coord_mask], dim=-2).flatten(2, 3).bool()
+            _sample_coord_fg_mask = sample_coord_fg_mask.flatten(1, 2)
+
+            # data = {
+            #     'mask': masks.cpu(),
+            #     'sample_coord_fg_reshape': sample_coord_fg_reshape.cpu(),
+            #     'input_view_coord': input_view_coord.cpu(),
+            #     'input_view_coord_mask': input_view_coord_mask.cpu(),
+            #     'sample_coord_fg_mask': sample_coord_fg_mask.cpu(),
+            #     'voxel': voxel.cpu(),
+            #     'value': value.cpu()
+            # }
+            # torch.save(data, 'data.pt')
+            # breakpoint()
+
+
+            # end.record()
+            # # Waits for everything to finish running
+            # torch.cuda.synchronize()
+            # print('voxelize', start.elapsed_time(end))
+            # start.record()
+
+            # end.record()
+            # # Waits for everything to finish running
+            # torch.cuda.synchronize()
+            # print('before ball', start.elapsed_time(end))
+            # start.record()
+            #
+            #
+            #
+            # dist, idx, _ = ball_query(p1=other_view_coord, p2=input_view_coord, K=bq_k, radius=bq_r) # [Bx(K-1), (N-1)xDxHxW, bq_k]
+            #
+            #
+            # end.record()
+            # # Waits for everything to finish running
+            # torch.cuda.synchronize()
+            # print('ball', start.elapsed_time(end))
+            # start.record()
+            #
+            #
+            #
+            # batch_idx = torch.arange(B * (K-1), device=idx.device).view(-1, 1, 1, 1).expand(-1, idx.shape[1], idx.shape[2], -1) # [Bx(K-1), (N-1)xDxHxW, bq_k, 1]
+            #
+            # gather_idx = torch.cat([batch_idx, idx.unsqueeze(-1)], dim=-1).permute(3, 0, 1, 2) # [2, Bx(K-1), (N-1)xDxHxW, bq_k]
+            # other_view_coord_mask = input_view_coord_mask[list(gather_idx)].sum(-1) > 0 # [Bx(K-1), (N-1)xDxHxW]
+            #
+            #
+            # input_view_coord_mask = input_view_coord_mask.view(B, K-1, 1, -1)
+            # other_view_coord_mask = other_view_coord_mask.view(B, K-1, N-1, -1)
+            # sample_coord_fg_mask = torch.cat([input_view_coord_mask, other_view_coord_mask], dim=-2).flatten(2, 3).bool()
+            # _sample_coord_fg_mask = sample_coord_fg_mask.flatten(1, 2)
+            #
+            # end.record()
+            # # Waits for everything to finish running
+            # torch.cuda.synchronize()
+            # print('compute mask', start.elapsed_time(end))
+            # start.record()
+
+        else:
+            sample_coord_fg_mask = None
+
         B, K, C = z_slots.shape
         P = sampling_coor_bg.shape[1]
 
@@ -128,22 +223,44 @@ class Decoder(nn.Module):
 
 
         z_bg = z_slots[:, 0:1, :]  # Bx1xC
-        z_fg = z_slots[:, 1:, :]  # Bx(K-1)xC
         query_bg = sin_emb(sampling_coor_bg, n_freq=self.n_freq)  # BxPx60, 60 means increased-freq feat dim
         input_bg = torch.cat([query_bg, z_bg.expand(-1, P, -1)], dim=-1)  # BxPx(60+C)
 
-        sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=1, end_dim=2)  # Bx((K-1)xP)x3
-        query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # Bx((K-1)xP)x60
-        z_fg_ex = z_fg[:, :, None, :].expand(-1, -1, P, -1).flatten(start_dim=1, end_dim=2)  # Bx((K-1)xP)xC
-        input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=-1)  # Bx((K-1)xP)x(60+C)
+        if sample_coord_fg_mask is not None:
+
+            z_fg = z_slots[:, 1:, :]  # Bx(K-1)xC
+            sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=1, end_dim=2)  # Bx((K-1)xP)x3
+            sampling_coor_fg_ = sampling_coor_fg_[_sample_coord_fg_mask]
+            query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # Bx((K-1)xP)x60
+
+            z_fg_ex = z_fg[:, :, None, :].expand(-1, -1, P, -1).flatten(start_dim=1, end_dim=2)  # Bx((K-1)xP)xC
+            z_fg_ex = z_fg_ex[_sample_coord_fg_mask]
+
+            input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=-1)
+        else:
+            z_fg = z_slots[:, 1:, :]  # Bx(K-1)xC
+            sampling_coor_fg_ = sampling_coor_fg.flatten(start_dim=1, end_dim=2)  # Bx((K-1)xP)x3
+            query_fg_ex = sin_emb(sampling_coor_fg_, n_freq=self.n_freq)  # Bx((K-1)xP)x60
+            z_fg_ex = z_fg[:, :, None, :].expand(-1, -1, P, -1).flatten(start_dim=1, end_dim=2)  # Bx((K-1)xP)xC
+            input_fg = torch.cat([query_fg_ex, z_fg_ex], dim=-1)  # Bx((K-1)xP)x(60+C)
 
         tmp = self.b_before(input_bg)
         bg_raws = self.b_after(torch.cat([input_bg, tmp], dim=-1)).view([B, 1, P, self.out_ch])  # BxPx5 -> Bx1xPx5
         tmp = self.f_before(input_fg)
         tmp = self.f_after(torch.cat([input_fg, tmp], dim=-1))  # Bx((K-1)xP)x64
         latent_fg = self.f_after_latent(tmp)  # Bx((K-1)xP)x64
-        fg_raw_rgb = self.f_color(latent_fg).view([B, K-1, P, 3])  # Bx((K-1)xP)x3 -> Bx(K-1)xPx3
-        fg_raw_shape = self.f_after_shape(tmp).view([B, K - 1, P])  # B((K-1)xP)x1 -> Bx(K-1)xP, density
+
+        if sample_coord_fg_mask is not None:
+            fg_raw_rgb = torch.zeros([B, K-1, P, 3], device=tmp.device)
+            fg_raw_shape = torch.zeros([B, K - 1, P], device=tmp.device)
+
+            fg_raw_rgb[sample_coord_fg_mask] = self.f_color(latent_fg)
+            fg_raw_shape[sample_coord_fg_mask] = self.f_after_shape(tmp).squeeze(-1)
+
+        else:
+            fg_raw_rgb = self.f_color(latent_fg).view([B, K - 1, P, 3])  # Bx((K-1)xP)x3 -> Bx(K-1)xPx3
+            fg_raw_shape = self.f_after_shape(tmp).view([B, K - 1, P])  # B((K-1)xP)x1 -> Bx(K-1)xP, density
+
         if self.locality:
             fg_raw_shape[outsider_idx] *= 0
         fg_raws = torch.cat([fg_raw_rgb, fg_raw_shape[..., None]], dim=-1)  # Bx(K-1)xPx4
@@ -236,7 +353,7 @@ class SlotAttention(nn.Module):
             dots_bg = torch.einsum('bid,bjd->bij', q_bg, k) * self.scale
             dots = torch.cat([dots_bg, dots_fg], dim=1)  # BxKxN
 
-            if self.gt_seg is not None:
+            if self.gt_seg:
                 # Replace slot attention with GT segmentations
                 attn_bg, attn_fg = masks[:, 0:1], masks[:, 1:]
                 attn = torch.cat([attn_bg, attn_fg], dim=1)
