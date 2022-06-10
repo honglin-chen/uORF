@@ -158,8 +158,9 @@ class uorfNoGanModel(BaseModel):
         feat = feature_map.flatten(start_dim=2).permute([0, 2, 1])  # BxNxC
 
         # Slot Attention
-        _masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode='nearest')
-        z_slots, attn = self.netSlotAttention(feat, masks=_masks)  # BxKxC, BxKxN
+        masks_original_res = masks.clone()
+        masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode='nearest')
+        z_slots, attn = self.netSlotAttention(feat, masks=masks)  # BxKxC, BxKxN
         K = attn.shape[1]
         N = cam2world.shape[1]
         if self.opt.stage == 'coarse':
@@ -180,8 +181,7 @@ class uorfNoGanModel(BaseModel):
             frus_nss_coor_, z_vals_, ray_dir_ = frus_nss_coor[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], z_vals[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :], ray_dir[..., H_idx:H_idx + rs, W_idx:W_idx + rs, :]
             frus_nss_coor, z_vals, ray_dir = frus_nss_coor_.flatten(1, 4), z_vals_.flatten(1, 3), ray_dir_.flatten(1, 3)
             x = x[:, :, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
-            masks = masks[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
-
+            masks = masks_original_res[:, :, H_idx:H_idx + rs, W_idx:W_idx + rs]
             self.z_vals, self.ray_dir = z_vals, ray_dir
 
         sampling_coor_fg = frus_nss_coor[:, None, ...].expand(-1, K - 1, -1, -1)  # (K-1)xPx3
