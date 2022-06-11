@@ -65,6 +65,10 @@ class uorfTrainModel(BaseModel):
                             help='occluded silhouette is computed at visualization epoch using rendering equation (making white color)')
         parser.add_argument('--visualize_unoccl_silhouette', action='store_true',
                             help='unoccluded silhouette is computed at visualization epoch using uorf raw2output')
+        parser.add_argument('--visualize_mask', action='store_true',
+                            help='visualize loaded masks')
+        parser.add_argument('--visualize_attn', action='store_true',
+                            help='visualize attn of uORF')
 
         parser.add_argument('--use_occl_silhouette_loss', action='store_true',
                             help='This will compute the occluded silhouette every epoch, and apply silhouette loss on it')
@@ -106,7 +110,10 @@ class uorfTrainModel(BaseModel):
         if self.opt.visualize_unoccl_silhouette:
             self.visual_names += ['unoccl_silhouette_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)]
         self.visual_names += ['depth_map{}'.format(i) for i in range(n)]
-                             # ['slot{}_attn'.format(k) for k in range(opt.num_slots)]
+        if self.opt.visualize_mask:
+            self.visual_names += ['mask_slot{}_view{}'.format(k, i) for k in range(opt.num_slots) for i in range(n)]
+        if self.opt.visualize_attn:
+            raise NotImplementedError # this is for uORF
         # print('You will visualize these images \n', self.visual_names)
         self.model_names = ['End2end']
         self.perceptual_net = get_perceptual_net().cuda()
@@ -154,10 +161,11 @@ class uorfTrainModel(BaseModel):
         if 'masks' in input.keys():
             bg_masks = input['bg_mask'].to(self.device)  # [NSxNV, 1, h, w]
             obj_masks = input['obj_masks'].to(self.device)  # [NSxNV, K-1, h, w]
-            bg_masks = bg_masks.view(NS, NV, 1, H, W)[:, 0]  # [NS, 1, h, w]
-            obj_masks = obj_masks.view(NS, NV, K - 1, H, W)[:, 0]  # [NS, K-1, h, w]
+            # bg_masks = bg_masks.view(NS, NV, 1, H, W)[:, 0]  # [NS, 1, h, w]
+            # obj_masks = obj_masks.view(NS, NV, K - 1, H, W)[:, 0]  # [NS, K-1, h, w]
             masks = torch.cat([bg_masks, obj_masks], dim=1)  # [NS, K, h, w]
             masks = F.interpolate(masks.float(), size=[self.opt.input_size, self.opt.input_size], mode='nearest')
+            masks = masks.view(NS, NV, K, H, W)
         return x, cam2world, cam2world_azi, masks
 
     def forward(self, x, cam2world, cam2world_azi, masks, epoch=0, iter=0):
@@ -208,7 +216,10 @@ class uorfTrainModel(BaseModel):
                 setattr(self, 'depth_map{}'.format(i), depth_map[0:1, i])
             setattr(self, 'masked_raws', masked_raws[0].detach()) # only the first in batch
             setattr(self, 'unmasked_raws', unmasked_raws[0].detach()) # only the first in batch
-            setattr(self, 'attn', attn)
+            setattr(self, 'attn', attn[0].detach())
+            setattr(self, 'masks', F.interpolate(masks[0].detach(),
+                                                 size=[self.opt.supervision_size, self.opt.supervision_size],
+                                                 mode='nearest')) # NVxKxHxW
             if self.opt.visualize_occl_silhouette:
                 assert self.opt.use_occl_silhouette_loss
                 setattr(self, 'occl_silhouettes', occl_silhouettes[0].detach())
@@ -237,10 +248,10 @@ class uorfTrainModel(BaseModel):
                     setattr(self, 'slot{}_view{}'.format(k, i), x_recon[i].unsqueeze(0))
                     if self.opt.visualize_unoccl_silhouette:
                         setattr(self, 'unoccl_silhouette_slot{}_view{}'.format(k, i), mask_map.view(N, 1, H, W)[i].unsqueeze(0))
-                        print(mask_map.view(N, H, W)[i].unsqueeze(0).shape, 'unoccl')
                     if self.opt.visualize_occl_silhouette:
                         setattr(self, 'occl_silhouette_slot{}_view{}'.format(k, i), self.occl_silhouettes[k][i].unsqueeze(0))
-                        print(self.occl_silhouettes[k][i].unsqueeze(0).shape, 'occl')
+                    if self.opt.visualize_mask:
+                        setattr(self, 'mask_slot{}_view{}'.format(k, i), self.masks[i][k].unsqueeze(0).unsqueeze(0))
 
             for k in range(self.opt.num_slots):
                 output_visual = self.netEnd2end.renderer.compute_visual(unmasked_raws[k])
@@ -248,8 +259,11 @@ class uorfTrainModel(BaseModel):
                 for i in range(self.opt.n_img_each_scene):
                     setattr(self, 'unmasked_slot{}_view{}'.format(k, i), x_recon[i].unsqueeze(0))
 
-            # for k in range(self.opt.num_slots):
-            #     setattr(self, 'slot{}_attn'.format(k), self.attn[k].unsqueeze(0) * 2 - 1)
+            if self.opt.visualize_attn:
+                raise NotImplementedError
+                # for k in range(self.opt.num_slots):
+                #     print(self.attn[k].unsqueeze(0).shape, 'attn')
+                #     setattr(self, 'slot{}_attn'.format(k), self.attn[k].unsqueeze(0) * 2 - 1)
 
     def optimize_parameters(self, loss, ret_grad=False, epoch=0):
         """Update network weights; it will be called in every training iteration."""

@@ -28,7 +28,7 @@ class MorfEnd2end(End2end):
         # input_img: BxNx3xHxW
         # Consider changing the input image size
         input_encoder = {'input_img': input_end2end['input_img'][:, 0, ...],
-                         'input_mask': input_end2end['input_mask']}
+                         'input_mask': input_end2end['input_mask'][:, 0, ...]}
         output_encoder = self.encoder(input_encoder)
 
         input_renderer = {'encoder_obj': self.encoder,

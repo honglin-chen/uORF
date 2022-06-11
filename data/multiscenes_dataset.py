@@ -158,7 +158,7 @@ class MultiscenesDataset(BaseDataset):
             else:
                 ret = {'img_data': img_data, 'path': path, 'cam2world': pose, 'azi_rot': azi_rot}
             mask_path = path.replace('.png', '_pred_mask.png' if self.use_eisen_seg else '_mask.png')
-            if os.path.isfile(mask_path):
+            if os.path.isfile(mask_path) and not self.disable_load_mask:
                 mask = Image.open(mask_path).convert('RGB')
                 # mask_l = mask.convert('L')
                 mask_l = self._object_id_hash(mask)
