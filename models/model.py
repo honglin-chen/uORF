@@ -117,6 +117,7 @@ class Decoder(nn.Module):
             fg_transform: If self.fixed_locality, it is Bx1x4x4 matrix nss2cam0, otherwise it is Bx1x3x3 azimuth rotation of nss2cam0
         """
 
+        masks = None
         if masks is not None:
             # use masked based sampling
             B, K, N, D, H, W = size
@@ -163,47 +164,6 @@ class Decoder(nn.Module):
             # breakpoint()
 
 
-            # end.record()
-            # # Waits for everything to finish running
-            # torch.cuda.synchronize()
-            # print('voxelize', start.elapsed_time(end))
-            # start.record()
-
-            # end.record()
-            # # Waits for everything to finish running
-            # torch.cuda.synchronize()
-            # print('before ball', start.elapsed_time(end))
-            # start.record()
-            #
-            #
-            #
-            # dist, idx, _ = ball_query(p1=other_view_coord, p2=input_view_coord, K=bq_k, radius=bq_r) # [Bx(K-1), (N-1)xDxHxW, bq_k]
-            #
-            #
-            # end.record()
-            # # Waits for everything to finish running
-            # torch.cuda.synchronize()
-            # print('ball', start.elapsed_time(end))
-            # start.record()
-            #
-            #
-            #
-            # batch_idx = torch.arange(B * (K-1), device=idx.device).view(-1, 1, 1, 1).expand(-1, idx.shape[1], idx.shape[2], -1) # [Bx(K-1), (N-1)xDxHxW, bq_k, 1]
-            #
-            # gather_idx = torch.cat([batch_idx, idx.unsqueeze(-1)], dim=-1).permute(3, 0, 1, 2) # [2, Bx(K-1), (N-1)xDxHxW, bq_k]
-            # other_view_coord_mask = input_view_coord_mask[list(gather_idx)].sum(-1) > 0 # [Bx(K-1), (N-1)xDxHxW]
-            #
-            #
-            # input_view_coord_mask = input_view_coord_mask.view(B, K-1, 1, -1)
-            # other_view_coord_mask = other_view_coord_mask.view(B, K-1, N-1, -1)
-            # sample_coord_fg_mask = torch.cat([input_view_coord_mask, other_view_coord_mask], dim=-2).flatten(2, 3).bool()
-            # _sample_coord_fg_mask = sample_coord_fg_mask.flatten(1, 2)
-            #
-            # end.record()
-            # # Waits for everything to finish running
-            # torch.cuda.synchronize()
-            # print('compute mask', start.elapsed_time(end))
-            # start.record()
 
         else:
             sample_coord_fg_mask = None

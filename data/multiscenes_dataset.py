@@ -8,7 +8,7 @@ import torch
 import glob
 import numpy as np
 import random
-
+import shutil
 
 class MultiscenesDataset(BaseDataset):
     @staticmethod
@@ -37,39 +37,19 @@ class MultiscenesDataset(BaseDataset):
         self.n_img_each_scene = opt.n_img_each_scene
         self.use_eisen_seg = opt.use_eisen_seg
         self.min_num_masks = self.opt.num_slots - 1 if not self.opt.dataset_combine_masks else 4
-        image_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*.png')))  # root/00000_sc000_az00_el00.png
-        mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask.png')))
-        fg_mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask_for_moving.png')))
-        moved_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_moved.png')))
-        bg_mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask_for_bg.png')))
-        bg_in_mask_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_mask_for_providing_bg.png')))
-        changed_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_changed.png')))
-        bg_in_filenames = sorted(glob.glob(os.path.join(opt.dataroot, '*_providing_bg.png')))
-        changed_filenames_set, bg_in_filenames_set = set(changed_filenames), set(bg_in_filenames)
-        bg_mask_filenames_set, bg_in_mask_filenames_set = set(bg_mask_filenames), set(bg_in_mask_filenames)
-        image_filenames_set, mask_filenames_set = set(image_filenames), set(mask_filenames)
-        fg_mask_filenames_set, moved_filenames_set = set(fg_mask_filenames), set(moved_filenames)
-        filenames_set = image_filenames_set - mask_filenames_set - fg_mask_filenames_set - moved_filenames_set - changed_filenames_set - bg_in_filenames_set - bg_mask_filenames_set - bg_in_mask_filenames_set
-        filenames = sorted(list(filenames_set))
-        self.scenes = []
-        skip = self.opt.skip
-        for i in range(skip, skip+self.n_scenes):
-            if self.opt.frame5:
-                scene_filenames = [x for x in filenames if 'sc{:04d}_frame5'.format(i) in x]
-            else:
-                scene_filenames = [x for x in filenames if 'sc{:04d}'.format(i) in x]
-            # print(scene_filenames)
-            self.scenes.append(scene_filenames)
+        self.dataroot = self.opt.dataroot
+        self.skip = self.opt.skip
+        self.frame5 = self.opt.frame5
 
         if self.opt.color_jitter:
             self.color_transform = transforms.ColorJitter(0.4, 0.4, 0.4, 0.4)
 
         # todo: debugging room_chair_train only, set the flag to False for TDW dataset
-        self.disable_load_mask = True
+        self.disable_load_mask = False
 
-        if 'tdw' in self.scenes[0][0] or self.opt.gt_seg:
-            self.disable_load_mask = False
-            # assert not self.disable_load_mask, "this flag is for debugging room_chair_train only, set the flag to False for TDW dataset"
+        # for debugging purpose only:
+        if not os.path.exists('error_files'):
+            os.mkdir('error_files')
 
     def _transform(self, img):
         if self.opt.dataset_nearest_interp:
@@ -119,14 +99,21 @@ class MultiscenesDataset(BaseDataset):
         out = Image.fromarray(out.squeeze(0).numpy().astype(np.uint8))
         return out
 
+    def _get_filenames(self, idx):
+        prefix = 'sc{:06d}'.format(idx)
+        if self.opt.frame5:
+            prefix += '_frame5'
+        filenames = [os.path.join(self.dataroot, prefix+'_img%d.png' % i) for i in range(self.n_img_each_scene)]
+        return filenames
+
     def __getitem__(self, index):
         """Return a data point and its metadata information.
 
         Parameters:
             index - - a random integer for data indexing, here it is scene_idx
         """
-        scene_idx = index
-        scene_filenames = self.scenes[scene_idx]
+        scene_idx = index + self.skip
+        scene_filenames = self._get_filenames(scene_idx)
         if self.opt.isTrain and not self.opt.no_shuffle:
             filenames = random.sample(scene_filenames, self.n_img_each_scene)
         else:
@@ -204,14 +191,25 @@ class MultiscenesDataset(BaseDataset):
                             continue
                         obj_mask = mask_l == greyscale_dict[i]  # 1xHxW
                         obj_masks.append(obj_mask)
+
+                # Exception handling for empty object masks
+                if len(obj_masks) == 0:
+                    print('Error reading file: ', path)
+                    shutil.copyfile(path, path.replace('playroom_v0_train', 'error_files')) # record error file
+                    return self.buffer_rets
+
                 obj_masks = torch.stack(obj_masks)  # Kx1xHxW
 
+                shape = obj_masks.shape[0]
                 # if the number of masks is too small, pad with empty masks
                 if obj_masks.shape[0] < self.min_num_masks:
-                    obj_masks = torch.cat([obj_masks, torch.zeros_like(obj_masks[0:(self.min_num_masks-obj_masks.shape[0])])], dim=0)
+                    n, d, h, w = obj_masks.shape
+                    obj_masks = torch.cat([obj_masks, torch.zeros(self.min_num_masks-n, d, h, w)], dim=0)
 
-                if obj_masks.shape[0] > self.min_num_masks:
+                # Exception handling for empty object masks
+                if shape == 1 or obj_masks.shape[0] > self.min_num_masks:
                     print('Error reading file: ', path)
+                    shutil.copyfile(path, path.replace('playroom_v0_train', 'error_files')) # record error file
                     return self.buffer_rets
 
                 ret['obj_masks'] = obj_masks  # KxHxW
